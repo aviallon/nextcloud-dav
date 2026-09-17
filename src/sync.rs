@@ -42,7 +42,7 @@ pub fn parse_sync_token(raw: Option<&str>) -> Result<SyncToken> {
         return Ok(SyncToken::Initial);
     };
     let Some(rest) = raw.strip_prefix(SYNCTOKEN_PREFIX) else {
-        return Err(Error::bad_request("Invalid or unknown sync token"));
+        return Err(Error::InvalidSyncToken);
     };
     if rest.is_empty() {
         return Ok(SyncToken::Initial);
@@ -53,12 +53,12 @@ pub fn parse_sync_token(raw: Option<&str>) -> Result<SyncToken> {
         let token = parts.next().and_then(|p| p.parse::<i64>().ok());
         return match (last_id, token) {
             (Some(last_id), Some(token)) => Ok(SyncToken::InitialPaging { last_id, token }),
-            _ => Err(Error::bad_request("Invalid or unknown sync token")),
+            _ => Err(Error::InvalidSyncToken),
         };
     }
     rest.parse::<i64>()
         .map(SyncToken::Changes)
-        .map_err(|_| Error::bad_request("Invalid or unknown sync token"))
+        .map_err(|_| Error::InvalidSyncToken)
 }
 
 /// A page of sync results, before it is turned into a `{DAV:}multistatus`.

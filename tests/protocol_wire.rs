@@ -10,9 +10,7 @@
 //! `Sabre\DAV\Sync\Plugin`, which are the source of truth.
 
 use nextcloud_dav::routes::{parse_path, DavTarget};
-use nextcloud_dav::sync::{
-    self, parse_sync_token, SyncToken, SYNCTOKEN_PREFIX,
-};
+use nextcloud_dav::sync::{self, parse_sync_token, SyncToken, SYNCTOKEN_PREFIX};
 use nextcloud_dav::util::{encode_path_segment, http_date, parse_basic_auth, percent_decode};
 use nextcloud_dav::vcard::{self, filter_read_blob};
 use nextcloud_dav::xml::filter::{self, Collation, MatchType, Test};
@@ -29,7 +27,8 @@ use nextcloud_dav::xml::write::{
 fn read_blob_strips_non_image_photo_with_folded_lines() {
     // Exactly the PHP loop: drop `PHOTO:data:<non-image>` and any following
     // folded (leading space) lines.
-    let data = b"BEGIN:VCARD\r\nPHOTO:data:text/plain;base64,AAAA\r\n AAAA\r\nFN:X\r\nEND:VCARD\r\n";
+    let data =
+        b"BEGIN:VCARD\r\nPHOTO:data:text/plain;base64,AAAA\r\n AAAA\r\nFN:X\r\nEND:VCARD\r\n";
     let (out, modified) = filter_read_blob(data);
     assert!(modified, "a non-image PHOTO must set modified=true");
     assert_eq!(out, b"BEGIN:VCARD\r\nFN:X\r\nEND:VCARD\r\n".to_vec());
@@ -66,9 +65,15 @@ fn read_blob_is_idempotent_when_nothing_to_strip() {
 fn has_photo_is_false_for_non_image_data_uri() {
     // HasPhotoPlugin::propFind(): a PHOTO whose value starts `data:` but not
     // `data:image/` is *not* a photo.
-    assert!(!vcard::has_photo(b"BEGIN:VCARD\r\nPHOTO:data:text/plain;base64,AA\r\nEND:VCARD\r\n"));
-    assert!(vcard::has_photo(b"BEGIN:VCARD\r\nPHOTO:data:image/png;base64,AA\r\nEND:VCARD\r\n"));
-    assert!(vcard::has_photo(b"BEGIN:VCARD\r\nPHOTO;VALUE=uri:https://x/a.jpg\r\nEND:VCARD\r\n"));
+    assert!(!vcard::has_photo(
+        b"BEGIN:VCARD\r\nPHOTO:data:text/plain;base64,AA\r\nEND:VCARD\r\n"
+    ));
+    assert!(vcard::has_photo(
+        b"BEGIN:VCARD\r\nPHOTO:data:image/png;base64,AA\r\nEND:VCARD\r\n"
+    ));
+    assert!(vcard::has_photo(
+        b"BEGIN:VCARD\r\nPHOTO;VALUE=uri:https://x/a.jpg\r\nEND:VCARD\r\n"
+    ));
     assert!(!vcard::has_photo(b"BEGIN:VCARD\r\nFN:X\r\nEND:VCARD\r\n"));
 }
 
@@ -85,7 +90,10 @@ fn vcard_unfolds_and_unescapes_like_sabre() {
 #[test]
 fn vcard_strips_group_prefix() {
     let card = vcard::parse(b"BEGIN:VCARD\r\nitem1.EMAIL:jane@example.com\r\nEND:VCARD\r\n");
-    assert_eq!(card.select("EMAIL").next().unwrap().value, "jane@example.com");
+    assert_eq!(
+        card.select("EMAIL").next().unwrap().value,
+        "jane@example.com"
+    );
 }
 
 #[test]
@@ -248,7 +256,7 @@ fn sync_token_parsing() {
     .unwrap();
     assert_eq!(req.sync_token, None);
     assert_eq!(
-        parse_sync_token(Some(&format!("{SYNCTOKEN_PREFIX}"))).unwrap(),
+        parse_sync_token(Some(SYNCTOKEN_PREFIX)).unwrap(),
         SyncToken::Initial
     );
     assert_eq!(
@@ -457,15 +465,9 @@ fn structured_property_renders_nested_elements() {
 fn propfind_allprop_defaults_and_empty_body() {
     let req = parse_propfind(b"").unwrap();
     assert_eq!(req.props, PropList::AllProp);
-    let req = parse_propfind(
-        br#"<d:propfind xmlns:d="DAV:"><d:allprop/></d:propfind>"#,
-    )
-    .unwrap();
+    let req = parse_propfind(br#"<d:propfind xmlns:d="DAV:"><d:allprop/></d:propfind>"#).unwrap();
     assert_eq!(req.props, PropList::AllProp);
-    let req = parse_propfind(
-        br#"<d:propfind xmlns:d="DAV:"><d:propname/></d:propfind>"#,
-    )
-    .unwrap();
+    let req = parse_propfind(br#"<d:propfind xmlns:d="DAV:"><d:propname/></d:propfind>"#).unwrap();
     assert_eq!(req.props, PropList::PropName);
 }
 

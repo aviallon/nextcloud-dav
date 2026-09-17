@@ -12,9 +12,7 @@ mod common;
 
 use common::{call, get, md5_hex, propfind, report, request, Resp, TestEnv};
 use nextcloud_dav::xml::parse::{parse_document, XNode};
-use nextcloud_dav::xml::write::{
-    NS_CALENDARSERVER, NS_CARDDAV, NS_DAV, NS_NEXTCLOUD, NS_SABREDAV,
-};
+use nextcloud_dav::xml::write::{NS_CALENDARSERVER, NS_CARDDAV, NS_DAV, NS_NEXTCLOUD, NS_SABREDAV};
 
 const CARD_JANE: &[u8] = b"BEGIN:VCARD\r\n\
 VERSION:3.0\r\n\
@@ -94,7 +92,8 @@ async fn setup() -> Option<(TestEnv, i64, axum::Router)> {
 // ---------------------------------------------------------------------------
 
 fn doc(body: &[u8]) -> XNode {
-    parse_document(body).unwrap_or_else(|e| panic!("not XML: {e}: {}", String::from_utf8_lossy(body)))
+    parse_document(body)
+        .unwrap_or_else(|e| panic!("not XML: {e}: {}", String::from_utf8_lossy(body)))
 }
 
 fn response<'a>(doc: &'a XNode, href: &str) -> &'a XNode {
@@ -103,7 +102,9 @@ fn response<'a>(doc: &'a XNode, href: &str) -> &'a XNode {
         .find(|c| {
             c.ns == NS_DAV
                 && c.local == "response"
-                && c.child(NS_DAV, "href").map(|h| h.text == href).unwrap_or(false)
+                && c.child(NS_DAV, "href")
+                    .map(|h| h.text == href)
+                    .unwrap_or(false)
         })
         .unwrap_or_else(|| panic!("no d:response for href {href}"))
 }
@@ -136,7 +137,13 @@ fn prop_status(resp: &XNode, ns: &str, local: &str) -> Option<String> {
         .map(|s| s.text.clone())
 }
 
-fn prop_has_element(resp: &XNode, ns: &str, local: &str, child_ns: &str, child_local: &str) -> bool {
+fn prop_has_element(
+    resp: &XNode,
+    ns: &str,
+    local: &str,
+    child_ns: &str,
+    child_local: &str,
+) -> bool {
     prop_of(resp, ns, local)
         .map(|n| {
             n.children
@@ -190,7 +197,13 @@ async fn propfind_book_depth0_has_all_expected_properties() {
     // Collections are emitted with a trailing slash, exactly like Sabre.
     let r = response(&doc, "/remote.php/dav/addressbooks/users/alice/contacts/");
 
-    assert!(prop_has_element(r, NS_DAV, "resourcetype", NS_DAV, "collection"));
+    assert!(prop_has_element(
+        r,
+        NS_DAV,
+        "resourcetype",
+        NS_DAV,
+        "collection"
+    ));
     assert!(prop_has_element(
         r,
         NS_DAV,
@@ -209,9 +222,9 @@ async fn propfind_book_depth0_has_all_expected_properties() {
         prop_text(r, NS_DAV, "sync-token"),
         "http://sabre.io/ns/sync/4"
     );
-    // NOTE: 5242880 differs from Sabre's advertised 10000000; see
-    // tests/deviations.toml id=max-resource-size-wrong.
-    assert_eq!(prop_text(r, NS_CARDDAV, "max-resource-size"), "5242880");
+    // Sabre's advertised property is 10 MB; the write limit (card_size_limit)
+    // is the separate 5 MiB value.
+    assert_eq!(prop_text(r, NS_CARDDAV, "max-resource-size"), "10000000");
     assert_eq!(prop_text(r, NS_NEXTCLOUD, "owner-displayname"), "Alice A");
     // owner href points at the principal, with a trailing slash.
     let owner = prop_of(r, NS_DAV, "owner").unwrap();
@@ -219,25 +232,34 @@ async fn propfind_book_depth0_has_all_expected_properties() {
         owner.child(NS_DAV, "href").unwrap().text,
         "/remote.php/dav/principals/users/alice/"
     );
-    // supported-address-data advertises both vCard versions. Sabre also
-    // advertises application/vcard+json 4.0; see
-    // tests/deviations.toml id=supported-address-data-missing-json.
+    // supported-address-data advertises text/vcard 3.0, text/vcard 4.0 and
+    // application/vcard+json 4.0, like Sabre.
     let sad = prop_of(r, NS_CARDDAV, "supported-address-data").unwrap();
-    let versions: Vec<String> = sad
+    let types: Vec<(String, String)> = sad
         .children
         .iter()
         .filter(|c| c.ns == NS_CARDDAV && c.local == "address-data-type")
-        .filter_map(|c| c.attr("version").map(str::to_string))
+        .map(|c| {
+            (
+                c.attr("content-type").unwrap_or_default().to_string(),
+                c.attr("version").unwrap_or_default().to_string(),
+            )
+        })
         .collect();
-    assert_eq!(versions, vec!["3.0", "4.0"]);
-    // supported-collation-set has the three collations. The child element is
-    // `card:collation` here, whereas Sabre uses `card:supported-collation`;
-    // see tests/deviations.toml id=supported-collation-element-name.
+    assert_eq!(
+        types,
+        vec![
+            ("text/vcard".to_string(), "3.0".to_string()),
+            ("text/vcard".to_string(), "4.0".to_string()),
+            ("application/vcard+json".to_string(), "4.0".to_string()),
+        ]
+    );
+    // supported-collation-set uses the `card:supported-collation` child name.
     let scs = prop_of(r, NS_CARDDAV, "supported-collation-set").unwrap();
     assert_eq!(
         scs.children
             .iter()
-            .filter(|c| c.ns == NS_CARDDAV && c.local == "collation")
+            .filter(|c| c.ns == NS_CARDDAV && c.local == "supported-collation")
             .count(),
         3
     );
@@ -256,7 +278,10 @@ async fn propfind_book_depth0_has_all_expected_properties() {
     let privs = prop_of(r, NS_DAV, "current-user-privilege-set").unwrap();
     assert!(privs.children.iter().any(|p| p
         .child(NS_DAV, "privilege")
-        .map(|pr| pr.children.iter().any(|c| c.ns == NS_DAV && c.local == "read"))
+        .map(|pr| pr
+            .children
+            .iter()
+            .any(|c| c.ns == NS_DAV && c.local == "read"))
         .unwrap_or(false)));
 }
 
@@ -320,17 +345,23 @@ async fn propfind_has_photo_is_1_for_an_image_data_uri() {
     let path = "/remote.php/dav/addressbooks/users/alice/contacts/photo.vcf";
     let resp = propfind(&app, path, USER, PASSWORD, "0", ALL_CARD_PROPS).await;
     let doc = doc(&resp.body);
-    assert_eq!(prop_text(response(&doc, path), NS_NEXTCLOUD, "has-photo"), "1");
+    assert_eq!(
+        prop_text(response(&doc, path), NS_NEXTCLOUD, "has-photo"),
+        "1"
+    );
 }
 
 #[tokio::test]
 async fn propfind_unknown_property_is_a_404_propstat() {
     let (_env, _book, app) = setup!();
-    let body = r#"<d:propfind xmlns:d="DAV:"><d:prop><d:displayname/><d:getetag/></d:prop></d:propfind>"#;
+    let body =
+        r#"<d:propfind xmlns:d="DAV:"><d:prop><d:displayname/><d:getetag/></d:prop></d:propfind>"#;
     let resp = propfind(&app, BOOK_PATH, USER, PASSWORD, "0", body).await;
     let doc = doc(&resp.body);
     let r = response(&doc, "/remote.php/dav/addressbooks/users/alice/contacts/");
-    assert!(prop_status(r, NS_DAV, "displayname").unwrap().contains("200"));
+    assert!(prop_status(r, NS_DAV, "displayname")
+        .unwrap()
+        .contains("200"));
     assert!(prop_status(r, NS_DAV, "getetag").unwrap().contains("404"));
 }
 
@@ -423,7 +454,10 @@ async fn get_strips_non_image_photo_data() {
         b"BEGIN:VCARD\r\nUID:1\r\nFN:X\r\nEND:VCARD\r\n".to_vec()
     );
     // ETag is the stored md5 of the *unfiltered* body, like PHP.
-    assert_eq!(resp.header("etag").unwrap(), format!("\"{}\"", md5_hex(raw)));
+    assert_eq!(
+        resp.header("etag").unwrap(),
+        format!("\"{}\"", md5_hex(raw))
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -455,7 +489,9 @@ async fn multiget_hit_and_miss_propstat() {
         &doc,
         "/remote.php/dav/addressbooks/users/alice/contacts/missing.vcf",
     );
-    assert!(prop_status(miss, NS_DAV, "getetag").unwrap().contains("404"));
+    assert!(prop_status(miss, NS_DAV, "getetag")
+        .unwrap()
+        .contains("404"));
     assert!(response_status(miss).is_none());
 }
 
@@ -552,10 +588,7 @@ async fn sync_collection_initial_sync_reports_all_cards() {
         .filter_map(|c| c.child(NS_DAV, "href").map(|h| h.text.clone()))
         .collect();
     assert_eq!(hrefs.len(), 3);
-    assert_eq!(
-        sync_token_of(&doc).unwrap(),
-        "http://sabre.io/ns/sync/4"
-    );
+    assert_eq!(sync_token_of(&doc).unwrap(), "http://sabre.io/ns/sync/4");
 }
 
 #[tokio::test]
@@ -565,7 +598,10 @@ async fn sync_collection_paging_and_507_truncation() {
     assert_eq!(resp.status, 207);
     let first = doc(&resp.body);
     let token = sync_token_of(&first).unwrap();
-    assert!(token.starts_with("http://sabre.io/ns/sync/init_"), "got {token}");
+    assert!(
+        token.starts_with("http://sabre.io/ns/sync/init_"),
+        "got {token}"
+    );
     // Truncation is signalled as a 507 response on the collection.
     let truncated = first
         .children
@@ -580,7 +616,14 @@ async fn sync_collection_paging_and_507_truncation() {
     assert!(response_status(truncated).unwrap().contains("507"));
 
     // Continue paging from the init token.
-    let resp = report(&app, BOOK_PATH, USER, PASSWORD, &sync_body(Some(&token), Some(1))).await;
+    let resp = report(
+        &app,
+        BOOK_PATH,
+        USER,
+        PASSWORD,
+        &sync_body(Some(&token), Some(1)),
+    )
+    .await;
     let doc2 = doc(&resp.body);
     let next = sync_token_of(&doc2).unwrap();
     assert_ne!(next, token);
@@ -593,8 +636,12 @@ async fn sync_collection_incremental_reports_add_modify_delete() {
     let current = sync_token_of(&doc(&resp.body)).unwrap();
 
     // New card (add), a modify, and a delete are logged as PHP would.
-    env.seed_card(book, "new.vcf", b"BEGIN:VCARD\r\nUID:new\r\nFN:New\r\nEND:VCARD\r\n")
-        .await;
+    env.seed_card(
+        book,
+        "new.vcf",
+        b"BEGIN:VCARD\r\nUID:new\r\nFN:New\r\nEND:VCARD\r\n",
+    )
+    .await;
     env.add_change(book, "john.vcf", 2).await;
     env.add_change(book, "jane.vcf", 3).await;
 
@@ -612,12 +659,14 @@ async fn sync_collection_incremental_reports_add_modify_delete() {
         &doc,
         "/remote.php/dav/addressbooks/users/alice/contacts/new.vcf",
     );
-    assert_eq!(prop_status(add, NS_DAV, "getetag").unwrap().contains("200"), true);
+    assert!(prop_status(add, NS_DAV, "getetag").unwrap().contains("200"));
     let modified = response(
         &doc,
         "/remote.php/dav/addressbooks/users/alice/contacts/john.vcf",
     );
-    assert!(prop_status(modified, NS_DAV, "getetag").unwrap().contains("200"));
+    assert!(prop_status(modified, NS_DAV, "getetag")
+        .unwrap()
+        .contains("200"));
     let deleted = response(
         &doc,
         "/remote.php/dav/addressbooks/users/alice/contacts/jane.vcf",
@@ -626,12 +675,20 @@ async fn sync_collection_incremental_reports_add_modify_delete() {
 }
 
 #[tokio::test]
-async fn sync_collection_malformed_token_is_400() {
-    // Sabre raises InvalidSyncToken (extends Forbidden) => 403; the sidecar
-    // returns 400. See tests/deviations.toml id=sync-invalid-token-400.
+async fn sync_collection_malformed_token_is_403_with_precondition() {
+    // Sabre raises InvalidSyncToken (extends Forbidden) => 403 with a
+    // `<d:valid-sync-token/>` body.
     let (_env, _book, app) = setup!();
-    let resp = report(&app, BOOK_PATH, USER, PASSWORD, &sync_body(Some("42"), None)).await;
-    assert_eq!(resp.status, 400);
+    let resp = report(
+        &app,
+        BOOK_PATH,
+        USER,
+        PASSWORD,
+        &sync_body(Some("42"), None),
+    )
+    .await;
+    assert_eq!(resp.status, 403);
+    assert!(resp.text().contains("valid-sync-token"), "{}", resp.text());
 }
 
 // ---------------------------------------------------------------------------
@@ -666,19 +723,24 @@ async fn other_users_and_missing_resources_are_404_not_403() {
 }
 
 #[tokio::test]
-async fn writes_return_501_so_nginx_can_fall_back_to_php() {
+async fn collection_write_methods_return_501_so_nginx_can_fall_back_to_php() {
+    // PUT/DELETE are native for cards; collection-level writes and the other
+    // methods still delegate to PHP via 501.
     let (_env, _book, app) = setup!();
     let paths = [
         BOOK_PATH,
         "/remote.php/dav/addressbooks/users/alice/contacts/new.vcf",
     ];
-    let methods = ["PUT", "DELETE", "MKCOL", "PROPPATCH", "MOVE", "COPY", "POST"];
+    let methods = ["MKCOL", "PROPPATCH", "MOVE", "COPY", "POST"];
     for path in paths {
         for method in methods {
             let resp = call(&app, request(method, path, USER, PASSWORD)).await;
             assert_eq!(resp.status, 501, "{method} {path}");
         }
     }
+    // A PUT on the collection (not a card) also stays 501.
+    let resp = call(&app, request("PUT", BOOK_PATH, USER, PASSWORD)).await;
+    assert_eq!(resp.status, 501, "PUT {BOOK_PATH}");
 }
 
 #[tokio::test]
@@ -785,8 +847,17 @@ async fn version_1_token_falls_back_to_php_and_therefore_502() {
 async fn stale_last_check_falls_back_to_php() {
     let env = env_or_skip!();
     env.seed_user(USER, None).await;
-    env.seed_token_full(USER, USER, PASSWORD, 1, 2, None, false, common::now() - 3600)
-        .await;
+    env.seed_token_full(
+        USER,
+        USER,
+        PASSWORD,
+        1,
+        2,
+        None,
+        false,
+        common::now() - 3600,
+    )
+    .await;
     let app = env.app_shared();
     assert_eq!(status_with(&app, USER, PASSWORD).await, 502);
 }
@@ -795,8 +866,17 @@ async fn stale_last_check_falls_back_to_php() {
 async fn expired_token_falls_back_to_php() {
     let env = env_or_skip!();
     env.seed_user(USER, None).await;
-    env.seed_token_full(USER, USER, PASSWORD, 1, 2, Some(common::now() - 1), false, common::now())
-        .await;
+    env.seed_token_full(
+        USER,
+        USER,
+        PASSWORD,
+        1,
+        2,
+        Some(common::now() - 1),
+        false,
+        common::now(),
+    )
+    .await;
     let app = env.app_shared();
     assert_eq!(status_with(&app, USER, PASSWORD).await, 502);
 }

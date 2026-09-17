@@ -9,12 +9,15 @@
 
 use crate::auth::{AuthError, Authenticator};
 use crate::config::{Config, DEFAULT_SYNC_LIMIT, MAX_RESOURCE_SIZE};
+use crate::dav_error;
 use crate::db::Db;
 use crate::error::{Error, Result};
 use crate::model::{AddressBook, Card};
+use crate::outbox::EffectRegistry;
 use crate::sync::{self, SYNCTOKEN_PREFIX};
 use crate::util::{encode_path_segment, http_date, parse_basic_auth, percent_decode};
 use crate::vcard;
+use crate::vcard_validate::{self, Reject};
 use crate::xml::filter;
 use crate::xml::parse::{self, PropList};
 use crate::xml::write::{
@@ -37,6 +40,15 @@ pub struct AppState {
     pub db: Arc<Db>,
     pub auth: Authenticator,
     pub config: Config,
+    /// The resolved write-size limit (`oc_appconfig` `dav/card_size_limit`, or
+    /// the `nextcloud_dav.card_size_limit` override), cached at startup.
+    pub card_size_limit: u64,
+    /// Whether native `PUT`/`DELETE` are served in-process. False when the
+    /// outbox table is missing or `event_dispatch.enabled` is off; writes then
+    /// return 501 so nginx falls back to PHP.
+    pub native_writes: bool,
+    /// The effect-ownership registry frozen into every outbox row.
+    pub registry: Arc<EffectRegistry>,
 }
 
 pub fn router(state: Arc<AppState>) -> Router {
@@ -263,6 +275,27 @@ async fn handle(state: Arc<AppState>, request: Request) -> Result<Response> {
                 "GET" | "HEAD" => {
                     get_card(&state, &target_user, &book_uri, &card_uri, &method).await
                 }
+                "PUT" => {
+                    if !state.native_writes {
+                        return Ok(not_implemented());
+                    }
+                    put_card(
+                        &state,
+                        &target_user,
+                        &book_uri,
+                        &card_uri,
+                        &href,
+                        &headers,
+                        request,
+                    )
+                    .await
+                }
+                "DELETE" => {
+                    if !state.native_writes {
+                        return Ok(not_implemented());
+                    }
+                    delete_card(&state, &target_user, &book_uri, &card_uri, &headers).await
+                }
                 "PROPFIND" => {
                     let body = read_body(request).await?;
                     let depth = parse_depth(&headers);
@@ -296,8 +329,6 @@ fn query_requires_php(query: &str) -> bool {
 
 fn unsupported_method(method: &Method) -> Option<&'static str> {
     match method.as_str() {
-        "PUT" => Some("PUT"),
-        "DELETE" => Some("DELETE"),
         "MKCOL" => Some("MKCOL"),
         "PROPPATCH" => Some("PROPPATCH"),
         "MOVE" => Some("MOVE"),
@@ -355,7 +386,7 @@ fn unauthorized() -> Response {
 fn not_implemented() -> Response {
     (
         StatusCode::NOT_IMPLEMENTED,
-        "This CardDAV sidecar is read-only; this method is served by Nextcloud PHP.\n",
+        "This CardDAV sidecar does not implement this method; it is served by Nextcloud PHP.\n",
     )
         .into_response()
 }
@@ -449,7 +480,12 @@ async fn handle_propfind(
                 owner_displayname: owner_displayname.clone(),
                 groups: Vec::new(),
             };
-            responses.push(build_response(&collection_href(href), NodeData::Home, &ctx, &request.props));
+            responses.push(build_response(
+                &collection_href(href),
+                NodeData::Home,
+                &ctx,
+                &request.props,
+            ));
             if depth >= 1 {
                 let books = state.db.address_books_for_user(&principal(user)).await?;
                 for book in &books {
@@ -731,11 +767,14 @@ fn resolve_property(
                 XmlElement::new("card:address-data-type")
                     .attr("content-type", "text/vcard")
                     .attr("version", "4.0"),
+                XmlElement::new("card:address-data-type")
+                    .attr("content-type", "application/vcard+json")
+                    .attr("version", "4.0"),
             ])),
             ("supported-collation-set", NodeData::Book(_)) => Some(PropValue::Elements(vec![
-                XmlElement::new("card:collation").text("i;ascii-casemap"),
-                XmlElement::new("card:collation").text("i;octet"),
-                XmlElement::new("card:collation").text("i;unicode-casemap"),
+                XmlElement::new("card:supported-collation").text("i;ascii-casemap"),
+                XmlElement::new("card:supported-collation").text("i;octet"),
+                XmlElement::new("card:supported-collation").text("i;unicode-casemap"),
             ])),
             ("address-data", NodeData::Card(card)) => Some(PropValue::Text(
                 String::from_utf8_lossy(&card.carddata).into_owned(),
@@ -855,6 +894,190 @@ async fn get_card(
 }
 
 // ---------------------------------------------------------------------------
+// PUT / DELETE (native writes)
+// ---------------------------------------------------------------------------
+
+/// Evaluates the `If-Match` / `If-None-Match` preconditions against the current
+/// card. Returns the 412 response when a precondition fails.
+///
+/// Mirrors `Sabre\DAV\Server::checkPreconditions()`: `If-Match` is evaluated
+/// first (and fails if the resource is absent unless the value is `*`), then
+/// `If-None-Match` (fails if the value matches or is `*` on an existing
+/// resource). Both compare against the stored unquoted ETag and its quoted
+/// wire form.
+fn check_preconditions(headers: &HeaderMap, card: Option<&Card>) -> Option<Response> {
+    if let Some(raw) = header_str(headers, header::IF_MATCH) {
+        let Some(card) = card else {
+            return Some(dav_error::precondition_failed("If-Match"));
+        };
+        if raw.trim() != "*" {
+            let matched = raw.split(',').any(|item| {
+                let item = item.trim();
+                item == card.etag
+                    || item == card.quoted_etag()
+                    || item.replace("\\\"", "\"") == card.quoted_etag()
+            });
+            if !matched {
+                return Some(dav_error::precondition_failed("If-Match"));
+            }
+        }
+    }
+
+    if let Some(raw) = header_str(headers, header::IF_NONE_MATCH) {
+        if let Some(card) = card {
+            let raw = raw.trim();
+            let matched = raw == "*"
+                || raw.split(',').any(|item| {
+                    let item = item.trim();
+                    item == card.etag || item == card.quoted_etag()
+                });
+            if matched {
+                return Some(dav_error::precondition_failed("If-None-Match"));
+            }
+        }
+    }
+
+    None
+}
+
+fn header_str(headers: &HeaderMap, name: header::HeaderName) -> Option<&str> {
+    headers.get(name).and_then(|value| value.to_str().ok())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn put_card(
+    state: &AppState,
+    user: &str,
+    book_uri: &str,
+    card_uri: &str,
+    href: &str,
+    headers: &HeaderMap,
+    request: Request,
+) -> Result<Response> {
+    let Some(book) = state
+        .db
+        .address_book_by_uri(&principal(user), book_uri)
+        .await?
+    else {
+        return Ok(Error::NotFound.into_response());
+    };
+
+    let body = read_body(request).await?;
+
+    // `CardDavValidatePlugin::beforePut()`: 403 once the *actual* bytes read
+    // exceed the configured limit (not merely `Content-Length`).
+    if body.len() as u64 > state.card_size_limit {
+        return Ok(dav_error::forbidden(&format!(
+            "VCard object exceeds {} bytes",
+            state.card_size_limit
+        )));
+    }
+
+    let existing = state.db.card(book.id, card_uri).await?;
+    if let Some(response) = check_preconditions(headers, existing.as_ref()) {
+        return Ok(response);
+    }
+
+    // Sabre's `Reader::read('')` raises a parse error. The empty body is called
+    // out separately and answered with a plain-text 415.
+    if body.is_empty() {
+        return Ok((
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "This resource only supports valid vCard data; the request body is empty.\n",
+        )
+            .into_response());
+    }
+
+    let validated = match vcard_validate::validate(&body) {
+        Ok(validated) => validated,
+        Err(Reject::UnsupportedMediaType(message)) => {
+            return Ok(dav_error::unsupported_media_type(&message));
+        }
+        Err(Reject::BadRequest(message)) => return Ok(dav_error::bad_request(&message)),
+    };
+
+    // RFC 6352 6.3.2.1 no-uid-conflict, on CREATE only. Sabre's
+    // `AddressBook::createFile()` calls `createCard()` with the check enabled,
+    // but `Card::put()` calls `updateCard()`, which does *not* check
+    // (`apps/dav/lib/CardDAV/CardDavBackend.php`). Matching that means an update
+    // is allowed to introduce a duplicate UID, exactly as PHP allows. Checking
+    // here on update too would reject writes a real Nextcloud accepts.
+    if existing.is_none() {
+        if let Some((_id, existing_uri)) = state.db.card_by_uid(book.id, &validated.uid).await? {
+            let collection = href.rsplit_once('/').map(|(base, _)| base).unwrap_or(href);
+            let conflict_href = format!("{collection}/{}", encode_path_segment(&existing_uri));
+            return Ok(dav_error::uid_conflict(&conflict_href));
+        }
+    }
+
+    let created = existing.is_none();
+    let snapshot = state
+        .db
+        .put_card(
+            book.id,
+            card_uri,
+            &validated.data,
+            &validated.uid,
+            !created,
+            &state.registry,
+            &state.config.event_dispatch.notify_channel,
+        )
+        .await?;
+
+    let mut response = Response::new(Body::empty());
+    *response.status_mut() = if created {
+        StatusCode::CREATED
+    } else {
+        StatusCode::NO_CONTENT
+    };
+    if let Ok(etag) = HeaderValue::from_str(&snapshot.quoted_etag()) {
+        response.headers_mut().insert(header::ETAG, etag);
+    }
+    response
+        .headers_mut()
+        .insert(header::CONTENT_LENGTH, HeaderValue::from_static("0"));
+    Ok(response)
+}
+
+async fn delete_card(
+    state: &AppState,
+    user: &str,
+    book_uri: &str,
+    card_uri: &str,
+    headers: &HeaderMap,
+) -> Result<Response> {
+    let Some(book) = state
+        .db
+        .address_book_by_uri(&principal(user), book_uri)
+        .await?
+    else {
+        return Ok(Error::NotFound.into_response());
+    };
+    let Some(card) = state.db.card(book.id, card_uri).await? else {
+        return Ok(Error::NotFound.into_response());
+    };
+    if let Some(response) = check_preconditions(headers, Some(&card)) {
+        return Ok(response);
+    }
+
+    let deleted = state
+        .db
+        .delete_card(
+            book.id,
+            card_uri,
+            &state.registry,
+            &state.config.event_dispatch.notify_channel,
+        )
+        .await?;
+    if deleted.is_none() {
+        return Ok(Error::NotFound.into_response());
+    }
+    let mut response = Response::new(Body::empty());
+    *response.status_mut() = StatusCode::NO_CONTENT;
+    Ok(response)
+}
+
+// ---------------------------------------------------------------------------
 // REPORT
 // ---------------------------------------------------------------------------
 
@@ -940,15 +1163,15 @@ async fn handle_report_book(
         (NS_CARDDAV, "addressbook-query") => {
             let request = parse::parse_query(body)?;
             let depth = parse_depth(headers);
-            let candidates: Vec<Card> = if depth == 0 {
-                let card_uri = percent_decode(last_segment(href));
-                match state.db.card(book.id, &card_uri).await? {
-                    Some(card) => vec![card],
-                    None => Vec::new(),
-                }
-            } else {
-                state.db.cards(book.id).await?
-            };
+            // `CardDAV\Plugin::addressbookQueryReport()`: Depth: 0 on a
+            // collection is only valid when the target itself is an ICard;
+            // otherwise Sabre raises ReportNotSupported (415).
+            if depth == 0 {
+                return Ok(dav_error::report_not_supported(
+                    "The addressbook-query report is not supported on this url with Depth: 0",
+                ));
+            }
+            let candidates = state.db.cards(book.id).await?;
 
             let ctx = PropContext {
                 principal_href: principal_href.clone(),
@@ -962,11 +1185,7 @@ async fn handle_report_book(
                         continue;
                     }
                 }
-                let response_href = if depth == 0 {
-                    href.to_string()
-                } else {
-                    format!("{href}/{}", encode_path_segment(&card.uri))
-                };
+                let response_href = format!("{href}/{}", encode_path_segment(&card.uri));
                 responses.push(build_response(
                     &response_href,
                     NodeData::Card(card),
@@ -1149,10 +1368,7 @@ async fn handle_sync_collection(
 }
 
 fn last_segment(href: &str) -> &str {
-    href.split('/')
-        .filter(|s| !s.is_empty())
-        .next_back()
-        .unwrap_or("")
+    href.split('/').rfind(|s| !s.is_empty()).unwrap_or("")
 }
 
 /// Turns a client-provided href into an absolute path we can echo back.

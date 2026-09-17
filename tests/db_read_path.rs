@@ -29,10 +29,22 @@ async fn address_books_are_scoped_and_ordered_by_id() {
     let env = env_or_skip!();
     env.seed_user("alice", Some("Alice")).await;
     let b1 = env
-        .seed_addressbook("principals/users/alice", "contacts", Some("Contacts"), None, 3)
+        .seed_addressbook(
+            "principals/users/alice",
+            "contacts",
+            Some("Contacts"),
+            None,
+            3,
+        )
         .await;
     let b2 = env
-        .seed_addressbook("principals/users/alice", "work", Some("Work"), Some("Work book"), 9)
+        .seed_addressbook(
+            "principals/users/alice",
+            "work",
+            Some("Work"),
+            Some("Work book"),
+            9,
+        )
         .await;
     let _other = env
         .seed_addressbook("principals/users/bob", "contacts", Some("Bob"), None, 1)
@@ -74,7 +86,13 @@ async fn address_books_are_scoped_and_ordered_by_id() {
 async fn card_reads_quote_etag_and_keep_stored_size_unless_filtered() {
     let env = env_or_skip!();
     let book = env
-        .seed_addressbook("principals/users/alice", "contacts", Some("Contacts"), None, 1)
+        .seed_addressbook(
+            "principals/users/alice",
+            "contacts",
+            Some("Contacts"),
+            None,
+            1,
+        )
         .await;
     env.seed_card(book, "jane.vcf", CARD).await;
 
@@ -90,7 +108,13 @@ async fn card_reads_quote_etag_and_keep_stored_size_unless_filtered() {
 async fn non_image_photo_is_stripped_and_size_recomputed() {
     let env = env_or_skip!();
     let book = env
-        .seed_addressbook("principals/users/alice", "contacts", Some("Contacts"), None, 1)
+        .seed_addressbook(
+            "principals/users/alice",
+            "contacts",
+            Some("Contacts"),
+            None,
+            1,
+        )
         .await;
     let raw = b"BEGIN:VCARD\r\nUID:1\r\nPHOTO:data:text/plain;base64,AAAA\r\n AAAA\r\nFN:X\r\nEND:VCARD\r\n";
     // PHP's createCard stores strlen($cardData) (unfiltered).
@@ -110,7 +134,13 @@ async fn non_image_photo_is_stripped_and_size_recomputed() {
 async fn stored_size_is_not_recomputed_when_nothing_was_filtered() {
     let env = env_or_skip!();
     let book = env
-        .seed_addressbook("principals/users/alice", "contacts", Some("Contacts"), None, 1)
+        .seed_addressbook(
+            "principals/users/alice",
+            "contacts",
+            Some("Contacts"),
+            None,
+            1,
+        )
         .await;
     env.insert_card_raw(book, "x.vcf", CARD).await;
     // Simulate a stored size that differs from the body (e.g. legacy row).
@@ -131,7 +161,13 @@ async fn stored_size_is_not_recomputed_when_nothing_was_filtered() {
 async fn cards_and_cards_by_uris_are_book_scoped() {
     let env = env_or_skip!();
     let book = env
-        .seed_addressbook("principals/users/alice", "contacts", Some("Contacts"), None, 1)
+        .seed_addressbook(
+            "principals/users/alice",
+            "contacts",
+            Some("Contacts"),
+            None,
+            1,
+        )
         .await;
     let other = env
         .seed_addressbook("principals/users/alice", "work", Some("Work"), None, 1)
@@ -139,8 +175,12 @@ async fn cards_and_cards_by_uris_are_book_scoped() {
     env.seed_card(book, "a.vcf", CARD).await;
     let card2 = b"BEGIN:VCARD\r\nUID:2\r\nFN:Two\r\nEND:VCARD\r\n";
     env.seed_card(book, "b.vcf", card2).await;
-    env.seed_card(other, "a.vcf", b"BEGIN:VCARD\r\nUID:9\r\nFN:Other\r\nEND:VCARD\r\n")
-        .await;
+    env.seed_card(
+        other,
+        "a.vcf",
+        b"BEGIN:VCARD\r\nUID:9\r\nFN:Other\r\nEND:VCARD\r\n",
+    )
+    .await;
 
     let cards = env.db.cards(book).await.unwrap();
     assert_eq!(cards.len(), 2);
@@ -159,7 +199,13 @@ async fn cards_and_cards_by_uris_are_book_scoped() {
 async fn contact_groups_come_from_cards_properties_categories() {
     let env = env_or_skip!();
     let book = env
-        .seed_addressbook("principals/users/alice", "contacts", Some("Contacts"), None, 1)
+        .seed_addressbook(
+            "principals/users/alice",
+            "contacts",
+            Some("Contacts"),
+            None,
+            1,
+        )
         .await;
     let card = env.seed_card(book, "a.vcf", CARD).await;
     env.seed_property(book, card, "CATEGORIES", "Friends").await;
@@ -176,7 +222,13 @@ async fn contact_groups_come_from_cards_properties_categories() {
 async fn sync_initial_cards_respects_after_id_and_limit() {
     let env = env_or_skip!();
     let book = env
-        .seed_addressbook("principals/users/alice", "contacts", Some("Contacts"), None, 1)
+        .seed_addressbook(
+            "principals/users/alice",
+            "contacts",
+            Some("Contacts"),
+            None,
+            1,
+        )
         .await;
     let c1 = env.insert_card_raw(book, "a.vcf", CARD).await;
     let c2 = env.insert_card_raw(book, "b.vcf", CARD).await;
@@ -197,7 +249,13 @@ async fn sync_initial_cards_respects_after_id_and_limit() {
 async fn sync_changes_are_ranged_and_ordered() {
     let env = env_or_skip!();
     let book = env
-        .seed_addressbook("principals/users/alice", "contacts", Some("Contacts"), None, 1)
+        .seed_addressbook(
+            "principals/users/alice",
+            "contacts",
+            Some("Contacts"),
+            None,
+            1,
+        )
         .await;
     // addChange() logs pre-increment tokens.
     env.add_change(book, "a.vcf", 1).await; // token 1
@@ -261,12 +319,7 @@ async fn authtoken_lookup_filters_on_version_2() {
         .execute(env.pool())
         .await
         .unwrap();
-    assert!(env
-        .db
-        .authtoken_by_hash(&hash)
-        .await
-        .unwrap()
-        .is_none());
+    assert!(env.db.authtoken_by_hash(&hash).await.unwrap().is_none());
 
     // Then a v2 row with the same token value is found.
     env.seed_token("alice", "alice", "pw", 1, 2).await;

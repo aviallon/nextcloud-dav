@@ -39,8 +39,18 @@ pub const TOKEN_RECHECK_INTERVAL: i64 = 300;
 /// `carddav_sync_request_truncation` default (`CardDavBackend.php`).
 pub const DEFAULT_SYNC_LIMIT: i64 = 2500;
 
-/// Nextcloud's default `{urn:ietf:params:xml:ns:carddav}max-resource-size`.
-pub const MAX_RESOURCE_SIZE: u64 = 5_242_880;
+/// Sabre's advertised `{urn:ietf:params:xml:ns:carddav}max-resource-size`.
+/// This is *not* Nextcloud's write limit: `CardDAV\Plugin` hardcodes 10 MB and
+/// Nextcloud does not override it.
+pub const MAX_RESOURCE_SIZE: u64 = 10_000_000;
+
+/// Nextcloud's `card_size_limit` app-config default (`dav` app), enforced by
+/// `CardDavValidatePlugin::beforePut()` on `PUT`. It is deliberately smaller
+/// than [`MAX_RESOURCE_SIZE`].
+pub const DEFAULT_CARD_SIZE_LIMIT: u64 = 5_242_880;
+
+/// Default `pg_notify` channel used to wake the event-dispatch worker.
+pub const DEFAULT_EVENT_NOTIFY_CHANNEL: &str = "oc_dav_event_outbox";
 
 /// `\RedisCluster::*` / `\PDO::*` constants appear inside `$CONFIG` and are not
 /// valid PHP literals for the parser. Replace them with their integer values,
@@ -84,6 +94,35 @@ impl Default for BruteforceConfig {
     }
 }
 
+/// The `nextcloud_dav.event_dispatch` config block.
+///
+/// The crate does not run a dispatcher in phase 1: native writes enqueue an
+/// `oc_dav_event_outbox` row and the companion PHP app drains it. What this
+/// block controls is *where each effect is owned*, recorded into every outbox
+/// row so a later phase can move an effect to `rust` without ambiguity. Each
+/// effect id must be claimed by exactly one backend.
+#[derive(Debug, Clone)]
+pub struct EventDispatchConfig {
+    /// Master switch: when false, native writes are refused (501) exactly like
+    /// a missing outbox table.
+    pub enabled: bool,
+    /// `pg_notify` channel the PHP worker `LISTEN`s on.
+    pub notify_channel: String,
+    /// effect id -> `"php"` | `"rust"`. Defaults to `"php"` for every known
+    /// effect. Unknown keys are ignored (forward compatibility).
+    pub handlers: IndexMap<String, String>,
+}
+
+impl Default for EventDispatchConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            notify_channel: DEFAULT_EVENT_NOTIFY_CHANNEL.to_string(),
+            handlers: IndexMap::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub database: AnyConnectOptions,
@@ -97,6 +136,12 @@ pub struct Config {
     pub nextcloud_url: String,
     pub log_level: String,
     pub bruteforce: BruteforceConfig,
+    /// The `nextcloud_dav.event_dispatch` block.
+    pub event_dispatch: EventDispatchConfig,
+    /// `nextcloud_dav.card_size_limit` override. When `None`, the value is read
+    /// from `oc_appconfig` at startup with [`DEFAULT_CARD_SIZE_LIMIT`] as the
+    /// fallback.
+    pub card_size_limit_override: Option<u64>,
     pub max_connections: u32,
     pub php_timeout: Duration,
     /// Accept invalid TLS certificates on the PHP fallback.
@@ -250,6 +295,35 @@ impl Config {
             .and_then(|a| a.get_bool_at("allow_self_signed"))
             .unwrap_or(false);
 
+        let event_dispatch = {
+            let mut dispatch = EventDispatchConfig::default();
+            let block = raw
+                .get("nextcloud_dav")
+                .map(|value| value["event_dispatch"].clone())
+                .unwrap_or(Value::Null);
+            if let Some(enabled) = AppConfig(&block).get_bool_at("enabled") {
+                dispatch.enabled = enabled;
+            }
+            if let Some(channel) = AppConfig(&block).get_str_at("notify_channel") {
+                if !channel.is_empty() {
+                    dispatch.notify_channel = channel;
+                }
+            }
+            if let Value::Array(map) = &block["handlers"] {
+                for (key, value) in map {
+                    if let (Some(key), Some(owner)) = (key.as_str(), value.as_str()) {
+                        dispatch.handlers.insert(key.to_string(), owner.to_string());
+                    }
+                }
+            }
+            dispatch
+        };
+
+        let card_size_limit_override = app
+            .and_then(|a| a.get_int_at("card_size_limit"))
+            .filter(|limit| *limit > 0)
+            .map(|limit| limit as u64);
+
         Ok(Config {
             database,
             database_prefix: nc.database_prefix,
@@ -258,6 +332,8 @@ impl Config {
             nextcloud_url,
             log_level: opt.log_level.unwrap_or_else(|| "info".to_string()),
             bruteforce,
+            event_dispatch,
+            card_size_limit_override,
             max_connections: opt.max_connections.unwrap_or(16),
             php_timeout,
             allow_self_signed,
@@ -422,5 +498,48 @@ mod tests {
         let app = AppConfig(app);
         assert_eq!(app.get_str_at("listen").as_deref(), Some("127.0.0.1:9999"));
         assert_eq!(app.get_bool_at("record_bruteforce_attempts"), Some(true));
+    }
+
+    #[test]
+    fn parses_event_dispatch_block() {
+        let value: Value = php_literal_parser::from_str(
+            r#"[
+                'nextcloud_dav' => [
+                    'card_size_limit' => 1234,
+                    'event_dispatch' => [
+                        'enabled' => false,
+                        'notify_channel' => 'custom_channel',
+                        'handlers' => [
+                            'redis_cloud_id' => 'rust',
+                            'activity_stream' => 'php',
+                            'bogus' => 'rust',
+                        ],
+                    ],
+                ],
+            ]"#,
+        )
+        .unwrap();
+        let raw = RawConfig {
+            values: value.into_map().unwrap(),
+        };
+        let app = raw.get("nextcloud_dav").unwrap();
+        let block = app["event_dispatch"].clone();
+        assert_eq!(AppConfig(&block).get_bool_at("enabled"), Some(false));
+        assert_eq!(
+            AppConfig(&block).get_str_at("notify_channel").as_deref(),
+            Some("custom_channel")
+        );
+        let mut dispatch = EventDispatchConfig::default();
+        if let Value::Array(map) = &block["handlers"] {
+            for (key, value) in map {
+                dispatch.handlers.insert(
+                    key.as_str().unwrap().to_string(),
+                    value.as_str().unwrap().to_string(),
+                );
+            }
+        }
+        let registry = crate::outbox::EffectRegistry::from_config(&dispatch);
+        assert_eq!(registry.rust_effects(), vec!["redis_cloud_id"]);
+        assert_eq!(AppConfig(app).get_int_at("card_size_limit"), Some(1234));
     }
 }

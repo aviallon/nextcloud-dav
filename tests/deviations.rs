@@ -11,6 +11,7 @@
 mod common;
 
 use common::{call, get, propfind, report, request, TestEnv};
+use nextcloud_dav::outbox::EffectRegistry;
 use nextcloud_dav::xml::parse::{parse_document, XNode};
 use nextcloud_dav::xml::write::{NS_CARDDAV, NS_DAV, NS_OWNCLOUD};
 
@@ -18,7 +19,8 @@ const USER: &str = "alice";
 const PASSWORD: &str = "app-password";
 const BOOK_PATH: &str = "/remote.php/dav/addressbooks/users/alice/contacts";
 
-const CARD_JANE: &[u8] = b"BEGIN:VCARD\r\nVERSION:3.0\r\nUID:jane-1\r\nFN:Jane Doe\r\nEND:VCARD\r\n";
+const CARD_JANE: &[u8] =
+    b"BEGIN:VCARD\r\nVERSION:3.0\r\nUID:jane-1\r\nFN:Jane Doe\r\nEND:VCARD\r\n";
 
 /// The ids asserted below. Kept in lock-step with `deviations.toml`.
 const DECLARED_IDS: &[&str] = &[
@@ -31,6 +33,10 @@ const DECLARED_IDS: &[&str] = &[
     "contactsinteraction-php",
     "bruteforce-recording-off",
     "no-event-dispatch",
+    "events-queued-not-dispatched",
+    "jcard-rejected",
+    "vcard-2.1-rejected",
+    "effect-ownership-registry",
     "allprop-curated",
     "vcard-version-negotiation-missing",
     "conditional-get-missing",
@@ -65,7 +71,10 @@ fn deviations_toml_ids_match() {
         toml, declared,
         "tests/deviations.toml and DECLARED_IDS in tests/deviations.rs are out of sync"
     );
-    assert_eq!(toml.len(), toml.iter().collect::<std::collections::HashSet<_>>().len());
+    assert_eq!(
+        toml.len(),
+        toml.iter().collect::<std::collections::HashSet<_>>().len()
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -104,6 +113,41 @@ fn prop_text(resp: &XNode, ns: &str, local: &str) -> Option<String> {
     prop_of(resp, ns, local).map(|n| n.text.clone())
 }
 
+/// Sends a PUT with a raw body and Basic auth.
+async fn put_body(app: &axum::Router, path: &str, body: &[u8]) -> common::Resp {
+    let request = axum::http::Request::builder()
+        .method("PUT")
+        .uri(path)
+        .header(
+            axum::http::header::AUTHORIZATION,
+            common::basic(USER, PASSWORD),
+        )
+        .header(
+            axum::http::header::CONTENT_TYPE,
+            "text/vcard; charset=utf-8",
+        )
+        .body(axum::body::Body::from(body.to_vec()))
+        .unwrap();
+    call(app, request).await
+}
+
+/// The `effects` JSON and `state` of the most recent outbox row.
+async fn latest_outbox(env: &TestEnv) -> (String, i64) {
+    use sqlx::Row;
+    let sql = format!(
+        "SELECT effects, state FROM {}dav_event_outbox ORDER BY seq DESC LIMIT 1",
+        env.prefix
+    );
+    let row = sqlx::query(sqlx::AssertSqlSafe(sql))
+        .fetch_one(env.pool())
+        .await
+        .unwrap();
+    (
+        row.try_get("effects").unwrap(),
+        row.try_get("state").unwrap(),
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Fixture
 // ---------------------------------------------------------------------------
@@ -131,8 +175,12 @@ async fn fixture() -> Option<Fixture> {
     // Insert Work before Friends: the sidecar sorts, PHP does not.
     env.seed_property(book, jane, "CATEGORIES", "Work").await;
     env.seed_property(book, jane, "CATEGORIES", "Friends").await;
-    env.seed_card(book, "john.vcf", b"BEGIN:VCARD\r\nUID:john-1\r\nFN:John Smith\r\nEND:VCARD\r\n")
-        .await;
+    env.seed_card(
+        book,
+        "john.vcf",
+        b"BEGIN:VCARD\r\nUID:john-1\r\nFN:John Smith\r\nEND:VCARD\r\n",
+    )
+    .await;
     env.seed_token(USER, USER, PASSWORD, 1, 2).await;
     let app = env.app_shared();
     Some(Fixture { env, book, app })
@@ -160,9 +208,12 @@ async fn assert_deviation(id: &str, f: &Fixture) -> Result<(), String> {
             let body = r#"<d:propfind xmlns:d="DAV:"><d:prop><d:getetag/></d:prop></d:propfind>"#;
             let prop = propfind(&f.app, card_path, USER, PASSWORD, "0", body).await;
             let d = doc(&prop.body);
-            let prop_etag = prop_text(response(&d, card_path).unwrap(), NS_DAV, "getetag")
-                .unwrap_or_default();
-            ensure!(etag == prop_etag, "GET etag {etag} != PROPFIND etag {prop_etag}");
+            let prop_etag =
+                prop_text(response(&d, card_path).unwrap(), NS_DAV, "getetag").unwrap_or_default();
+            ensure!(
+                etag == prop_etag,
+                "GET etag {etag} != PROPFIND etag {prop_etag}"
+            );
         }
         "photo-delegated" => {
             let resp = get(&f.app, &format!("{card_path}?photo"), USER, PASSWORD).await;
@@ -173,7 +224,8 @@ async fn assert_deviation(id: &str, f: &Fixture) -> Result<(), String> {
             ensure!(resp.status == 501, "?export returned {}", resp.status);
         }
         "home-listing-php" => {
-            let body = r#"<d:propfind xmlns:d="DAV:"><d:prop><d:resourcetype/></d:prop></d:propfind>"#;
+            let body =
+                r#"<d:propfind xmlns:d="DAV:"><d:prop><d:resourcetype/></d:prop></d:propfind>"#;
             let resp = propfind(
                 &f.app,
                 "/remote.php/dav/addressbooks/users/alice",
@@ -189,15 +241,25 @@ async fn assert_deviation(id: &str, f: &Fixture) -> Result<(), String> {
                 .filter_map(|c| c.child(NS_DAV, "href").map(|h| h.text.clone()))
                 .collect();
             ensure!(
-                !hrefs.iter().any(|h| h.contains("z-server-generated") || h.contains("contactsinteraction")),
+                !hrefs
+                    .iter()
+                    .any(|h| h.contains("z-server-generated") || h.contains("contactsinteraction")),
                 "home listing advertises app-generated collections: {hrefs:?}"
             );
         }
         "writes-501" => {
-            for method in ["PUT", "DELETE", "MKCOL", "PROPPATCH", "MOVE", "COPY", "POST"] {
+            // PUT/DELETE are native for cards; collection writes and the other
+            // methods still delegate to PHP.
+            for method in ["MKCOL", "PROPPATCH", "MOVE", "COPY", "POST"] {
                 let resp = call(&f.app, request(method, card_path, USER, PASSWORD)).await;
                 ensure!(resp.status == 501, "{method} returned {}", resp.status);
             }
+            let resp = call(&f.app, request("PUT", BOOK_PATH, USER, PASSWORD)).await;
+            ensure!(
+                resp.status == 501,
+                "PUT on a collection returned {}",
+                resp.status
+            );
         }
         "shared-books-php" => {
             // Bob shares his book with alice; the sidecar must ignore it.
@@ -221,7 +283,11 @@ async fn assert_deviation(id: &str, f: &Fixture) -> Result<(), String> {
                 .address_books_for_user("principals/users/alice")
                 .await
                 .unwrap();
-            ensure!(books.len() == 1, "shared book leaked into the listing: {}", books.len());
+            ensure!(
+                books.len() == 1,
+                "shared book leaked into the listing: {}",
+                books.len()
+            );
             let resp = get(
                 &f.app,
                 "/remote.php/dav/addressbooks/users/alice/shared",
@@ -239,28 +305,95 @@ async fn assert_deviation(id: &str, f: &Fixture) -> Result<(), String> {
                 PASSWORD,
             )
             .await;
-            ensure!(resp.status == 404, "contactsinteraction returned {}", resp.status);
+            ensure!(
+                resp.status == 404,
+                "contactsinteraction returned {}",
+                resp.status
+            );
         }
         "bruteforce-recording-off" => {
             let resp = get(&f.app, card_path, USER, "wrong-password").await;
-            ensure!(resp.status == 401, "wrong password returned {}", resp.status);
+            ensure!(
+                resp.status == 401,
+                "wrong password returned {}",
+                resp.status
+            );
             ensure!(
                 f.env.count("bruteforce_attempts").await == 0,
                 "a bruteforce attempt was recorded although recording is off"
             );
         }
         "no-event-dispatch" => {
-            let before_cards = f.env.count("cards").await;
-            let before_changes = f.env.count("addressbookchanges").await;
-            let resp = call(&f.app, request("PUT", card_path, USER, PASSWORD)).await;
-            ensure!(resp.status == 501, "PUT returned {}", resp.status);
+            // The write commits, but the sidecar runs no listener: the event is
+            // queued for the PHP worker instead.
+            let before = f.env.count("cards").await;
+            let resp = put_body(
+                &f.app,
+                "/remote.php/dav/addressbooks/users/alice/contacts/deviation.vcf",
+                b"BEGIN:VCARD\r\nVERSION:3.0\r\nUID:dev-noevent\r\nFN:Deviation\r\nEND:VCARD\r\n",
+            )
+            .await;
+            ensure!(resp.status == 201, "PUT returned {}", resp.status);
             ensure!(
-                f.env.count("cards").await == before_cards,
-                "PUT changed the card count"
+                f.env.count("cards").await == before + 1,
+                "PUT did not persist the card"
+            );
+            let (effects, state) = latest_outbox(&f.env).await;
+            ensure!(state == 0, "outbox row is not pending (state {state})");
+            let parsed: serde_json::Value = serde_json::from_str(&effects).unwrap();
+            ensure!(
+                parsed["rust"].as_array().unwrap().is_empty(),
+                "the sidecar claims a Rust-owned effect: {effects}"
+            );
+        }
+        "events-queued-not-dispatched" => {
+            let before = f.env.count("dav_event_outbox").await;
+            let resp = put_body(
+                &f.app,
+                "/remote.php/dav/addressbooks/users/alice/contacts/queued.vcf",
+                b"BEGIN:VCARD\r\nVERSION:3.0\r\nUID:dev-queued\r\nFN:Queued\r\nEND:VCARD\r\n",
+            )
+            .await;
+            ensure!(resp.status == 201, "PUT returned {}", resp.status);
+            ensure!(
+                f.env.count("dav_event_outbox").await == before + 1,
+                "no exactly-one outbox row was queued"
+            );
+            let (effects, _state) = latest_outbox(&f.env).await;
+            ensure!(
+                effects.contains("activity_stream") && effects.contains("redis_cloud_id"),
+                "outbox effects are incomplete: {effects}"
+            );
+        }
+        "jcard-rejected" => {
+            let resp = put_body(
+                &f.app,
+                "/remote.php/dav/addressbooks/users/alice/contacts/jcard.vcf",
+                b"[\"vcard\",[]]",
+            )
+            .await;
+            ensure!(resp.status == 415, "jCard PUT returned {}", resp.status);
+        }
+        "vcard-2.1-rejected" => {
+            let resp = put_body(
+                &f.app,
+                "/remote.php/dav/addressbooks/users/alice/contacts/v21.vcf",
+                b"BEGIN:VCARD\r\nVERSION:2.1\r\nUID:v21\r\nFN:Old\r\nEND:VCARD\r\n",
+            )
+            .await;
+            ensure!(resp.status == 415, "vCard 2.1 PUT returned {}", resp.status);
+        }
+        "effect-ownership-registry" => {
+            let registry = EffectRegistry::default();
+            ensure!(
+                registry.effects_json()
+                    == r#"{"php":["activity_stream","activity_mail","notification_push","birthday_calendar","calendar_reminders","photo_cache","redis_cloud_id"],"rust":[]}"#,
+                "phase-1 registry differs: {}",
+                registry.effects_json()
             );
             ensure!(
-                f.env.count("addressbookchanges").await == before_changes,
-                "PUT changed the change log"
+                registry.rust_effects().is_empty(),
+                "phase 1 must own no effect natively"
             );
         }
         "allprop-curated" => {
@@ -304,7 +437,10 @@ async fn assert_deviation(id: &str, f: &Fixture) -> Result<(), String> {
             let req = axum::http::Request::builder()
                 .method("GET")
                 .uri(card_path)
-                .header(axum::http::header::AUTHORIZATION, common::basic(USER, PASSWORD))
+                .header(
+                    axum::http::header::AUTHORIZATION,
+                    common::basic(USER, PASSWORD),
+                )
                 .header("if-none-match", etag)
                 .body(axum::body::Body::empty())
                 .unwrap();
@@ -322,7 +458,7 @@ async fn assert_deviation(id: &str, f: &Fixture) -> Result<(), String> {
             let r = response(&d, "/remote.php/dav/addressbooks/users/alice/contacts/").unwrap();
             let size = prop_text(r, NS_CARDDAV, "max-resource-size").unwrap();
             ensure!(
-                size == "5242880",
+                size == "10000000",
                 "max-resource-size is {size}; Sabre advertises 10000000"
             );
         }
@@ -337,13 +473,13 @@ async fn assert_deviation(id: &str, f: &Fixture) -> Result<(), String> {
                 .iter()
                 .filter(|c| c.ns == NS_CARDDAV && c.local == "address-data-type")
                 .count();
-            ensure!(count == 2, "expected 2 address-data types, got {count}");
+            ensure!(count == 3, "expected 3 address-data types, got {count}");
             ensure!(
-                !types.children.iter().any(|c| c
+                types.children.iter().any(|c| c
                     .attr("content-type")
                     .map(|t| t == "application/vcard+json")
                     .unwrap_or(false)),
-                "the jCard type is now advertised"
+                "the jCard type is not advertised"
             );
         }
         "supported-collation-element-name" => {
@@ -355,18 +491,26 @@ async fn assert_deviation(id: &str, f: &Fixture) -> Result<(), String> {
             ensure!(
                 set.children
                     .iter()
-                    .all(|c| c.ns == NS_CARDDAV && c.local == "collation"),
+                    .all(|c| c.ns == NS_CARDDAV && c.local == "supported-collation"),
                 "supported-collation-set children are {:?}; Sabre uses supported-collation",
-                set.children.iter().map(|c| c.local.clone()).collect::<Vec<_>>()
+                set.children
+                    .iter()
+                    .map(|c| c.local.clone())
+                    .collect::<Vec<_>>()
             );
         }
         "sync-invalid-token-400" => {
             let body = r#"<?xml version="1.0"?><d:sync-collection xmlns:d="DAV:"><d:sync-token>42</d:sync-token><d:prop><d:getetag/></d:prop></d:sync-collection>"#;
             let resp = report(&f.app, BOOK_PATH, USER, PASSWORD, body).await;
             ensure!(
-                resp.status == 400,
-                "malformed sync token returned {}; Sabre returns 403",
+                resp.status == 403,
+                "malformed sync token returned {}",
                 resp.status
+            );
+            ensure!(
+                resp.text().contains("valid-sync-token"),
+                "403 body lacks the valid-sync-token precondition: {}",
+                resp.text()
             );
         }
         "groups-sorted" => {
@@ -390,14 +534,14 @@ async fn assert_deviation(id: &str, f: &Fixture) -> Result<(), String> {
             let body = r#"<?xml version="1.0"?><card:addressbook-query xmlns:d="DAV:" xmlns:card="urn:ietf:params:xml:ns:carddav"><d:prop><d:getetag/></d:prop></card:addressbook-query>"#;
             let resp = report(&f.app, BOOK_PATH, USER, PASSWORD, body).await;
             ensure!(
-                resp.status == 207,
+                resp.status == 415,
                 "depth-0 query on a collection returned {}; Sabre returns 415",
                 resp.status
             );
-            let d = doc(&resp.body);
             ensure!(
-                responses(&d).is_empty(),
-                "depth-0 query on a collection returned responses"
+                resp.text().contains("supported-report"),
+                "415 body lacks the supported-report precondition: {}",
+                resp.text()
             );
         }
         "authtoken-v2-only" => {
@@ -416,14 +560,27 @@ async fn assert_deviation(id: &str, f: &Fixture) -> Result<(), String> {
             );
         }
         "error-body-501" => {
-            let resp = call(&f.app, request("PUT", card_path, USER, PASSWORD)).await;
+            let resp = call(
+                &f.app,
+                request(
+                    "MKCOL",
+                    "/remote.php/dav/addressbooks/users/alice/contacts/new",
+                    USER,
+                    PASSWORD,
+                ),
+            )
+            .await;
             ensure!(
-                resp.text().contains("read-only"),
+                resp.text().contains("does not implement this method"),
                 "501 body is not the declared sidecar text: {}",
                 resp.text()
             );
         }
-        other => return Err(format!("no assertion implemented for declared id {other:?}")),
+        other => {
+            return Err(format!(
+                "no assertion implemented for declared id {other:?}"
+            ))
+        }
     }
     Ok(())
 }

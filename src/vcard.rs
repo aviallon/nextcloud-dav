@@ -124,7 +124,7 @@ fn parse_head(head: &str) -> (String, Vec<(String, Vec<String>)>) {
     (name, params)
 }
 
-fn find_unquoted_colon(s: &str) -> Option<usize> {
+pub(crate) fn find_unquoted_colon(s: &str) -> Option<usize> {
     let mut in_quotes = false;
     let mut escaped = false;
     for (idx, c) in s.char_indices() {
@@ -142,7 +142,7 @@ fn find_unquoted_colon(s: &str) -> Option<usize> {
     None
 }
 
-fn split_unquoted(s: &str, sep: char) -> Vec<String> {
+pub(crate) fn split_unquoted(s: &str, sep: char) -> Vec<String> {
     let mut parts = Vec::new();
     let mut current = String::new();
     let mut in_quotes = false;
@@ -168,7 +168,7 @@ fn split_unquoted(s: &str, sep: char) -> Vec<String> {
     parts
 }
 
-fn unquote(value: &str) -> &str {
+pub(crate) fn unquote(value: &str) -> &str {
     let bytes = value.as_bytes();
     if bytes.len() >= 2 && bytes[0] == b'"' && bytes[bytes.len() - 1] == b'"' {
         &value[1..value.len() - 1]

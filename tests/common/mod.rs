@@ -20,8 +20,9 @@ use axum::Router;
 use http_body_util::BodyExt;
 use nextcloud_dav::auth::token::hash_token;
 use nextcloud_dav::auth::Authenticator;
-use nextcloud_dav::config::BruteforceConfig;
+use nextcloud_dav::config::{BruteforceConfig, EventDispatchConfig};
 use nextcloud_dav::db::Db;
+use nextcloud_dav::outbox::EffectRegistry;
 use nextcloud_dav::php::PhpClient;
 use nextcloud_dav::routes::{router, AppState};
 use sqlx::any::AnyConnectOptions;
@@ -117,9 +118,7 @@ fn cluster() -> Option<&'static PgCluster> {
                 "-D",
                 data_dir.to_str().unwrap(),
                 "-o",
-                &format!(
-                    "-p {port} -c listen_addresses=127.0.0.1 -c max_connections=500 -F"
-                ),
+                &format!("-p {port} -c listen_addresses=127.0.0.1 -c max_connections=500 -F"),
                 "-w",
                 "start",
             ]))
@@ -378,8 +377,17 @@ impl TestEnv {
         token_type: i64,
         version: i64,
     ) {
-        self.seed_token_full(uid, login_name, password, token_type, version, None, false, now())
-            .await;
+        self.seed_token_full(
+            uid,
+            login_name,
+            password,
+            token_type,
+            version,
+            None,
+            false,
+            now(),
+        )
+        .await;
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -430,7 +438,12 @@ impl TestEnv {
         let options = AnyConnectOptions::from_str(&self.url).unwrap();
         let db = Arc::new(Db::new(options, self.prefix.clone(), 5).await.unwrap());
         let php = PhpClient::new(base, Duration::from_millis(500), false).unwrap();
-        let auth = Authenticator::new(db.clone(), php, self.secret.clone(), BruteforceConfig::default());
+        let auth = Authenticator::new(
+            db.clone(),
+            php,
+            self.secret.clone(),
+            BruteforceConfig::default(),
+        );
         let config = nextcloud_dav::config::Config {
             database: AnyConnectOptions::from_str(&self.url).unwrap(),
             database_prefix: self.prefix.clone(),
@@ -439,12 +452,21 @@ impl TestEnv {
             nextcloud_url: base.to_string(),
             log_level: "error".to_string(),
             bruteforce: BruteforceConfig::default(),
+            event_dispatch: EventDispatchConfig::default(),
+            card_size_limit_override: None,
             max_connections: 5,
             php_timeout: Duration::from_millis(500),
             allow_self_signed: false,
             config_path: std::path::PathBuf::from("/dev/null"),
         };
-        router(Arc::new(AppState { db, auth, config }))
+        router(Arc::new(AppState {
+            db,
+            auth,
+            config,
+            card_size_limit: nextcloud_dav::config::DEFAULT_CARD_SIZE_LIMIT,
+            native_writes: true,
+            registry: Arc::new(EffectRegistry::default()),
+        }))
     }
 
     /// A router that shares this env's pool instead of opening a new one.
@@ -464,12 +486,21 @@ impl TestEnv {
             nextcloud_url: "http://127.0.0.1:1/".to_string(),
             log_level: "error".to_string(),
             bruteforce: BruteforceConfig::default(),
+            event_dispatch: EventDispatchConfig::default(),
+            card_size_limit_override: None,
             max_connections: 5,
             php_timeout: Duration::from_millis(500),
             allow_self_signed: false,
             config_path: std::path::PathBuf::from("/dev/null"),
         };
-        router(Arc::new(AppState { db: self.db.clone(), auth, config }))
+        router(Arc::new(AppState {
+            db: self.db.clone(),
+            auth,
+            config,
+            card_size_limit: nextcloud_dav::config::DEFAULT_CARD_SIZE_LIMIT,
+            native_writes: true,
+            registry: Arc::new(EffectRegistry::default()),
+        }))
     }
 }
 
@@ -551,13 +582,7 @@ pub async fn propfind(
 }
 
 /// REPORT helper.
-pub async fn report(
-    app: &Router,
-    path: &str,
-    user: &str,
-    password: &str,
-    body: &str,
-) -> Resp {
+pub async fn report(app: &Router, path: &str, user: &str, password: &str, body: &str) -> Resp {
     let request = Request::builder()
         .method("REPORT")
         .uri(path)
@@ -598,9 +623,9 @@ struct Md5;
 impl Md5 {
     fn digest(input: &[u8]) -> [u8; 16] {
         const S: [u32; 64] = [
-            7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 5, 9, 14, 20, 5, 9,
-            14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4,
-            11, 16, 23, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
+            7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 5, 9, 14, 20, 5, 9, 14, 20,
+            5, 9, 14, 20, 5, 9, 14, 20, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23,
+            6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
         ];
         const K: [u32; 64] = [
             0xd76aa478, 0xe8c7b756, 0x242070db, 0xc1bdceee, 0xf57c0faf, 0x4787c62a, 0xa8304613,
@@ -640,10 +665,7 @@ impl Md5 {
                     32..=47 => (b ^ c ^ d, (3 * i + 5) % 16),
                     _ => (c ^ (b | !d), (7 * i) % 16),
                 };
-                let f = f
-                    .wrapping_add(a)
-                    .wrapping_add(K[i])
-                    .wrapping_add(m[g]);
+                let f = f.wrapping_add(a).wrapping_add(K[i]).wrapping_add(m[g]);
                 a = d;
                 d = c;
                 c = b;
@@ -768,6 +790,31 @@ CREATE TABLE oc_bruteforce_attempts (
     action varchar(255) NULL,
     metadata text NULL
 );
+CREATE TABLE oc_appconfig (
+    appid varchar(32) NOT NULL DEFAULT '',
+    configkey varchar(64) NOT NULL DEFAULT '',
+    configvalue text NULL
+);
+-- Mirrors the companion app migration; the sidecar never creates this.
+CREATE TABLE oc_dav_event_outbox (
+    seq              bigserial   PRIMARY KEY,
+    created_at       bigint      NOT NULL,
+    event_type       smallint    NOT NULL,
+    addressbookid    bigint      NOT NULL,
+    card_uri         varchar(255) NOT NULL,
+    card_row         text        NOT NULL,
+    card_data        bytea       NOT NULL,
+    effects          text        NOT NULL,
+    state            smallint    NOT NULL DEFAULT 0,
+    attempts         smallint    NOT NULL DEFAULT 0,
+    next_attempt_at  bigint      NOT NULL DEFAULT 0,
+    reserved_by      varchar(64) NULL,
+    reserved_at      bigint      NULL,
+    processed_at     bigint      NULL,
+    last_error       text        NULL
+);
+CREATE INDEX oc_dav_event_outbox_pending_idx
+    ON oc_dav_event_outbox (state, next_attempt_at, seq);
 "#;
     for statement in ddl.split(';') {
         let statement = statement.trim();

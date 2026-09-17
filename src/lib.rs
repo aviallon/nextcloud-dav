@@ -9,12 +9,15 @@
 
 pub mod auth;
 pub mod config;
+pub mod dav_error;
 pub mod db;
 pub mod error;
 pub mod model;
+pub mod outbox;
 pub mod php;
 pub mod routes;
 pub mod sync;
 pub mod util;
 pub mod vcard;
+pub mod vcard_validate;
 pub mod xml;

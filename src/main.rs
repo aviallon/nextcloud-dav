@@ -2,8 +2,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 use nextcloud_dav::auth::Authenticator;
-use nextcloud_dav::config::{Config, Opt, HELP};
+use nextcloud_dav::config::{Config, Opt, DEFAULT_CARD_SIZE_LIMIT, HELP};
 use nextcloud_dav::db::Db;
+use nextcloud_dav::outbox::{self, EffectRegistry};
 use nextcloud_dav::php::PhpClient;
 use nextcloud_dav::routes::{router, AppState};
 use std::error::Error;
@@ -50,6 +51,38 @@ async fn run() -> Result<(), Box<dyn Error>> {
     );
     db.ping().await?;
 
+    // The write-size limit: config override first, then the `dav` app-config
+    // value, then Nextcloud's default. Cached for the process lifetime.
+    let card_size_limit = match config.card_size_limit_override {
+        Some(limit) => limit,
+        None => db
+            .appconfig_value("dav", "card_size_limit")
+            .await?
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .filter(|limit| *limit > 0)
+            .unwrap_or(DEFAULT_CARD_SIZE_LIMIT),
+    };
+
+    // The outbox table is owned by the companion PHP app; the sidecar only
+    // validates it. Without it (or with event dispatch disabled) writes stay
+    // 501 so nginx falls back to PHP, while reads keep working.
+    let registry = Arc::new(EffectRegistry::from_config(&config.event_dispatch));
+    let mut native_writes = config.event_dispatch.enabled;
+    if native_writes {
+        match outbox::verify_schema(db.pool(), &config.database_prefix).await {
+            Ok(()) => log::info!("event outbox present; native PUT/DELETE enabled"),
+            Err(error) => {
+                native_writes = false;
+                log::error!(
+                    "event outbox table is missing or has an unexpected shape ({error}); \
+                     refusing native writes and returning 501 for PUT/DELETE"
+                );
+            }
+        }
+    } else {
+        log::warn!("nextcloud_dav.event_dispatch.enabled is false; native writes refused");
+    }
+
     let php = PhpClient::new(
         &config.nextcloud_url,
         config.php_timeout,
@@ -66,6 +99,9 @@ async fn run() -> Result<(), Box<dyn Error>> {
         db,
         auth,
         config: config.clone(),
+        card_size_limit,
+        native_writes,
+        registry,
     });
     let app = router(state);
 

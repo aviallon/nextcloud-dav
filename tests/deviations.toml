@@ -5,7 +5,10 @@
 # if the sidecar's behaviour (or the declared status) changes. The two files are
 # kept in sync by tests/deviations.rs::deviations_toml_ids_match.
 #
-# status: intentional | accepted | temporary | likely-wrong
+# status: intentional | accepted | temporary | likely-wrong | resolved
+#
+# `resolved` marks a former `likely-wrong` deviation that has been fixed; the
+# assertion now pins the corrected behaviour.
 #
 # Fields:
 #   id        stable identifier (also the dispatch key in the Rust test)
@@ -60,12 +63,12 @@ evidence = "docs/ARCHITECTURE.md §3; src/routes.rs:handle_propfind (DavTarget::
 [[deviation]]
 id = "writes-501"
 area = "writes"
-status = "temporary"
+status = "resolved"
 nextcloud = "PUT/DELETE/MKCOL/PROPPATCH/MOVE/COPY/POST are handled by Sabre and mutate the database (and dispatch events)."
-sidecar = "All seven methods return 501 Not Implemented; nginx intercepts the 501 and replays the buffered request to PHP."
-why = "v1 is read-only by design. Write support is being added concurrently; this entry and its test are expected to change and will flag the transition loudly."
+sidecar = "PUT and DELETE are native for a card (201/204, DB write + outbox row). MKCOL/PROPPATCH/MOVE/COPY/POST, and PUT/DELETE on a collection, still return 501 so nginx replays the buffered request to PHP."
+why = "Card create/update/delete are the hot write path; collection management and the other methods stay in PHP."
 test = "tests/deviations.rs::every_declared_deviation_holds (id=writes-501)"
-evidence = "src/routes.rs:unsupported_method; docs/ARCHITECTURE.md §7"
+evidence = "src/routes.rs:unsupported_method; src/routes.rs:put_card/delete_card; docs/ARCHITECTURE.md §7"
 
 [[deviation]]
 id = "shared-books-php"
@@ -101,11 +104,51 @@ evidence = "src/config.rs:BruteforceConfig::default; src/auth/mod.rs:record_fail
 id = "no-event-dispatch"
 area = "writes"
 status = "intentional"
-nextcloud = "createCard/updateCard/deleteCard dispatch CardCreatedEvent/CardUpdatedEvent/CardDeletedEvent, which drive search-index, activity and notification side effects."
-sidecar = "The sidecar never writes, so it never dispatches events. Even if a write path were added it would have no dispatcher."
-why = "v1 is read-only; writes go through PHP, so events are still dispatched exactly once, by PHP."
+nextcloud = "createCard/updateCard/deleteCard dispatch CardCreatedEvent/CardUpdatedEvent/CardDeletedEvent synchronously, and the listeners run before the request returns."
+sidecar = "A native write queues the event in oc_dav_event_outbox inside the card transaction and runs no listener itself; the companion PHP worker drains the queue."
+why = "Queuing decouples the card write from the listeners (a failing BirthdayListener can no longer roll back the PUT) while the outbox row makes the event durable and atomic with the card."
 test = "tests/deviations.rs::every_declared_deviation_holds (id=no-event-dispatch)"
-evidence = "src/routes.rs:unsupported_method; apps/dav/lib/CardDAV/CardDavBackend.php:createCard (dispatcher->dispatchTyped)"
+evidence = "src/db.rs:insert_outbox; src/outbox.rs; docs/recon/event-dispatch.md §1"
+
+[[deviation]]
+id = "events-queued-not-dispatched"
+area = "writes"
+status = "intentional"
+nextcloud = "The request returns only after every effect (activity, birthday, photo cache, notifications, Redis DEL) has run."
+sidecar = "The request returns after committing exactly one pending outbox row (state = 0) and a transactional pg_notify; no effect runs in the sidecar process."
+why = "Phase 1 keeps every effect in PHP. The frozen effects map records the ownership so a later phase can move one effect to Rust without double dispatch."
+test = "tests/deviations.rs::every_declared_deviation_holds (id=events-queued-not-dispatched)"
+evidence = "src/db.rs:insert_outbox; src/outbox.rs:EffectRegistry"
+
+[[deviation]]
+id = "jcard-rejected"
+area = "writes"
+status = "intentional"
+nextcloud = "A body starting with `[` is parsed as jCard (RFC 7095) and re-serialised to vCard before storage."
+sidecar = "jCard PUT bodies are rejected with 415; only vCard text is accepted."
+why = "Re-serialising to vCard would break byte stability and the ETag. jCard is declared unsupported instead of being silently converted."
+test = "tests/deviations.rs::every_declared_deviation_holds (id=jcard-rejected)"
+evidence = "src/vcard_validate.rs:validate; 3rdparty/sabre/dav/lib/CardDAV/Plugin.php:validateVCard"
+
+[[deviation]]
+id = "vcard-2.1-rejected"
+area = "writes"
+status = "intentional"
+nextcloud = "vCard 2.1 is level 3 (rejected) under PROFILE_CARDDAV; the sidecar also has no REPAIR layer, so 2.1 is never upgraded."
+sidecar = "A VERSION other than 3.0 or 4.0 (including 2.1) is rejected with 415."
+why = "CardDAV servers must not accept 2.1. We do not implement Sabre's REPAIR, so the only safe behaviour is to match the strict result."
+test = "tests/deviations.rs::every_declared_deviation_holds (id=vcard-2.1-rejected)"
+evidence = "src/vcard_validate.rs:validate; 3rdparty/sabre/vobject/lib/Component/VCard.php:validate"
+
+[[deviation]]
+id = "effect-ownership-registry"
+area = "writes"
+status = "intentional"
+nextcloud = "Effects are produced unconditionally by the PHP listeners registered on the card events."
+sidecar = "Every effect id is claimed by exactly one backend in the registry; phase 1 is all `php` with an empty `rust` list, frozen into each outbox row."
+why = "Single ownership makes double dispatch structurally impossible when an effect later moves to Rust."
+test = "tests/deviations.rs::every_declared_deviation_holds (id=effect-ownership-registry)"
+evidence = "src/outbox.rs:EffectRegistry; docs/recon/event-dispatch.md §3.4"
 
 [[deviation]]
 id = "allprop-curated"
@@ -140,42 +183,42 @@ evidence = "src/routes.rs:get_card"
 [[deviation]]
 id = "max-resource-size-wrong"
 area = "propfind"
-status = "likely-wrong"
+status = "resolved"
 nextcloud = "Sabre's CardDAV plugin advertises {carddav}max-resource-size = 10000000 (10 MB); Nextcloud does not override it. The separate write-validation limit is card_size_limit = 5242880."
-sidecar = "Returns 5242880 (5 MiB) for {carddav}max-resource-size."
-why = "The sidecar conflates Nextcloud's write size limit with Sabre's advertised max-resource-size property. Reported as a likely bug; the test pins the current value so a fix fails the suite and forces this entry to be updated."
+sidecar = "Returns 10000000, matching Sabre; the write limit is enforced separately on PUT."
+why = "Previously conflated the write limit with the advertised property. Fixed."
 test = "tests/deviations.rs::every_declared_deviation_holds (id=max-resource-size-wrong)"
-evidence = "src/config.rs:MAX_RESOURCE_SIZE; 3rdparty/sabre/dav/lib/CardDAV/Plugin.php:58; apps/dav/lib/CardDAV/Validation/CardDavValidatePlugin.php:34"
+evidence = "src/config.rs:MAX_RESOURCE_SIZE; src/routes.rs:resolve_property; 3rdparty/sabre/dav/lib/CardDAV/Plugin.php:58"
 
 [[deviation]]
 id = "supported-address-data-missing-json"
 area = "propfind"
-status = "likely-wrong"
+status = "resolved"
 nextcloud = "Sabre advertises three {carddav}address-data-type entries: text/vcard 3.0, text/vcard 4.0 and application/vcard+json 4.0."
-sidecar = "Advertises only text/vcard 3.0 and text/vcard 4.0."
-why = "The jCard type is missing. Reported as a likely bug; the test pins the two-entry set so adding the third fails the suite."
+sidecar = "Advertises all three entries."
+why = "The jCard type was missing. Fixed."
 test = "tests/deviations.rs::every_declared_deviation_holds (id=supported-address-data-missing-json)"
 evidence = "src/routes.rs:resolve_property (supported-address-data); 3rdparty/sabre/dav/lib/CardDAV/Xml/Property/SupportedAddressData.php:39"
 
 [[deviation]]
 id = "supported-collation-element-name"
 area = "propfind"
-status = "likely-wrong"
+status = "resolved"
 nextcloud = "Sabre emits <card:supported-collation> children inside {carddav}supported-collation-set."
-sidecar = "Emits <card:collation> children."
-why = "Wrong element name; clients parsing the standard element will not see the collations. Reported as a likely bug; the test pins the current name so a fix fails the suite."
+sidecar = "Emits <card:supported-collation> children."
+why = "The wrong element name was used before. Fixed."
 test = "tests/deviations.rs::every_declared_deviation_holds (id=supported-collation-element-name)"
 evidence = "src/routes.rs:resolve_property (supported-collation-set); 3rdparty/sabre/dav/lib/CardDAV/Xml/Property/SupportedCollationSet.php:42"
 
 [[deviation]]
 id = "sync-invalid-token-400"
 area = "sync"
-status = "likely-wrong"
+status = "resolved"
 nextcloud = "A sync-token that does not start with http://sabre.io/ns/sync/ raises Sabre\\DAV\\Exception\\InvalidSyncToken, which extends Forbidden => HTTP 403 with a <d:valid-sync-token/> precondition body."
-sidecar = "Returns 400 Bad Request with a plain-text body."
-why = "Status code differs from Sabre (403 vs 400). Reported as a likely bug; the test pins 400 so a fix fails the suite."
+sidecar = "Returns 403 with the same <d:valid-sync-token/> body."
+why = "Previously returned 400. Fixed."
 test = "tests/deviations.rs::every_declared_deviation_holds (id=sync-invalid-token-400)"
-evidence = "src/sync.rs:parse_sync_token; 3rdparty/sabre/dav/lib/DAV/Sync/Plugin.php:116; 3rdparty/sabre/dav/lib/DAV/Exception/InvalidSyncToken.php"
+evidence = "src/sync.rs:parse_sync_token; src/dav_error.rs:invalid_sync_token; 3rdparty/sabre/dav/lib/DAV/Sync/Plugin.php:116"
 
 [[deviation]]
 id = "groups-sorted"
@@ -190,12 +233,12 @@ evidence = "src/db.rs:contact_groups; apps/dav/lib/CardDAV/CardDavBackend.php:co
 [[deviation]]
 id = "query-depth0-on-collection"
 area = "report"
-status = "likely-wrong"
+status = "resolved"
 nextcloud = "addressbook-query with Depth: 0 on a collection raises ReportNotSupported (HTTP 415) because the target is not an ICard."
-sidecar = "Returns 207 with zero responses (it looks up a card whose URI equals the book name and finds none)."
-why = "Status code and body differ. Reported as a likely bug; the test pins the current 207 so a fix fails the suite."
+sidecar = "Returns 415 with a <d:supported-report/> body."
+why = "Previously returned 207 with zero responses. Fixed."
 test = "tests/deviations.rs::every_declared_deviation_holds (id=query-depth0-on-collection)"
-evidence = "src/routes.rs:handle_report_book (depth == 0 branch); 3rdparty/sabre/dav/lib/CardDAV/Plugin.php:402"
+evidence = "src/routes.rs:handle_report_book; 3rdparty/sabre/dav/lib/CardDAV/Plugin.php:402"
 
 [[deviation]]
 id = "authtoken-v2-only"
@@ -212,7 +255,7 @@ id = "error-body-501"
 area = "writes"
 status = "accepted"
 nextcloud = "A 501 from Sabre would carry Sabre's XML/HTML error body."
-sidecar = "The 501 carries a plain-text body: 'This CardDAV sidecar is read-only; this method is served by Nextcloud PHP.'"
+sidecar = "The 501 (returned for MKCOL/PROPPATCH/MOVE/COPY/POST, and for any write while native writes are unavailable) carries a plain-text body."
 why = "nginx intercepts every sidecar 501 and re-dispatches to PHP, so a real client never sees this body. It exists to make the delegation explicit in logs."
 test = "tests/deviations.rs::every_declared_deviation_holds (id=error-body-501)"
 evidence = "src/routes.rs:not_implemented"

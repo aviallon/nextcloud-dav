@@ -111,8 +111,28 @@ counting.
   temporary type → PHP fallback (502 with the unreachable test backend), wipe
   token, brute-force recording off.
 - Access control: other users' and missing resources are 404, not 403.
-- Writes: all seven methods 501; `?photo`/`?export` 501.
+- Collection writes (`MKCOL`/`PROPPATCH`/`MOVE`/`COPY`/`POST`, and PUT/DELETE on
+  a collection) are 501; `?photo`/`?export` 501.
 - OPTIONS discovery headers; unauthenticated 401.
+
+### `write_path.rs` — native `PUT`/`DELETE`
+
+The production router with native writes enabled and the outbox table present:
+
+- Create → 201 + quoted ETag; the `oc_cards` row (carddata/etag/size/uid/
+  lastmodified), `oc_addressbookchanges` operation 1 with the pre-increment
+  token, `oc_addressbooks.synctoken` +1, and `oc_cards_properties` including
+  `TYPE=PREF` → `preferred = 1` and the `mb_strcut(…, 254)` truncation on a
+  multibyte value.
+- Update → 204 + a changed ETag and operation 2.
+- Delete → 204, properties purged, operation 3, and a delete outbox row whose
+  `card_data` is the pre-delete (post-`readBlob`) snapshot.
+- `If-Match` mismatch 412 / quoted or unquoted match 204; `If-None-Match: *`
+  412 on an existing card and 201 on a missing one.
+- Validation: duplicate UID 409 (with the conflicting href), missing UID 400,
+  bad `VERSION` 415, oversized body 403, ISO-8859-1 → UTF-8 conversion.
+- Atomicity: the outbox row is present on success and absent when the
+  transaction fails (a forced mid-transaction error rolls back the card too).
 
 ### `deviations.rs` — the declared exceptions
 
@@ -152,13 +172,14 @@ requires a TOML entry **and** a matching `DECLARED_IDS` entry **and** an
 assertion in `assert_deviation()`; otherwise `deviations_toml_ids_match` or
 `every_declared_deviation_holds` fails.
 
-Current `likely-wrong` entries (the sidecar probably differs from Nextcloud;
-not fixed here, pinned by a test): `max-resource-size-wrong`,
-`supported-address-data-missing-json`, `supported-collation-element-name`,
-`sync-invalid-token-400`, `query-depth0-on-collection`.
+Current `resolved` entries (formerly `likely-wrong`, now fixed and pinned by a
+test): `max-resource-size-wrong`, `supported-address-data-missing-json`,
+`supported-collation-element-name`, `sync-invalid-token-400`,
+`query-depth0-on-collection`, `writes-501`.
 
-`writes-501` is marked `temporary`: write support is being added concurrently,
-so that test is expected to fail and force the declaration to be updated.
+Write-path deviations added with the native write support:
+`no-event-dispatch`, `events-queued-not-dispatched`, `jcard-rejected`,
+`vcard-2.1-rejected`, `effect-ownership-registry`.
 
 ## What is NOT covered
 
@@ -170,8 +191,11 @@ so that test is expected to fail and force the declaration to be updated.
   `3rdparty/sabre/dav` for expectations and fixtures, but did not run PHPUnit.
 - **Shared / group / system address books**, `contactsinteraction`, `?photo`
   and `?export` internals — declared PHP-only.
-- **Writes** — currently 501; the new write path is being implemented in
-  `src/` by another agent and is not exercised here.
+- **Writes** — card `PUT`/`DELETE` are exercised in `write_path.rs`;
+  collection management, `MOVE`/`COPY` and `?photo`/`?export` remain PHP-only
+  (declared).
+- **The PHP outbox worker** — the sidecar only queues events; draining the
+  `oc_dav_event_outbox` queue is the companion app's job and is not tested here.
 - **vCard version negotiation, conditional GET, `allprop` completeness** —
   declared deviations.
 - **MySQL / SQLite.** The sidecar supports them via `sqlx::Any`; the tests only
@@ -186,7 +210,7 @@ so that test is expected to fail and force the declaration to be updated.
 
 - The differential harness against a real PHP backend (no local Nextcloud PHP
   instance). Run it against the deployed instance read-only.
-- Anything requiring the concurrent write path (PUT/DELETE/MKCOL/…), which is
-  still 501 at the time of writing.
+- Anything requiring collection management (`MKCOL`, `MOVE`, `COPY`, …), which
+  is still 501 and served by PHP.
 - `max-resource-size` and `supported-address-data` against a deployed NC 33 to
   confirm the vendored Sabre version behaves like the NC 36 checkout.

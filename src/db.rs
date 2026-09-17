@@ -17,8 +17,32 @@
 use crate::error::{Error, Result};
 use crate::model::{AddressBook, AuthToken, Card, CardIdUri, ChangeRow};
 use crate::vcard;
+use md5::{Digest, Md5};
 use sqlx::any::{AnyConnectOptions, AnyPoolOptions, AnyRow};
 use sqlx::{Any, AnyPool, Row};
+
+/// `CardDavBackend::INDEXED_PROPERTIES` (`CardDavBackend.php:47-50`). Only these
+/// property names are mirrored into `oc_cards_properties` for search.
+const INDEXED_PROPERTIES: &[&str] = &[
+    "BDAY",
+    "UID",
+    "N",
+    "FN",
+    "TITLE",
+    "ROLE",
+    "NOTE",
+    "NICKNAME",
+    "ORG",
+    "CATEGORIES",
+    "EMAIL",
+    "TEL",
+    "IMPP",
+    "ADR",
+    "URL",
+    "GEO",
+    "CLOUD",
+    "X-SOCIALPROFILE",
+];
 
 pub struct Db {
     pool: AnyPool,
@@ -318,6 +342,411 @@ impl Db {
     }
 
     // ------------------------------------------------------------------
+    // Card writes (native PUT/DELETE) + the event outbox
+    // ------------------------------------------------------------------
+
+    /// `oc_appconfig` lookup. `card_size_limit` is read once at startup.
+    pub async fn appconfig_value(&self, app: &str, key: &str) -> Result<Option<String>> {
+        let sql = self.render(&format!(
+            "SELECT configvalue FROM {}appconfig WHERE appid = ? AND configkey = ? LIMIT 1",
+            self.prefix
+        ));
+        let row = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(app)
+            .bind(key)
+            .fetch_optional(&self.pool)
+            .await?;
+        match row {
+            Some(row) => Ok(row.try_get::<Option<String>, _>("configvalue")?),
+            None => Ok(None),
+        }
+    }
+
+    /// Id and URI of the card carrying `uid` in an address book, if any.
+    /// Mirrors `CardDavBackend::getCardByUid()`.
+    pub async fn card_by_uid(
+        &self,
+        address_book_id: i64,
+        uid: &str,
+    ) -> Result<Option<(i64, String)>> {
+        let sql = self.render(&format!(
+            "SELECT id, uri FROM {}cards WHERE addressbookid = ? AND uid = ? LIMIT 1",
+            self.prefix
+        ));
+        let row = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(address_book_id)
+            .bind(uid)
+            .fetch_optional(&self.pool)
+            .await?;
+        match row {
+            Some(row) => Ok(Some((
+                row.try_get("id")?,
+                row.try_get::<Option<String>, _>("uri")?.unwrap_or_default(),
+            ))),
+            None => Ok(None),
+        }
+    }
+
+    /// The single transaction behind a native PUT.
+    ///
+    /// Mirrors `CardDavBackend::createCard()` (operation 1) and
+    /// `updateCard()` (operation 2): write `oc_cards`, append the change row
+    /// carrying the pre-increment sync token and bump the book's token, rebuild
+    /// `oc_cards_properties`, then enqueue the outbox event and wake the PHP
+    /// worker with a transactional `pg_notify`.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn put_card(
+        &self,
+        address_book_id: i64,
+        uri: &str,
+        carddata: &[u8],
+        uid: &str,
+        existing: bool,
+        registry: &crate::outbox::EffectRegistry,
+        notify_channel: &str,
+    ) -> Result<Card> {
+        let etag = md5_hex(carddata);
+        let now = now_unix();
+        let size = carddata.len() as i64;
+        let mut tx = self.pool.begin().await?;
+
+        let card_id = if existing {
+            let sql = self.render(&format!(
+                "UPDATE {}cards SET carddata = ?, lastmodified = ?, size = ?, etag = ?, uid = ? \
+                 WHERE addressbookid = ? AND uri = ?",
+                self.prefix
+            ));
+            let result = sqlx::query(sqlx::AssertSqlSafe(sql))
+                .bind(carddata.to_vec())
+                .bind(now)
+                .bind(size)
+                .bind(&etag)
+                .bind(uid)
+                .bind(address_book_id)
+                .bind(uri)
+                .execute(&mut *tx)
+                .await?;
+            if result.rows_affected() == 0 {
+                return Err(Error::NotFound);
+            }
+            self.card_id(&mut tx, address_book_id, uri).await?
+        } else {
+            let sql = self.render(&format!(
+                "INSERT INTO {}cards (carddata, uri, lastmodified, addressbookid, size, etag, uid) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING id",
+                self.prefix
+            ));
+            let row = sqlx::query(sqlx::AssertSqlSafe(sql))
+                .bind(carddata.to_vec())
+                .bind(uri)
+                .bind(now)
+                .bind(address_book_id)
+                .bind(size)
+                .bind(&etag)
+                .bind(uid)
+                .fetch_one(&mut *tx)
+                .await?;
+            row.try_get("id")?
+        };
+
+        let operation = if existing {
+            crate::outbox::EVENT_UPDATE
+        } else {
+            crate::outbox::EVENT_CREATE
+        };
+        self.add_change(&mut tx, address_book_id, uri, operation, now)
+            .await?;
+        self.update_properties(&mut tx, address_book_id, card_id, carddata)
+            .await?;
+
+        // Snapshot exactly what PHP's `getCard()` would return: `readBlob()`
+        // filtering may shrink `carddata` and `size`.
+        let (carddata_filtered, modified) = vcard::filter_read_blob(carddata);
+        let snapshot = Card {
+            id: card_id,
+            uri: uri.to_string(),
+            etag: etag.clone(),
+            size: if modified {
+                carddata_filtered.len() as i64
+            } else {
+                size
+            },
+            lastmodified: Some(now),
+            carddata: carddata_filtered,
+        };
+        self.insert_outbox(
+            &mut tx,
+            operation,
+            address_book_id,
+            uri,
+            &snapshot,
+            uid,
+            registry,
+            notify_channel,
+            now,
+        )
+        .await?;
+
+        tx.commit().await?;
+        Ok(snapshot)
+    }
+
+    /// The single transaction behind a native DELETE.
+    ///
+    /// Mirrors `CardDavBackend::deleteCard()`: read the pre-delete row (the
+    /// event snapshot), delete it, log operation 3, purge the search columns and
+    /// enqueue the delete event. Returns `None` when the card does not exist
+    /// (Sabre answers 404).
+    pub async fn delete_card(
+        &self,
+        address_book_id: i64,
+        uri: &str,
+        registry: &crate::outbox::EffectRegistry,
+        notify_channel: &str,
+    ) -> Result<Option<Card>> {
+        let mut tx = self.pool.begin().await?;
+        let Some((card, uid)) = self.fetch_card(&mut tx, address_book_id, uri).await? else {
+            return Ok(None);
+        };
+        let now = now_unix();
+
+        let sql = self.render(&format!(
+            "DELETE FROM {}cards WHERE addressbookid = ? AND uri = ?",
+            self.prefix
+        ));
+        sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(address_book_id)
+            .bind(uri)
+            .execute(&mut *tx)
+            .await?;
+
+        self.add_change(
+            &mut tx,
+            address_book_id,
+            uri,
+            crate::outbox::EVENT_DELETE,
+            now,
+        )
+        .await?;
+        self.purge_properties(&mut tx, address_book_id, card.id)
+            .await?;
+        self.insert_outbox(
+            &mut tx,
+            crate::outbox::EVENT_DELETE,
+            address_book_id,
+            uri,
+            &card,
+            &uid,
+            registry,
+            notify_channel,
+            now,
+        )
+        .await?;
+
+        tx.commit().await?;
+        Ok(Some(card))
+    }
+
+    /// `CardDavBackend::getCardId()` inside a transaction.
+    async fn card_id(
+        &self,
+        tx: &mut sqlx::Transaction<'_, Any>,
+        address_book_id: i64,
+        uri: &str,
+    ) -> Result<i64> {
+        let sql = self.render(&format!(
+            "SELECT id FROM {}cards WHERE addressbookid = ? AND uri = ? LIMIT 1",
+            self.prefix
+        ));
+        let row = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(address_book_id)
+            .bind(uri)
+            .fetch_optional(&mut **tx)
+            .await?;
+        match row {
+            Some(row) => Ok(row.try_get("id")?),
+            None => Err(Error::NotFound),
+        }
+    }
+
+    /// Reads one card inside a transaction, applying `readBlob()` filtering.
+    /// Returns the card plus its stored `uid` (the outbox snapshot needs both).
+    async fn fetch_card(
+        &self,
+        tx: &mut sqlx::Transaction<'_, Any>,
+        address_book_id: i64,
+        uri: &str,
+    ) -> Result<Option<(Card, String)>> {
+        let sql = self.render(&format!(
+            "SELECT id, uri, etag, size, lastmodified, carddata, uid \
+             FROM {}cards WHERE addressbookid = ? AND uri = ? LIMIT 1",
+            self.prefix
+        ));
+        let row = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(address_book_id)
+            .bind(uri)
+            .fetch_optional(&mut **tx)
+            .await?;
+        match row {
+            Some(row) => {
+                let uid = row.try_get::<Option<String>, _>("uid")?.unwrap_or_default();
+                Ok(Some((card_from_row(&row)?, uid)))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// `CardDavBackend::addChange()`: insert the change row carrying the
+    /// *pre-increment* token, then bump the book's synctoken.
+    async fn add_change(
+        &self,
+        tx: &mut sqlx::Transaction<'_, Any>,
+        address_book_id: i64,
+        uri: &str,
+        operation: i16,
+        now: i64,
+    ) -> Result<()> {
+        let select = self.render(&format!(
+            "SELECT synctoken FROM {}addressbooks WHERE id = ?",
+            self.prefix
+        ));
+        let token: i64 = sqlx::query(sqlx::AssertSqlSafe(select))
+            .bind(address_book_id)
+            .fetch_one(&mut **tx)
+            .await?
+            .try_get("synctoken")?;
+        let insert = self.render(&format!(
+            "INSERT INTO {}addressbookchanges (uri, synctoken, addressbookid, operation, created_at) \
+             VALUES (?, ?, ?, ?, ?)",
+            self.prefix
+        ));
+        sqlx::query(sqlx::AssertSqlSafe(insert))
+            .bind(uri)
+            .bind(token)
+            .bind(address_book_id)
+            .bind(operation)
+            .bind(now)
+            .execute(&mut **tx)
+            .await?;
+        let update = self.render(&format!(
+            "UPDATE {}addressbooks SET synctoken = ? WHERE id = ?",
+            self.prefix
+        ));
+        sqlx::query(sqlx::AssertSqlSafe(update))
+            .bind(token + 1)
+            .bind(address_book_id)
+            .execute(&mut **tx)
+            .await?;
+        Ok(())
+    }
+
+    /// `CardDavBackend::updateProperties()` + `purgeProperties()`: rebuild the
+    /// indexed search columns for a card.
+    async fn update_properties(
+        &self,
+        tx: &mut sqlx::Transaction<'_, Any>,
+        address_book_id: i64,
+        card_id: i64,
+        carddata: &[u8],
+    ) -> Result<()> {
+        self.purge_properties(tx, address_book_id, card_id).await?;
+        let card = vcard::parse(carddata);
+        for property in &card.properties {
+            if !INDEXED_PROPERTIES.contains(&property.name.as_str()) {
+                continue;
+            }
+            // `TYPE=PREF` is case-insensitive on the parameter value.
+            let preferred = property.params.iter().any(|(name, values)| {
+                name == "TYPE"
+                    && values
+                        .iter()
+                        .any(|value| value.eq_ignore_ascii_case("PREF"))
+            });
+            // `mb_strcut($value, 0, 254)`: 254 bytes, never splitting a UTF-8
+            // code point.
+            let value = truncate_utf8(&property.value, 254);
+            let sql = self.render(&format!(
+                "INSERT INTO {}cards_properties (addressbookid, cardid, name, value, preferred) \
+                 VALUES (?, ?, ?, ?, ?)",
+                self.prefix
+            ));
+            sqlx::query(sqlx::AssertSqlSafe(sql))
+                .bind(address_book_id)
+                .bind(card_id)
+                .bind(&property.name)
+                .bind(value)
+                .bind(i32::from(preferred))
+                .execute(&mut **tx)
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn purge_properties(
+        &self,
+        tx: &mut sqlx::Transaction<'_, Any>,
+        address_book_id: i64,
+        card_id: i64,
+    ) -> Result<()> {
+        let sql = self.render(&format!(
+            "DELETE FROM {}cards_properties WHERE cardid = ? AND addressbookid = ?",
+            self.prefix
+        ));
+        sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(card_id)
+            .bind(address_book_id)
+            .execute(&mut **tx)
+            .await?;
+        Ok(())
+    }
+
+    /// Inserts the event-outbox row and (on PostgreSQL) `pg_notify`s the
+    /// worker. Both happen inside the caller's card transaction, so the event
+    /// and the card commit or roll back together.
+    #[allow(clippy::too_many_arguments)]
+    async fn insert_outbox(
+        &self,
+        tx: &mut sqlx::Transaction<'_, Any>,
+        event_type: i16,
+        address_book_id: i64,
+        uri: &str,
+        card: &Card,
+        uid: &str,
+        registry: &crate::outbox::EffectRegistry,
+        notify_channel: &str,
+        now: i64,
+    ) -> Result<()> {
+        let card_row = crate::outbox::card_row_json(card, uid).to_string();
+        let effects = registry.effects_json();
+        let sql = self.render(&format!(
+            "INSERT INTO {}dav_event_outbox \
+             (created_at, event_type, addressbookid, card_uri, card_row, card_data, effects) \
+             VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING seq",
+            self.prefix
+        ));
+        let seq: i64 = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(now)
+            .bind(event_type)
+            .bind(address_book_id)
+            .bind(uri)
+            .bind(card_row)
+            .bind(card.carddata.clone())
+            .bind(effects)
+            .fetch_one(&mut **tx)
+            .await?
+            .try_get("seq")?;
+        if self.postgres {
+            let sql = self.render("SELECT pg_notify(?, ?)");
+            sqlx::query(sqlx::AssertSqlSafe(sql))
+                .bind(notify_channel)
+                .bind(seq.to_string())
+                .execute(&mut **tx)
+                .await?;
+        }
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------
     // Brute force (read + the single opt-in write)
     // ------------------------------------------------------------------
 
@@ -392,6 +821,32 @@ pub fn placeholder(index: usize, postgres: bool) -> String {
     } else {
         "?".to_string()
     }
+}
+
+/// Unix seconds, as PHP's `time()`.
+pub fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// `md5($cardData)` as lower-case hex.
+pub fn md5_hex(data: &[u8]) -> String {
+    hex::encode(Md5::digest(data))
+}
+
+/// `mb_strcut($value, 0, 254)`: truncate to at most `max` bytes without
+/// splitting a UTF-8 code point.
+pub fn truncate_utf8(value: &str, max: usize) -> &str {
+    if value.len() <= max {
+        return value;
+    }
+    let mut end = max;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    &value[..end]
 }
 
 fn address_book_from_row(row: &AnyRow) -> Result<AddressBook> {

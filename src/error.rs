@@ -26,6 +26,8 @@ pub enum Error {
     Unauthorized,
     #[error("not found")]
     NotFound,
+    #[error("invalid or unknown sync token")]
+    InvalidSyncToken,
     #[error("{1}")]
     Status(StatusCode, String),
     #[error("internal error: {0}")]
@@ -48,6 +50,7 @@ impl Error {
             Error::BadRequest(_) | Error::Xml(_) => StatusCode::BAD_REQUEST,
             Error::Unauthorized => StatusCode::UNAUTHORIZED,
             Error::NotFound | Error::NoPrincipal => StatusCode::NOT_FOUND,
+            Error::InvalidSyncToken => StatusCode::FORBIDDEN,
             Error::Status(status, _) => *status,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         }
@@ -56,6 +59,11 @@ impl Error {
 
 impl IntoResponse for Error {
     fn into_response(self) -> Response {
+        // The sync-token precondition carries a Sabre XML body, not our plain
+        // text; render it before the generic path.
+        if matches!(self, Error::InvalidSyncToken) {
+            return crate::dav_error::invalid_sync_token();
+        }
         let status = self.status();
         let body = self.to_string();
         let mut response = (status, body).into_response();
