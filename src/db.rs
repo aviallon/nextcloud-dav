@@ -228,10 +228,15 @@ impl Db {
     // ------------------------------------------------------------------
 
     pub async fn authtoken_by_hash(&self, hash: &str) -> Result<Option<AuthToken>> {
+        // `version` is `PublicKeyToken::VERSION`, which is 2 on both Nextcloud 33
+        // and 36 (lib/private/Authentication/Token/PublicKeyToken.php).
+        // `PublicKeyTokenMapper` filters on exactly this value, so the sidecar
+        // must too; a mismatch only means we fall back to PHP, never that we
+        // accept a token Nextcloud would reject.
         let sql = self.render(&format!(
             "SELECT uid, login_name, type, expires, last_check, last_activity, \
                     CASE WHEN password_invalid THEN '1' ELSE '0' END AS password_invalid_flag \
-             FROM {}authtoken WHERE token = ? AND version = 1 LIMIT 1",
+             FROM {}authtoken WHERE token = ? AND version = 2 LIMIT 1",
             self.prefix
         ));
         let row = sqlx::query(sqlx::AssertSqlSafe(sql))
