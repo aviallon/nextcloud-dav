@@ -1337,6 +1337,7 @@ dependencies = [
  "base64 0.22.1",
  "env_logger",
  "hex",
+ "http-body-util",
  "httpdate",
  "indexmap",
  "log",
@@ -1350,6 +1351,7 @@ dependencies = [
  "sqlx",
  "thiserror",
  "tokio",
+ "tower",
 ]
 
 [[package]]
