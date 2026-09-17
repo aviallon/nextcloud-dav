@@ -1,0 +1,61 @@
+<?xml version="1.0"?>
+<!--
+  - SPDX-FileCopyrightText: 2026 nextcloud-dav contributors
+  - SPDX-License-Identifier: AGPL-3.0-or-later
+-->
+<info xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+	  xsi:noNamespaceSchemaLocation="https://apps.nextcloud.com/schema/apps/info.xsd">
+	<id>nextcloud_dav</id>
+	<name>Nextcloud DAV event dispatcher</name>
+	<summary>Drains the nextcloud-dav sidecar event outbox and dispatches CardDAV events</summary>
+	<description><![CDATA[
+Companion app for the `nextcloud-dav` CardDAV sidecar.
+
+The sidecar performs native `PUT`/`DELETE` and writes an outbox row in the same
+database transaction as the card write. This app owns the outbox table
+(`<prefix>dav_event_outbox`) and ships a resident worker (`occ
+dav:event-dispatch`) that dispatches the real `CardCreatedEvent` /
+`CardUpdatedEvent` / `CardDeletedEvent` through Nextcloud's normal listeners
+(activity, birthday calendar, photo cache, push, webhooks).
+
+A background job (`OutboxJanitor`) re-arms stale reservations and removes done
+rows past the retention window.
+]]></description>
+	<version>1.0.0</version>
+	<licence>AGPL-3.0-or-later</licence>
+	<author>nextcloud-dav contributors</author>
+	<namespace>NextcloudDav</namespace>
+	<category>integration</category>
+	<bugs>https://github.com/nextcloud/server/issues</bugs>
+	<!--
+		Nextcloud's info.xml has no app-to-app dependency element (see
+		resources/app-info.xsd and lib/private/App/DependencyAnalyzer.php), so the
+		hard dependency on the shipped `dav` app is enforced at runtime:
+		OCA\NextcloudDav\Command\EventDispatch refuses to start unless the `dav`
+		application can be loaded and OCA\DAV\Events\CardCreatedEvent exists.
+	-->
+	<dependencies>
+		<!-- The APIs used here (IQueryBuilder::forUpdate + ConflictResolutionMode,
+		     ISetupManager/ITempManager, the Card*Event listeners) are all present
+		     since NC 33, which is the deployed version; the checkout is 36-dev. -->
+		<nextcloud min-version="33" max-version="36"/>
+	</dependencies>
+
+	<background-jobs>
+		<job>OCA\NextcloudDav\Cron\OutboxJanitor</job>
+	</background-jobs>
+
+	<repair-steps>
+		<uninstall>
+			<step>OCA\NextcloudDav\Repair\DropOutbox</step>
+		</uninstall>
+	</repair-steps>
+
+	<commands>
+		<command>OCA\NextcloudDav\Command\EventDispatch</command>
+	</commands>
+
+	<settings>
+		<admin>OCA\NextcloudDav\Settings\Admin</admin>
+	</settings>
+</info>
