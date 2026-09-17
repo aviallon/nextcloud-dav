@@ -13,6 +13,10 @@ brute-force throttling parity.
 > them back to PHP. Shared/group/system address books are not served and must
 > stay routed to PHP.
 
+See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the as-built design:
+deployment topology, the nginx split and its failure mode, the app-password
+fast path, the sync-token scheme, the data model, and the operational traps.
+
 ## What works
 
 | Capability | Notes |
