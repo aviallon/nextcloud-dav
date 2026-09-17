@@ -449,7 +449,7 @@ async fn handle_propfind(
                 owner_displayname: owner_displayname.clone(),
                 groups: Vec::new(),
             };
-            responses.push(build_response(href, NodeData::Home, &ctx, &request.props));
+            responses.push(build_response(&collection_href(href), NodeData::Home, &ctx, &request.props));
             if depth >= 1 {
                 let books = state.db.address_books_for_user(&principal(user)).await?;
                 for book in &books {
@@ -484,7 +484,7 @@ async fn handle_propfind(
                 groups,
             };
             responses.push(build_response(
-                href,
+                &collection_href(href),
                 NodeData::Book(&book),
                 &ctx,
                 &request.props,
@@ -552,6 +552,18 @@ async fn requested_groups(props: &PropList, book: &AddressBook, db: &Db) -> Resu
         db.contact_groups(book.id).await
     } else {
         Ok(Vec::new())
+    }
+}
+
+/// Collection responses must carry a trailing slash, exactly as Sabre emits
+/// them (`/remote.php/dav/addressbooks/users/<u>/<book>/`). Children are built
+/// by appending to the slash-less href, so only the collection's own response
+/// is normalised here.
+fn collection_href(href: &str) -> String {
+    if href.ends_with('/') {
+        href.to_string()
+    } else {
+        format!("{href}/")
     }
 }
 
