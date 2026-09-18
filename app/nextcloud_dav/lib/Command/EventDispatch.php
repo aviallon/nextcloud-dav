@@ -119,8 +119,19 @@ class EventDispatch extends Command {
 		$dispatcher = Server::get(IEventDispatcher::class);
 
 		// Registers CardUpdatedEvent -> CloudIdManager::handleCardEvent (the
-		// Redis cloud_id_ DEL). Without this the listener never runs.
-		Server::get(CloudIdManager::class);
+		// Redis cloud_id_ DEL). Without this the listener never runs. Guarded
+		// because it is a core service we do not strictly need: if it cannot be
+		// built, or the Redis-backed cache it uses is unavailable, every other
+		// effect must still be dispatched.
+		try {
+			Server::get(CloudIdManager::class);
+		} catch (Throwable $e) {
+			$output->writeln('<comment>CloudIdManager unavailable (' . $e->getMessage() . '); the redis_cloud_id effect will not run.</comment>');
+			$this->logger->warning('nextcloud_dav: CloudIdManager unavailable; redis_cloud_id effect disabled', [
+				'app' => 'nextcloud_dav',
+				'exception' => $e,
+			]);
+		}
 
 		$listener = new PostgresListener($settings['notify_channel'], $this->logger);
 		if ($listener->connect()) {
@@ -180,23 +191,37 @@ class EventDispatch extends Command {
 			}
 
 			$batchSize = count($rows);
-			try {
-				$this->db->beginTransaction();
-				foreach ($rows as $row) {
+			$failed = 0;
+			// Per-ROW isolation, deliberately. One poison row (a listener from a
+			// missing optional app throwing, a malformed card_row, an address book
+			// that vanished) must not roll back and dead-letter the healthy rows
+			// around it. Each row gets its own transaction, so dispatch and
+			// mark-done commit together: a crash mid-batch can at worst redeliver
+			// that single row, never lose it.
+			foreach ($rows as $row) {
+				$seq = (int)$row['seq'];
+				try {
+					$this->db->beginTransaction();
 					$this->dispatchRow($row, $cardDavBackend, $dispatcher, $output);
+					$this->markDone([$seq], time());
+					$this->db->commit();
+					$processed++;
+				} catch (Throwable $e) {
+					if ($this->db->inTransaction()) {
+						$this->db->rollBack();
+					}
+					$failed++;
+					$this->scheduleRetry([$row], $e, $settings['max_attempts'], $settings['backoff_ms']);
+					$this->logger->error('nextcloud_dav: outbox row failed, scheduled retry', [
+						'app' => 'nextcloud_dav',
+						'seq' => $seq,
+						'exception' => $e,
+					]);
+					$output->writeln(sprintf('<error>Outbox row %d failed: %s</error>', $seq, $e->getMessage()));
 				}
-				$this->markDone(array_map(static fn (array $row): int => (int)$row['seq'], $rows), time());
-				$this->db->commit();
-				$processed += $batchSize;
-			} catch (Throwable $e) {
-				$this->db->rollBack();
-				$this->scheduleRetry($rows, $e, $settings['max_attempts'], $settings['backoff_ms']);
-				$this->logger->error('nextcloud_dav: dispatch batch failed, scheduled retry', [
-					'app' => 'nextcloud_dav',
-					'rows' => $batchSize,
-					'exception' => $e,
-				]);
-				$output->writeln(sprintf('<error>Batch of %d failed: %s</error>', $batchSize, $e->getMessage()));
+			}
+			if ($failed > 0) {
+				$output->writeln(sprintf('<comment>%d of %d rows failed and were rescheduled.</comment>', $failed, $batchSize), OutputInterface::VERBOSITY_VERBOSE);
 			}
 
 			// Per-batch hygiene, cf. core/Command/Background/JobWorker.php.
@@ -286,7 +311,18 @@ class EventDispatch extends Command {
 		$cardRow['addressbookid'] = $addressBookId;
 		$cardRow['carddata'] = $cardData;
 
-		$addressBookData = $cardDavBackend->getAddressBookById($addressBookId) ?? [];
+		$addressBookData = $cardDavBackend->getAddressBookById($addressBookId);
+		if ($addressBookData === null) {
+			// The address book was deleted after the card write. Every listener
+			// needs address-book data, so there is nothing meaningful to dispatch
+			// and retrying could never succeed: let the row complete.
+			$output->writeln(sprintf(
+				'<comment>Skipping outbox row %d: address book %d no longer exists.</comment>',
+				(int)$row['seq'],
+				$addressBookId,
+			), OutputInterface::VERBOSITY_VERBOSE);
+			return;
+		}
 		$shares = $cardDavBackend->getShares($addressBookId);
 
 		$event = match ((int)$row['event_type']) {
