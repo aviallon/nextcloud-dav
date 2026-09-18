@@ -461,16 +461,31 @@ async fn assert_deviation(id: &str, f: &Fixture) -> Result<(), String> {
             );
         }
         "contactsinteraction-php" => {
-            let path =
-                "/remote.php/dav/addressbooks/users/alice/z-app-generated--contactsinteraction--recent";
+            // Plugin-provided books are delegated to PHP (501 -> nginx replay),
+            // not denied: the home listing advertises them and PHP can serve
+            // them. Both known aliases must behave this way, for the book and
+            // for a card under it.
             let body =
                 r#"<d:propfind xmlns:d="DAV:"><d:prop><d:resourcetype/></d:prop></d:propfind>"#;
-            let resp = propfind(&f.app, path, USER, PASSWORD, "0", body).await;
-            ensure!(
-                resp.status == 404,
-                "contactsinteraction returned {}",
-                resp.status
-            );
+            for book in [
+                "z-app-generated--contactsinteraction--recent",
+                "z-server-generated--system",
+            ] {
+                let path = format!("/remote.php/dav/addressbooks/users/alice/{book}");
+                let resp = propfind(&f.app, &path, USER, PASSWORD, "0", body).await;
+                ensure!(
+                    resp.status == 501,
+                    "{book} returned {} (expected 501 so nginx replays it to PHP)",
+                    resp.status
+                );
+                let card = format!("{path}/someone.vcf");
+                let resp = propfind(&f.app, &card, USER, PASSWORD, "0", body).await;
+                ensure!(
+                    resp.status == 501,
+                    "a card under {book} returned {} (expected 501)",
+                    resp.status
+                );
+            }
         }
         "bruteforce-recording-off" => {
             let resp = get(&f.app, card_path, USER, "wrong-password").await;

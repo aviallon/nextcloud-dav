@@ -233,6 +233,9 @@ async fn handle(state: Arc<AppState>, request: Request) -> Result<Response> {
             if target_user != &user.uid {
                 return Ok(Error::NotFound.into_response());
             }
+            if is_delegated_book_uri(book_uri) {
+                return Ok(not_implemented());
+            }
             let target_user = target_user.clone();
             let book_uri = book_uri.clone();
             let href = href.clone();
@@ -266,6 +269,9 @@ async fn handle(state: Arc<AppState>, request: Request) -> Result<Response> {
         } => {
             if target_user != &user.uid {
                 return Ok(Error::NotFound.into_response());
+            }
+            if is_delegated_book_uri(book_uri) {
+                return Ok(not_implemented());
             }
             let target_user = target_user.clone();
             let book_uri = book_uri.clone();
@@ -648,6 +654,21 @@ fn principal(user: &str) -> String {
 /// A book whose real URI already contains `_shared_by_` can collide with a
 /// shared book's wire name; owned books are listed first, so they win, exactly
 /// like `Sabre\DAV\Collection::getChild()`.
+/// Book URIs that only PHP can serve: the address books contributed by
+/// Nextcloud plugins rather than by rows the sidecar can read.
+///
+/// `z-app-generated` is the reserved prefix for plugin-provided books
+/// (`apps/dav/lib/CardDAV/Integration/ExternalAddressBook.php`, and
+/// `UserAddressBooks::createExtendedCollection()` refuses to let a user create
+/// such a name), and `z-server-generated--system` is the system address book's
+/// shared alias (`apps/dav/lib/CardDAV/SystemAddressbook.php`). Neither has an
+/// `oc_addressbooks` row the sidecar could resolve, so answering 501 lets nginx
+/// replay the request to PHP — which is what the client expects, and what the
+/// home listing (served by PHP) has already advertised.
+fn is_delegated_book_uri(book_uri: &str) -> bool {
+    book_uri == "z-server-generated--system" || book_uri.starts_with("z-app-generated")
+}
+
 async fn resolve_book(state: &AppState, user: &str, book_uri: &str) -> Result<Option<VisibleBook>> {
     let caller = principal(user);
     let groups = state.db.group_principals(user).await?;
