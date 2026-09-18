@@ -503,13 +503,65 @@ are rejected before any query, and every query is scoped to
   `501` (nginx replays them to PHP). Card `PUT`/`DELETE` *are* native.
 - Dispatch the PHP event listeners itself: it queues them (§7.2).
 - `?photo` (appdata + GD) and `?export` (concatenated vCard) → `501`.
-- Shared / group / **system** address books, and the app-generated
-  `contactsinteraction` book → served by PHP (and the home listing always is).
+- The **system** address book and the app-generated `contactsinteraction`
+  book → served by PHP (and the home listing always is). Shared books and
+  database-backed group shares **are** served (see below).
 - jCard (`[`-prefixed) bodies → `415` rather than being converted to vCard, so
   the stored bytes stay byte-identical to what was uploaded.
 - vCard 3↔4 negotiation for `address-data`, conditional GET, `allprop`
   completeness → not implemented.
 - Brute-force attempt recording → off by default.
+
+### 11.1 Shared and group address books
+
+A book is visible when it is owned (`oc_addressbooks.principaluri =
+principals/users/<uid>`), or when an `oc_dav_shares` row of `type =
+'addressbook'` targets the caller or one of their **database** groups, and no
+`access = 5` tombstone for the caller's principals targets the same
+`resourceid`. `Db::visible_books()` returns owned books first, then the shared
+rows folded by `oc_addressbooks.id` (read-write beats read-only), ordered by
+id:
+
+```sql
+SELECT a.id, a.uri, a.displayname, a.principaluri, a.description, a.synctoken, s.access
+FROM oc_dav_shares s JOIN oc_addressbooks a ON s.resourceid = a.id
+WHERE s.type = 'addressbook'
+  AND s.principaluri IN (<caller principal>, <group principals>)
+  AND NOT EXISTS (
+      SELECT 1 FROM oc_dav_shares d
+      WHERE d.access = 5 AND d.resourceid = s.resourceid
+        AND d.principaluri IN (<caller principal>, <group principals>))
+ORDER BY a.id
+```
+
+Group principals come from `oc_group_user`/`oc_groups`, each gid run through
+PHP's `urlencode()` (`space → +`, `~ → %7E`, `-_.` unescaped). Every request for
+a book or card resolves through this single list, matching the requested name
+against the wire URI, so an owned book and a shared book take the same path. A
+shared book is served under `<uri>_shared_by_<owner-name>` and a book that is
+not visible is a `404`.
+
+| property | owned book | shared, read-write | shared, read-only |
+|---|---|---|---|
+| `{DAV:}displayname` | `oc_addressbooks.displayname` (fallback `uri`) | `"<displayname> (<owner display name>)"` | same |
+| `{DAV:}owner` | `<d:href>/remote.php/dav/principals/users/<caller>/</d:href>` | the **owner's** principal href | same |
+| `{nc}owner-displayname` | caller's display name | owner's display name | same |
+| `{oc}owner-principal` | absent (404) | `principals/users/<owner>` | same |
+| `{oc}read-only` | absent (404) | empty element | `1` |
+| `{DAV:}current-user-privilege-set` | full set | full set | `read`, `read-acl`, `read-current-user-privilege-set`, `write-properties` |
+| `{carddav}addressbook-description`, `{cs}getctag`, `{sabredav}sync-token`, `{DAV:}sync-token` | owner book columns | owner book columns | same |
+
+A card written into a shared book carries the **owner's**
+`oc_addressbooks.id` (the resolved book), exactly like PHP: the card, its
+change row, the sync-token bump and the outbox row all land on the owner's
+book. If the share is read-only the write is answered **404, never 403**
+(Nextcloud's `DavAclPlugin` hides existence from non-owners), with no database
+write and no outbox row; reads stay allowed. Three behaviour notes are declared
+as deviations: tombstones exclude by `resourceid` (PHP's CardDAV uses `s.id`,
+which never hides a surviving group share), group expansion is database-only
+(LDAP/circles and `hideFromCollaboration()` are invisible to SQL), and a
+shared-book write's activity is attributed to the owner because the outbox has
+no actor column.
 
 ---
 

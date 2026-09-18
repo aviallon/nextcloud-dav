@@ -37,6 +37,15 @@ use std::time::Duration;
 /// The app-password secret used by the DB-backed tests.
 pub const TEST_SECRET: &str = "unit-test-secret";
 
+/// Renders `?` placeholders as `$n` and asserts the SQL is safe.
+///
+/// `sqlx::Any` does **not** translate placeholders, and this harness only ever
+/// runs PostgreSQL (`initdb`/`pg_ctl`), so every raw query must go through this
+/// the same way `Db::render` does for the library queries.
+pub fn safe(sql: impl Into<String>) -> sqlx::AssertSqlSafe<String> {
+    sqlx::AssertSqlSafe(nextcloud_dav::db::render_placeholders(&sql.into(), true))
+}
+
 /// Counts started clusters/databases so tests do not collide.
 static DB_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
@@ -109,6 +118,15 @@ fn cluster() -> Option<&'static PgCluster> {
             ]))
             .ok()?;
 
+            // NixOS's PostgreSQL defaults to `/run/postgresql` for the unix
+            // socket, which does not exist for an unprivileged test run; point
+            // it at a writable directory instead (connections are over TCP).
+            let socket_dir = base.join("socket");
+            if std::fs::create_dir_all(&socket_dir).is_err() {
+                return None;
+            }
+            let log_file = base.join("postgres.log");
+
             // Pick a free loopback port.
             let listener = TcpListener::bind("127.0.0.1:0").ok()?;
             let port = listener.local_addr().ok()?.port();
@@ -117,8 +135,17 @@ fn cluster() -> Option<&'static PgCluster> {
             run(Command::new("pg_ctl").args([
                 "-D",
                 data_dir.to_str().unwrap(),
+                // Redirect the server's stdout/stderr to a file, otherwise the
+                // daemon inherits this command's pipes and `output()` never sees
+                // EOF after `pg_ctl` exits.
+                "-l",
+                log_file.to_str().unwrap(),
                 "-o",
-                &format!("-p {port} -c listen_addresses=127.0.0.1 -c max_connections=500 -F"),
+                &format!(
+                    "-p {port} -c listen_addresses=127.0.0.1 -c max_connections=500 -F \
+                     -c unix_socket_directories={}",
+                    socket_dir.display()
+                ),
                 "-w",
                 "start",
             ]))
@@ -160,12 +187,10 @@ impl TestEnv {
             .connect_with(admin_opts)
             .await
             .ok()?;
-        let _ = sqlx::query(sqlx::AssertSqlSafe(format!(
-            "DROP DATABASE IF EXISTS {db_name}"
-        )))
-        .execute(&admin)
-        .await;
-        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {db_name}")))
+        let _ = sqlx::query(safe(format!("DROP DATABASE IF EXISTS {db_name}")))
+            .execute(&admin)
+            .await;
+        sqlx::query(safe(format!("CREATE DATABASE {db_name}")))
             .execute(&admin)
             .await
             .ok()?;
@@ -192,7 +217,7 @@ impl TestEnv {
     /// The number of rows in a table (unquoted name).
     pub async fn count(&self, table: &str) -> i64 {
         let sql = format!("SELECT COUNT(*) AS c FROM {}{}", self.prefix, table);
-        sqlx::query(sqlx::AssertSqlSafe(sql))
+        sqlx::query(safe(sql))
             .fetch_one(self.pool())
             .await
             .unwrap()
@@ -209,7 +234,7 @@ impl TestEnv {
             "INSERT INTO {}users (uid, displayname) VALUES (?, ?)",
             self.prefix
         );
-        sqlx::query(sqlx::AssertSqlSafe(sql))
+        sqlx::query(safe(sql))
             .bind(uid)
             .bind(displayname)
             .execute(self.pool())
@@ -223,7 +248,7 @@ impl TestEnv {
              VALUES (?, 'core', 'enabled', 'false')",
             self.prefix
         );
-        sqlx::query(sqlx::AssertSqlSafe(sql))
+        sqlx::query(safe(sql))
             .bind(uid)
             .execute(self.pool())
             .await
@@ -243,7 +268,7 @@ impl TestEnv {
              VALUES (?, ?, ?, ?, ?) RETURNING id",
             self.prefix
         );
-        sqlx::query(sqlx::AssertSqlSafe(sql))
+        sqlx::query(safe(sql))
             .bind(principaluri)
             .bind(displayname)
             .bind(uri)
@@ -255,6 +280,56 @@ impl TestEnv {
             .get("id")
     }
 
+    pub async fn seed_group(&self, gid: &str) {
+        let sql = format!("INSERT INTO {}groups (gid) VALUES (?)", self.prefix);
+        sqlx::query(safe(sql))
+            .bind(gid)
+            .execute(self.pool())
+            .await
+            .unwrap();
+    }
+
+    pub async fn seed_group_member(&self, gid: &str, uid: &str) {
+        let sql = format!(
+            "INSERT INTO {}group_user (gid, uid) VALUES (?, ?)",
+            self.prefix
+        );
+        sqlx::query(safe(sql))
+            .bind(gid)
+            .bind(uid)
+            .execute(self.pool())
+            .await
+            .unwrap();
+    }
+
+    /// A `type = 'addressbook'` share row (the CardDAV type).
+    pub async fn seed_share(&self, principaluri: &str, access: i64, resourceid: i64) {
+        self.seed_share_typed(principaluri, "addressbook", access, resourceid)
+            .await;
+    }
+
+    pub async fn seed_share_typed(
+        &self,
+        principaluri: &str,
+        share_type: &str,
+        access: i64,
+        resourceid: i64,
+    ) {
+        let sql = format!(
+            "INSERT INTO {}dav_shares (principaluri, type, access, resourceid) \
+             VALUES (?, ?, ?, ?)",
+            self.prefix
+        );
+        sqlx::query(safe(sql))
+            .bind(principaluri)
+            .bind(share_type)
+            .bind(access as i16)
+            .bind(resourceid as i32)
+            .execute(self.pool())
+            .await
+            .unwrap();
+    }
+
     /// Inserts a card exactly as PHP's `createCard()` would (md5 etag,
     /// byte length), then logs the add-change and bumps the sync token.
     pub async fn seed_card(&self, addressbook_id: i64, uri: &str, carddata: &[u8]) -> i64 {
@@ -264,7 +339,7 @@ impl TestEnv {
              VALUES (?, ?, ?, 1_700_000_000, ?, ?, ?) RETURNING id",
             self.prefix
         );
-        let id: i64 = sqlx::query(sqlx::AssertSqlSafe(sql))
+        let id: i64 = sqlx::query(safe(sql))
             .bind(addressbook_id)
             .bind(carddata.to_vec())
             .bind(uri)
@@ -288,7 +363,7 @@ impl TestEnv {
              VALUES (?, ?, ?, 1_700_000_000, ?, ?, ?) RETURNING id",
             self.prefix
         );
-        sqlx::query(sqlx::AssertSqlSafe(sql))
+        sqlx::query(safe(sql))
             .bind(addressbook_id)
             .bind(carddata.to_vec())
             .bind(uri)
@@ -308,7 +383,7 @@ impl TestEnv {
             "SELECT synctoken FROM {}addressbooks WHERE id = ?",
             self.prefix
         );
-        let token: i32 = sqlx::query(sqlx::AssertSqlSafe(select))
+        let token: i32 = sqlx::query(safe(select))
             .bind(addressbook_id)
             .fetch_one(self.pool())
             .await
@@ -319,7 +394,7 @@ impl TestEnv {
              VALUES (?, ?, ?, ?, 1_700_000_000)",
             self.prefix
         );
-        sqlx::query(sqlx::AssertSqlSafe(insert))
+        sqlx::query(safe(insert))
             .bind(uri)
             .bind(token)
             .bind(addressbook_id)
@@ -331,7 +406,7 @@ impl TestEnv {
             "UPDATE {}addressbooks SET synctoken = ? WHERE id = ?",
             self.prefix
         );
-        sqlx::query(sqlx::AssertSqlSafe(update))
+        sqlx::query(safe(update))
             .bind(token + 1)
             .bind(addressbook_id)
             .execute(self.pool())
@@ -344,7 +419,7 @@ impl TestEnv {
             "UPDATE {}addressbooks SET synctoken = ? WHERE id = ?",
             self.prefix
         );
-        sqlx::query(sqlx::AssertSqlSafe(sql))
+        sqlx::query(safe(sql))
             .bind(token)
             .bind(addressbook_id)
             .execute(self.pool())
@@ -358,7 +433,7 @@ impl TestEnv {
              VALUES (?, ?, ?, ?, 0)",
             self.prefix
         );
-        sqlx::query(sqlx::AssertSqlSafe(sql))
+        sqlx::query(safe(sql))
             .bind(addressbook_id)
             .bind(card_id)
             .bind(name)
@@ -409,7 +484,7 @@ impl TestEnv {
              VALUES (?, ?, '', ?, ?, 0, ?, ?, NULL, ?, ?, ?)",
             self.prefix
         );
-        sqlx::query(sqlx::AssertSqlSafe(sql))
+        sqlx::query(safe(sql))
             .bind(uid)
             .bind(login_name)
             .bind(&hash)
@@ -765,6 +840,13 @@ CREATE TABLE oc_dav_shares (
     resourceid integer NULL,
     publicuri varchar(255) NULL
 );
+CREATE TABLE oc_groups (
+    gid varchar(64) NOT NULL PRIMARY KEY
+);
+CREATE TABLE oc_group_user (
+    gid varchar(64) NOT NULL,
+    uid varchar(64) NOT NULL
+);
 CREATE TABLE oc_authtoken (
     id integer GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
     uid varchar(64) NOT NULL DEFAULT '',
@@ -795,7 +877,7 @@ CREATE TABLE oc_appconfig (
     configkey varchar(64) NOT NULL DEFAULT '',
     configvalue text NULL
 );
--- Mirrors the companion app migration; the sidecar never creates this.
+-- Mirrors the companion app migration (the sidecar never creates this).
 CREATE TABLE oc_dav_event_outbox (
     seq              bigserial   PRIMARY KEY,
     created_at       bigint      NOT NULL,
@@ -821,7 +903,7 @@ CREATE INDEX oc_dav_event_outbox_pending_idx
         if statement.is_empty() {
             continue;
         }
-        sqlx::query(sqlx::AssertSqlSafe(statement.to_string()))
+        sqlx::query(safe(statement.to_string()))
             .execute(pool)
             .await?;
     }

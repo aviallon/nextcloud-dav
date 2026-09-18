@@ -12,7 +12,7 @@ use crate::config::{Config, DEFAULT_SYNC_LIMIT, MAX_RESOURCE_SIZE};
 use crate::dav_error;
 use crate::db::Db;
 use crate::error::{Error, Result};
-use crate::model::{AddressBook, Card};
+use crate::model::{AddressBook, Card, VisibleBook};
 use crate::outbox::EffectRegistry;
 use crate::sync::{self, SYNCTOKEN_PREFIX};
 use crate::util::{encode_path_segment, http_date, parse_basic_auth, percent_decode};
@@ -461,25 +461,14 @@ async fn handle_propfind(
     body: &[u8],
 ) -> Result<Response> {
     let request = parse::parse_propfind(body)?;
-    let principal_href = format!(
-        "{}principals/users/{}/",
-        context_of(parsed),
-        encode_path_segment(user)
-    );
-    let owner_displayname = state
-        .db
-        .user_display_name(user)
-        .await?
-        .unwrap_or_else(|| user.to_string());
 
     let mut responses = Vec::new();
     match &parsed.target {
         DavTarget::Home { href, .. } => {
-            let ctx = PropContext {
-                principal_href: principal_href.clone(),
-                owner_displayname: owner_displayname.clone(),
-                groups: Vec::new(),
-            };
+            // The home stays on PHP in production (declared deviation
+            // `home-listing-php`); this handler is only reached on a misroute.
+            // It lists the caller's own books.
+            let ctx = caller_context(state, parsed, user).await?;
             responses.push(build_response(
                 &collection_href(href),
                 NodeData::Home,
@@ -488,17 +477,13 @@ async fn handle_propfind(
             ));
             if depth >= 1 {
                 let books = state.db.address_books_for_user(&principal(user)).await?;
-                for book in &books {
-                    let book_href = format!("{href}/{}", encode_path_segment(&book.uri));
-                    let groups = requested_groups(&request.props, book, &state.db).await?;
-                    let ctx = PropContext {
-                        principal_href: principal_href.clone(),
-                        owner_displayname: owner_displayname.clone(),
-                        groups,
-                    };
+                for book in books.into_iter().map(VisibleBook::owned) {
+                    let book_href = format!("{href}/{}", encode_path_segment(&book.wire_uri));
+                    let mut ctx = caller_context(state, parsed, user).await?;
+                    ctx.groups = requested_groups(&request.props, &book.book, &state.db).await?;
                     responses.push(build_response(
-                        &book_href,
-                        NodeData::Book(book),
+                        &collection_href(&book_href),
+                        NodeData::Book(&book),
                         &ctx,
                         &request.props,
                     ));
@@ -506,19 +491,11 @@ async fn handle_propfind(
             }
         }
         DavTarget::Book { href, book_uri, .. } => {
-            let Some(book) = state
-                .db
-                .address_book_by_uri(&principal(user), book_uri)
-                .await?
-            else {
+            let Some(book) = resolve_book(state, user, book_uri).await? else {
                 return Ok(Error::NotFound.into_response());
             };
-            let groups = requested_groups(&request.props, &book, &state.db).await?;
-            let ctx = PropContext {
-                principal_href: principal_href.clone(),
-                owner_displayname: owner_displayname.clone(),
-                groups,
-            };
+            let mut ctx = book_context(state, parsed, user, &book).await?;
+            ctx.groups = requested_groups(&request.props, &book.book, &state.db).await?;
             responses.push(build_response(
                 &collection_href(href),
                 NodeData::Book(&book),
@@ -526,7 +503,7 @@ async fn handle_propfind(
                 &request.props,
             ));
             if depth >= 1 {
-                let cards = state.db.cards(book.id).await?;
+                let cards = state.db.cards(book.book.id).await?;
                 for card in &cards {
                     let card_href = format!("{href}/{}", encode_path_segment(&card.uri));
                     responses.push(build_response(
@@ -544,21 +521,13 @@ async fn handle_propfind(
             card_uri,
             ..
         } => {
-            let Some(book) = state
-                .db
-                .address_book_by_uri(&principal(user), book_uri)
-                .await?
-            else {
+            let Some(book) = resolve_book(state, user, book_uri).await? else {
                 return Ok(Error::NotFound.into_response());
             };
-            let Some(card) = state.db.card(book.id, card_uri).await? else {
+            let Some(card) = state.db.card(book.book.id, card_uri).await? else {
                 return Ok(Error::NotFound.into_response());
             };
-            let ctx = PropContext {
-                principal_href: principal_href.clone(),
-                owner_displayname,
-                groups: Vec::new(),
-            };
+            let ctx = book_context(state, parsed, user, &book).await?;
             responses.push(build_response(
                 href,
                 NodeData::Card(&card),
@@ -644,13 +613,21 @@ fn build_response(
 #[derive(Clone, Copy)]
 enum NodeData<'a> {
     Home,
-    Book(&'a AddressBook),
+    Book(&'a VisibleBook),
     Card(&'a Card),
 }
 
 struct PropContext {
+    /// `{DAV:}owner` href: the owner's principal for a shared book, the
+    /// caller's otherwise.
     principal_href: String,
+    /// `{nc}owner-displayname`.
     owner_displayname: String,
+    /// `Some(owner principal)` only for a shared book; the switch for
+    /// `{oc}owner-principal` / `{oc}read-only`.
+    owner_principal: Option<String>,
+    /// `{oc}read-only` and the read-only `current-user-privilege-set`.
+    read_only: bool,
     groups: Vec<String>,
 }
 
@@ -663,6 +640,85 @@ fn context_of(parsed: &ParsedPath) -> String {
 
 fn principal(user: &str) -> String {
     format!("principals/users/{user}")
+}
+
+/// Resolves a requested book against the caller's visible set (owned + shared),
+/// matching the constructed wire name. `None` is the 404 case.
+///
+/// A book whose real URI already contains `_shared_by_` can collide with a
+/// shared book's wire name; owned books are listed first, so they win, exactly
+/// like `Sabre\DAV\Collection::getChild()`.
+async fn resolve_book(state: &AppState, user: &str, book_uri: &str) -> Result<Option<VisibleBook>> {
+    let caller = principal(user);
+    let groups = state.db.group_principals(user).await?;
+    state
+        .db
+        .visible_book_by_uri(&caller, &groups, book_uri)
+        .await
+}
+
+/// The property context for the caller's own principal (the home node and
+/// owned books).
+async fn caller_context(state: &AppState, parsed: &ParsedPath, user: &str) -> Result<PropContext> {
+    let principal_href = format!(
+        "{}principals/users/{}/",
+        context_of(parsed),
+        encode_path_segment(user)
+    );
+    let owner_displayname = state
+        .db
+        .user_display_name(user)
+        .await?
+        .unwrap_or_else(|| user.to_string());
+    Ok(PropContext {
+        principal_href,
+        owner_displayname,
+        owner_principal: None,
+        read_only: false,
+        groups: Vec::new(),
+    })
+}
+
+/// The property context for a book: the **owner's** principal and display name
+/// for a shared book, the caller's otherwise.
+async fn book_context(
+    state: &AppState,
+    parsed: &ParsedPath,
+    user: &str,
+    book: &VisibleBook,
+) -> Result<PropContext> {
+    let base = context_of(parsed);
+    let (principal_href, owner_displayname) = match &book.owner_principal {
+        Some(owner) => {
+            let owner_name = owner.rsplit('/').next().unwrap_or_default();
+            let href = format!(
+                "{base}principals/users/{}/",
+                encode_path_segment(owner_name)
+            );
+            let displayname = state
+                .db
+                .user_display_name(owner_name)
+                .await?
+                .unwrap_or_else(|| owner_name.to_string());
+            (href, displayname)
+        }
+        None => {
+            let href = format!("{base}principals/users/{}/", encode_path_segment(user));
+            let displayname = state
+                .db
+                .user_display_name(user)
+                .await?
+                .unwrap_or_else(|| user.to_string());
+            (href, displayname)
+        }
+    };
+    Ok(PropContext {
+        principal_href,
+        owner_displayname,
+        owner_principal: book.owner_principal.clone(),
+        read_only: book.read_only,
+        groups: Vec::new(),
+    })
 }
 
 fn default_props(node: &NodeData<'_>) -> Vec<PropQName> {
@@ -687,6 +743,8 @@ fn default_props(node: &NodeData<'_>) -> Vec<PropQName> {
             PropQName::dav("owner"),
             PropQName::dav("current-user-privilege-set"),
             PropQName::owncloud("groups"),
+            PropQName::owncloud("owner-principal"),
+            PropQName::owncloud("read-only"),
             PropQName::nextcloud("owner-displayname"),
         ],
         NodeData::Card(_) => vec![
@@ -719,7 +777,9 @@ fn resolve_property(
             ])),
             ("resourcetype", NodeData::Card(_)) => Some(PropValue::Empty),
             ("displayname", NodeData::Book(book)) => Some(PropValue::Text(
-                book.displayname.clone().unwrap_or_else(|| book.uri.clone()),
+                book.wire_displayname
+                    .clone()
+                    .unwrap_or_else(|| book.wire_uri.clone()),
             )),
             ("supported-report-set", NodeData::Book(_)) => Some(report_set(&[
                 "card:addressbook-query",
@@ -733,13 +793,19 @@ fn resolve_property(
             ("supported-report-set", NodeData::Home) => Some(PropValue::Elements(Vec::new())),
             ("sync-token", NodeData::Book(book)) => Some(PropValue::Text(format!(
                 "{SYNCTOKEN_PREFIX}{}",
-                book.synctoken
+                book.book.synctoken
             ))),
             ("owner", _) => Some(PropValue::Elements(vec![
                 XmlElement::new("d:href").text(ctx.principal_href.clone())
             ])),
             ("current-user-privilege-set", NodeData::Home) => Some(privilege_set(false)),
-            ("current-user-privilege-set", NodeData::Book(_)) => Some(privilege_set(true)),
+            ("current-user-privilege-set", NodeData::Book(_)) => {
+                if ctx.read_only {
+                    Some(read_only_privilege_set())
+                } else {
+                    Some(privilege_set(true))
+                }
+            }
             ("current-user-privilege-set", NodeData::Card(_)) => Some(privilege_set(false)),
             ("getetag", NodeData::Card(card)) => Some(PropValue::Text(card.quoted_etag())),
             ("getcontentlength", NodeData::Card(card)) => {
@@ -755,7 +821,7 @@ fn resolve_property(
         },
         NS_CARDDAV => match (local, node) {
             ("addressbook-description", NodeData::Book(book)) => {
-                book.description.clone().map(PropValue::Text)
+                book.book.description.clone().map(PropValue::Text)
             }
             ("max-resource-size", NodeData::Book(_)) => {
                 Some(PropValue::Text(MAX_RESOURCE_SIZE.to_string()))
@@ -782,12 +848,14 @@ fn resolve_property(
             _ => None,
         },
         NS_CALENDARSERVER => match (local, node) {
-            ("getctag", NodeData::Book(book)) => Some(PropValue::Text(book.synctoken.to_string())),
+            ("getctag", NodeData::Book(book)) => {
+                Some(PropValue::Text(book.book.synctoken.to_string()))
+            }
             _ => None,
         },
         NS_SABREDAV => match (local, node) {
             ("sync-token", NodeData::Book(book)) => {
-                Some(PropValue::Text(book.synctoken.to_string()))
+                Some(PropValue::Text(book.book.synctoken.to_string()))
             }
             _ => None,
         },
@@ -798,8 +866,20 @@ fn resolve_property(
                     .map(|group| XmlElement::new("oc:group").text(group.clone()))
                     .collect(),
             )),
-            // Owned books do not carry `oc:owner-principal`; it is only set for
-            // shared books and the system book (design doc §2.2).
+            // `{oc}owner-principal` / `{oc}read-only` are set by the backend
+            // only for shared books; an owned book answers 404 for both.
+            ("owner-principal", NodeData::Book(_)) => {
+                ctx.owner_principal.clone().map(PropValue::Text)
+            }
+            ("read-only", NodeData::Book(_)) => ctx.owner_principal.as_ref().map(|_| {
+                // PHP serialises the bool: `1` for a read-only share and the
+                // empty string for a read-write one (`(string) false === ''`).
+                PropValue::Text(if ctx.read_only {
+                    "1".to_string()
+                } else {
+                    String::new()
+                })
+            }),
             _ => None,
         },
         NS_NEXTCLOUD => match (local, node) {
@@ -852,6 +932,27 @@ fn privilege_set(collection: bool) -> PropValue {
     )
 }
 
+/// The `{DAV:}current-user-privilege-set` of a **read-only** shared book.
+///
+/// `AddressBook::getACL()` grants the sharee `{DAV:}read`, and
+/// `Backend::applyShareAcl()` adds `{DAV:}write-properties` for a read-only
+/// address book. Sabre aggregates `read-acl` and
+/// `read-current-user-privilege-set` from `{DAV:}read`.
+fn read_only_privilege_set() -> PropValue {
+    let privileges = [
+        "read",
+        "read-acl",
+        "read-current-user-privilege-set",
+        "write-properties",
+    ];
+    PropValue::Elements(
+        privileges
+            .iter()
+            .map(|name| XmlElement::new("d:privilege").child(XmlElement::new(format!("d:{name}"))))
+            .collect(),
+    )
+}
+
 // ---------------------------------------------------------------------------
 // GET / HEAD
 // ---------------------------------------------------------------------------
@@ -863,14 +964,10 @@ async fn get_card(
     card_uri: &str,
     method: &Method,
 ) -> Result<Response> {
-    let Some(book) = state
-        .db
-        .address_book_by_uri(&principal(user), book_uri)
-        .await?
-    else {
+    let Some(book) = resolve_book(state, user, book_uri).await? else {
         return Ok(Error::NotFound.into_response());
     };
-    let Some(card) = state.db.card(book.id, card_uri).await? else {
+    let Some(card) = state.db.card(book.book.id, card_uri).await? else {
         return Ok(Error::NotFound.into_response());
     };
 
@@ -954,13 +1051,16 @@ async fn put_card(
     headers: &HeaderMap,
     request: Request,
 ) -> Result<Response> {
-    let Some(book) = state
-        .db
-        .address_book_by_uri(&principal(user), book_uri)
-        .await?
-    else {
+    let Some(book) = resolve_book(state, user, book_uri).await? else {
         return Ok(Error::NotFound.into_response());
     };
+
+    // A read-only share is invisible to a write (Nextcloud's DavAclPlugin hides
+    // existence from non-owners): 404, before reading the body, with no DB
+    // write and no outbox row. Reads on a read-only share are allowed.
+    if book.read_only {
+        return Ok(Error::NotFound.into_response());
+    }
 
     let body = read_body(request).await?;
 
@@ -973,7 +1073,7 @@ async fn put_card(
         )));
     }
 
-    let existing = state.db.card(book.id, card_uri).await?;
+    let existing = state.db.card(book.book.id, card_uri).await?;
     if let Some(response) = check_preconditions(headers, existing.as_ref()) {
         return Ok(response);
     }
@@ -1003,7 +1103,9 @@ async fn put_card(
     // is allowed to introduce a duplicate UID, exactly as PHP allows. Checking
     // here on update too would reject writes a real Nextcloud accepts.
     if existing.is_none() {
-        if let Some((_id, existing_uri)) = state.db.card_by_uid(book.id, &validated.uid).await? {
+        if let Some((_id, existing_uri)) =
+            state.db.card_by_uid(book.book.id, &validated.uid).await?
+        {
             let collection = href.rsplit_once('/').map(|(base, _)| base).unwrap_or(href);
             let conflict_href = format!("{collection}/{}", encode_path_segment(&existing_uri));
             return Ok(dav_error::uid_conflict(&conflict_href));
@@ -1014,7 +1116,7 @@ async fn put_card(
     let snapshot = state
         .db
         .put_card(
-            book.id,
+            book.book.id,
             card_uri,
             &validated.data,
             &validated.uid,
@@ -1046,14 +1148,14 @@ async fn delete_card(
     card_uri: &str,
     headers: &HeaderMap,
 ) -> Result<Response> {
-    let Some(book) = state
-        .db
-        .address_book_by_uri(&principal(user), book_uri)
-        .await?
-    else {
+    let Some(book) = resolve_book(state, user, book_uri).await? else {
         return Ok(Error::NotFound.into_response());
     };
-    let Some(card) = state.db.card(book.id, card_uri).await? else {
+    // Read-only share: 404, never 403, and no DB write (see `put_card`).
+    if book.read_only {
+        return Ok(Error::NotFound.into_response());
+    }
+    let Some(card) = state.db.card(book.book.id, card_uri).await? else {
         return Ok(Error::NotFound.into_response());
     };
     if let Some(response) = check_preconditions(headers, Some(&card)) {
@@ -1063,7 +1165,7 @@ async fn delete_card(
     let deleted = state
         .db
         .delete_card(
-            book.id,
+            book.book.id,
             card_uri,
             &state.registry,
             &state.config.event_dispatch.notify_channel,
@@ -1090,23 +1192,10 @@ async fn handle_report_book(
     headers: &HeaderMap,
     body: &[u8],
 ) -> Result<Response> {
-    let Some(book) = state
-        .db
-        .address_book_by_uri(&principal(user), book_uri)
-        .await?
-    else {
+    let Some(book) = resolve_book(state, user, book_uri).await? else {
         return Ok(Error::NotFound.into_response());
     };
-    let principal_href = format!(
-        "{}principals/users/{}/",
-        context_of(parsed),
-        encode_path_segment(user)
-    );
-    let owner_displayname = state
-        .db
-        .user_display_name(user)
-        .await?
-        .unwrap_or_else(|| user.to_string());
+    let ctx = book_context(state, parsed, user, &book).await?;
 
     if body.is_empty() {
         return Ok(Error::bad_request("empty REPORT body").into_response());
@@ -1115,7 +1204,7 @@ async fn handle_report_book(
     match (document.ns.as_str(), document.local.as_str()) {
         (NS_CARDDAV, "addressbook-multiget") => {
             let request = parse::parse_multiget(body)?;
-            let cards = state.db.cards(book.id).await?;
+            let cards = state.db.cards(book.book.id).await?;
             let mut responses = Vec::new();
             // Sabre resolves hrefs, preserving the client's order and returning
             // a 404 propstat for hrefs that do not resolve.
@@ -1126,11 +1215,6 @@ async fn handle_report_book(
                 let response_href = normalize_href(raw_href, href);
                 match by_uri.get(&card_uri) {
                     Some(card) => {
-                        let ctx = PropContext {
-                            principal_href: principal_href.clone(),
-                            owner_displayname: owner_displayname.clone(),
-                            groups: Vec::new(),
-                        };
                         responses.push(build_response(
                             &response_href,
                             NodeData::Card(card),
@@ -1171,13 +1255,8 @@ async fn handle_report_book(
                     "The addressbook-query report is not supported on this url with Depth: 0",
                 ));
             }
-            let candidates = state.db.cards(book.id).await?;
+            let candidates = state.db.cards(book.book.id).await?;
 
-            let ctx = PropContext {
-                principal_href: principal_href.clone(),
-                owner_displayname: owner_displayname.clone(),
-                groups: Vec::new(),
-            };
             let mut responses = Vec::new();
             for card in &candidates {
                 if let Some(filter) = &request.filter {
@@ -1209,16 +1288,7 @@ async fn handle_report_book(
         }
         (NS_DAV, "sync-collection") => {
             let request = parse::parse_sync_collection(body)?;
-            handle_sync_collection(
-                state,
-                &book,
-                href,
-                &principal_href,
-                &owner_displayname,
-                user,
-                &request,
-            )
-            .await
+            handle_sync_collection(state, &book.book, href, &ctx, &request).await
         }
         (ns, local) => {
             log::debug!("unsupported report {{{ns}}}{local}");
@@ -1236,34 +1306,16 @@ async fn handle_report_card(
     href: &str,
     body: &[u8],
 ) -> Result<Response> {
-    let Some(book) = state
-        .db
-        .address_book_by_uri(&principal(user), book_uri)
-        .await?
-    else {
+    let Some(book) = resolve_book(state, user, book_uri).await? else {
         return Ok(Error::NotFound.into_response());
     };
-    let Some(card) = state.db.card(book.id, card_uri).await? else {
+    let Some(card) = state.db.card(book.book.id, card_uri).await? else {
         return Ok(Error::NotFound.into_response());
     };
     let document = parse::parse_document(body)?;
     if document.ns == NS_CARDDAV && document.local == "addressbook-query" {
         let request = parse::parse_query(body)?;
-        let principal_href = format!(
-            "{}principals/users/{}/",
-            context_of(parsed),
-            encode_path_segment(user)
-        );
-        let owner_displayname = state
-            .db
-            .user_display_name(user)
-            .await?
-            .unwrap_or_else(|| user.to_string());
-        let ctx = PropContext {
-            principal_href: principal_href.clone(),
-            owner_displayname,
-            groups: Vec::new(),
-        };
+        let ctx = book_context(state, parsed, user, &book).await?;
         let matches = request
             .filter
             .as_ref()
@@ -1295,9 +1347,7 @@ async fn handle_sync_collection(
     state: &AppState,
     book: &AddressBook,
     href: &str,
-    principal_href: &str,
-    owner_displayname: &str,
-    _user: &str,
+    ctx: &PropContext,
     request: &parse::SyncCollectionRequest,
 ) -> Result<Response> {
     let limit = request
@@ -1326,11 +1376,6 @@ async fn handle_sync_collection(
     };
 
     let mut responses = Vec::new();
-    let ctx = PropContext {
-        principal_href: principal_href.to_string(),
-        owner_displayname: owner_displayname.to_string(),
-        groups: Vec::new(),
-    };
     let mut changed_uris = page.added.clone();
     changed_uris.extend(page.modified.clone());
     if !changed_uris.is_empty() {
@@ -1343,7 +1388,7 @@ async fn handle_sync_collection(
                 responses.push(build_response(
                     &card_href,
                     NodeData::Card(card),
-                    &ctx,
+                    ctx,
                     &PropList::Props(request.props.clone()),
                 ));
             }
@@ -1474,14 +1519,31 @@ mod tests {
         assert_eq!(last_segment("c.vcf"), "c.vcf");
     }
 
-    fn test_book() -> AddressBook {
-        AddressBook {
+    fn test_book() -> VisibleBook {
+        VisibleBook::owned(AddressBook {
             id: 1,
             uri: "contacts".into(),
             displayname: Some("Contacts".into()),
             principaluri: "principals/users/alice".into(),
             description: None,
             synctoken: 5,
+        })
+    }
+
+    fn test_shared_book(read_only: bool) -> VisibleBook {
+        VisibleBook {
+            book: AddressBook {
+                id: 2,
+                uri: "bobcontacts".into(),
+                displayname: Some("Bob Contacts".into()),
+                principaluri: "principals/users/bob".into(),
+                description: None,
+                synctoken: 1,
+            },
+            wire_uri: "bobcontacts_shared_by_bob".into(),
+            wire_displayname: Some("Bob Contacts (Bob Builder)".into()),
+            owner_principal: Some("principals/users/bob".into()),
+            read_only,
         }
     }
 
@@ -1489,6 +1551,8 @@ mod tests {
         PropContext {
             principal_href: "/remote.php/dav/principals/users/alice/".into(),
             owner_displayname: "Alice".into(),
+            owner_principal: None,
+            read_only: false,
             groups: vec!["Friends".into()],
         }
     }
@@ -1516,6 +1580,112 @@ mod tests {
                 &ctx
             ),
             Some(PropValue::Text("5".into()))
+        );
+    }
+
+    #[test]
+    fn shared_book_properties_are_owner_scoped() {
+        let book = test_shared_book(true);
+        let mut ctx = test_ctx();
+        ctx.principal_href = "/remote.php/dav/principals/users/bob/".into();
+        ctx.owner_displayname = "Bob Builder".into();
+        ctx.owner_principal = Some("principals/users/bob".into());
+        ctx.read_only = true;
+
+        assert_eq!(
+            resolve_property(&PropQName::dav("displayname"), &NodeData::Book(&book), &ctx),
+            Some(PropValue::Text("Bob Contacts (Bob Builder)".into()))
+        );
+        assert_eq!(
+            resolve_property(&PropQName::dav("owner"), &NodeData::Book(&book), &ctx),
+            Some(PropValue::Elements(vec![
+                XmlElement::new("d:href").text("/remote.php/dav/principals/users/bob/")
+            ]))
+        );
+        assert_eq!(
+            resolve_property(
+                &PropQName::nextcloud("owner-displayname"),
+                &NodeData::Book(&book),
+                &ctx
+            ),
+            Some(PropValue::Text("Bob Builder".into()))
+        );
+        assert_eq!(
+            resolve_property(
+                &PropQName::owncloud("owner-principal"),
+                &NodeData::Book(&book),
+                &ctx
+            ),
+            Some(PropValue::Text("principals/users/bob".into()))
+        );
+        assert_eq!(
+            resolve_property(
+                &PropQName::owncloud("read-only"),
+                &NodeData::Book(&book),
+                &ctx
+            ),
+            Some(PropValue::Text("1".into()))
+        );
+
+        let privileges = resolve_property(
+            &PropQName::dav("current-user-privilege-set"),
+            &NodeData::Book(&book),
+            &ctx,
+        )
+        .unwrap();
+        let PropValue::Elements(children) = privileges else {
+            panic!("expected element privileges");
+        };
+        let names: Vec<String> = children
+            .iter()
+            .filter_map(|child| child.children.first().map(|p| p.name.clone()))
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "d:read",
+                "d:read-acl",
+                "d:read-current-user-privilege-set",
+                "d:write-properties",
+            ]
+        );
+    }
+
+    #[test]
+    fn read_write_share_serialises_an_empty_read_only() {
+        let book = test_shared_book(false);
+        let mut ctx = test_ctx();
+        ctx.owner_principal = Some("principals/users/bob".into());
+        assert_eq!(
+            resolve_property(
+                &PropQName::owncloud("read-only"),
+                &NodeData::Book(&book),
+                &ctx
+            ),
+            Some(PropValue::Text(String::new()))
+        );
+        assert!(!ctx.read_only);
+    }
+
+    #[test]
+    fn owned_book_has_no_sharing_properties() {
+        let book = test_book();
+        let ctx = test_ctx();
+        assert_eq!(
+            resolve_property(
+                &PropQName::owncloud("owner-principal"),
+                &NodeData::Book(&book),
+                &ctx
+            ),
+            None
+        );
+        assert_eq!(
+            resolve_property(
+                &PropQName::owncloud("read-only"),
+                &NodeData::Book(&book),
+                &ctx
+            ),
+            None
         );
     }
 

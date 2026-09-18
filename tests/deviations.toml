@@ -73,12 +73,52 @@ evidence = "src/routes.rs:unsupported_method; src/routes.rs:put_card/delete_card
 [[deviation]]
 id = "shared-books-php"
 area = "routing"
-status = "accepted"
+status = "resolved"
 nextcloud = "Shared (oc_dav_shares), group and system address books are listed for the sharee and served with their share ACLs."
-sidecar = "Only personal books (principaluri = principals/users/<uid>) are queried; shared/group/system books are not listed and return 404."
-why = "The share/ACL model is not implemented; those books must stay routed to PHP."
+sidecar = "Owned and shared (direct user + database-group) address books are listed through one visible_books path and served with the sharing properties (owner-principal, read-only, owner, owner-displayname, the read-only privilege set). The system book and the app-generated contactsinteraction book still stay on PHP."
+why = "The share/ACL model for oc_dav_shares books is implemented; only the non-row-backed collections remain delegated."
 test = "tests/deviations.rs::every_declared_deviation_holds (id=shared-books-php)"
-evidence = "src/db.rs:address_books_for_user; docs/ARCHITECTURE.md §11"
+evidence = "src/db.rs:visible_books; src/routes.rs:resolve_book; docs/ARCHITECTURE.md §11"
+
+[[deviation]]
+id = "shared-unshare-tombstone-semantics"
+area = "routing"
+status = "intentional"
+nextcloud = "CardDavBackend::getAddressBooksForUser() excludes unshared resources by matching the tombstone row's `id` against `dav_shares.id` (CardDavBackend.php:140-147); the CalDAV twin excludes by `resourceid`."
+sidecar = "visible_books() excludes any share row whose `resourceid` has an access=5 tombstone for one of the caller's principals."
+why = "The literal CardDAV form never hides a resource the sharee still reaches through a surviving group share (the tombstone is a separate row, so `s.id NOT IN (tombstone ids)` never matches). We use the intended, CalDAV-aligned `resourceid` semantics instead of reproducing the bug."
+test = "tests/deviations.rs::every_declared_deviation_holds (id=shared-unshare-tombstone-semantics)"
+evidence = "src/db.rs:visible_books; apps/dav/lib/CardDAV/CardDavBackend.php:140-147; apps/dav/lib/CalDAV/CalDavBackend.php:396-406"
+
+[[deviation]]
+id = "shared-write-actor"
+area = "writes"
+status = "intentional"
+nextcloud = "A card written into a shared book is attributed to the sharee (the current session user) by the activity listener."
+sidecar = "The oc_dav_event_outbox row has no actor column, so the PHP worker (which runs without a session user) attributes a shared-book write to the address book owner."
+why = "An `actor_uid` column on oc_dav_event_outbox (plus a companion-app migration) is the future fix; the frozen schema and the app's migration are unchanged for now."
+test = "tests/deviations.rs::every_declared_deviation_holds (id=shared-write-actor)"
+evidence = "src/db.rs:insert_outbox; docs/recon/shared-addressbooks.md §3.3"
+
+[[deviation]]
+id = "shared-books-group-backends"
+area = "routing"
+status = "intentional"
+nextcloud = "Principal::getGroupMembership() merges every registered group backend (LDAP, circles) through traitGetGroupMembership and skips groups for which hideFromCollaboration() is true."
+sidecar = "Group principals are expanded from oc_group_user/oc_groups only; LDAP/circle membership and hideFromCollaboration() are not visible in the schema."
+why = "With the database group backend the other sources are empty, so the two agree. A deployment using LDAP or circles for the affected users would miss those shares; the home listing stays on PHP anyway."
+test = "tests/deviations.rs::every_declared_deviation_holds (id=shared-books-group-backends)"
+evidence = "src/db.rs:group_principals; apps/dav/lib/Connector/Sabre/Principal.php:187-217"
+
+[[deviation]]
+id = "shared-books-listing-order"
+area = "routing"
+status = "intentional"
+nextcloud = "getAddressBooksForUser() adds no ORDER BY, so shared rows come back in database order."
+sidecar = "visible_books() returns owned books first (ordered by id) and then shared rows ORDER BY a.id."
+why = "Deterministic output is friendlier to clients and diffing. Owned-first is also required for the wire-name collision rule (Sabre returns the first matching child), not just a style choice."
+test = "tests/deviations.rs::every_declared_deviation_holds (id=shared-books-listing-order)"
+evidence = "src/db.rs:visible_books"
 
 [[deviation]]
 id = "contactsinteraction-php"

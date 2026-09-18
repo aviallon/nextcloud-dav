@@ -15,11 +15,15 @@
 //! `CASE WHEN ... THEN '1' ELSE '0' END`.
 
 use crate::error::{Error, Result};
-use crate::model::{AddressBook, AuthToken, Card, CardIdUri, ChangeRow};
+use crate::model::{AddressBook, AuthToken, Card, CardIdUri, ChangeRow, VisibleBook};
 use crate::vcard;
 use md5::{Digest, Md5};
 use sqlx::any::{AnyConnectOptions, AnyPoolOptions, AnyRow};
 use sqlx::{Any, AnyPool, Row};
+
+/// `OCA\DAV\DAV\Sharing\Backend` access levels.
+const ACCESS_READ: i16 = 3;
+const ACCESS_UNSHARED: i16 = 5;
 
 /// `CardDavBackend::INDEXED_PROPERTIES` (`CardDavBackend.php:47-50`). Only these
 /// property names are mirrored into `oc_cards_properties` for search.
@@ -123,6 +127,167 @@ impl Db {
             .fetch_optional(&self.pool)
             .await?;
         row.as_ref().map(address_book_from_row).transpose()
+    }
+
+    /// Group principals of a user, as `CardDavBackend::getAddressBooksForUser()`
+    /// builds them through `Principal::getGroupMembership()`.
+    ///
+    /// PHP merges the database group backend with every other registered
+    /// backend (LDAP, circles) through `traitGetGroupMembership`, and skips
+    /// groups for which `hideFromCollaboration()` is true. Neither is visible
+    /// in the schema: LDAP/circle membership is not stored in `oc_group_user`,
+    /// and `hideFromCollaboration()` is backend state with no `oc_groups`
+    /// column. The sidecar therefore expands database groups only; that
+    /// limitation is declared as the `shared-books-group-backends` deviation.
+    pub async fn group_principals(&self, uid: &str) -> Result<Vec<String>> {
+        let sql = self.render(&format!(
+            "SELECT g.gid FROM {}group_user gu JOIN {}groups g ON g.gid = gu.gid \
+             WHERE gu.uid = ? ORDER BY g.gid",
+            self.prefix, self.prefix
+        ));
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(uid)
+            .fetch_all(&self.pool)
+            .await?;
+        let mut principals = Vec::with_capacity(rows.len());
+        for row in &rows {
+            if let Some(gid) = row.try_get::<Option<String>, _>("gid")? {
+                principals.push(format!("principals/groups/{}", php_urlencode(&gid)));
+            }
+        }
+        Ok(principals)
+    }
+
+    /// Every book the caller can see: owned books plus the de-duplicated
+    /// `oc_dav_shares` books, in PHP's listing order.
+    ///
+    /// Owned books come first (a wire-name collision must resolve to the owned
+    /// book, `Sabre\DAV\Collection::getChild()` returns the first match), then
+    /// the shared rows ordered by `a.id` for determinism. PHP adds no `ORDER BY`
+    /// (declared as `shared-books-listing-order`).
+    pub async fn visible_books(
+        &self,
+        principal: &str,
+        group_principals: &[String],
+    ) -> Result<Vec<VisibleBook>> {
+        let owned = self.address_books_for_user(principal).await?;
+        let mut books: Vec<VisibleBook> = owned.into_iter().map(VisibleBook::owned).collect();
+        let mut index: std::collections::HashMap<i64, usize> = books
+            .iter()
+            .enumerate()
+            .map(|(position, book)| (book.book.id, position))
+            .collect();
+
+        // The principals are bound twice (share rows + tombstone subquery);
+        // the tombstone access level is bound once, ahead of both.
+        let mut principals: Vec<String> = Vec::with_capacity(group_principals.len() + 1);
+        principals.push(principal.to_string());
+        principals.extend(group_principals.iter().cloned());
+        let access_ph = self.ph(1);
+        let mut in_list = String::new();
+        let mut tombstone_list = String::new();
+        for i in 0..principals.len() {
+            if i > 0 {
+                in_list.push_str(", ");
+                tombstone_list.push_str(", ");
+            }
+            in_list.push_str(&self.ph(i + 2));
+            tombstone_list.push_str(&self.ph(principals.len() + i + 2));
+        }
+        // Deliberate deviation from the literal CardDAV query: PHP excludes the
+        // tombstone row by `s.id` (`CardDavBackend.php:140-147`), which never
+        // hides a resource reached through a surviving group share. We exclude
+        // by `resourceid`, which is the intended (CalDAV-aligned) semantics.
+        // Declared as `shared-unshare-tombstone-semantics`.
+        let sql = format!(
+            "SELECT a.id, a.uri, a.displayname, a.principaluri, a.description, a.synctoken, s.access \
+             FROM {p}dav_shares s JOIN {p}addressbooks a ON s.resourceid = a.id \
+             WHERE s.type = 'addressbook' AND s.principaluri IN ({in_list}) \
+               AND NOT EXISTS (SELECT 1 FROM {p}dav_shares d \
+                   WHERE d.access = {access_ph} AND d.resourceid = s.resourceid \
+                     AND d.principaluri IN ({tombstone_list})) \
+             ORDER BY a.id",
+            p = self.prefix,
+        );
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql)).bind(ACCESS_UNSHARED);
+        for principal in &principals {
+            query = query.bind(principal.as_str());
+        }
+        for principal in &principals {
+            query = query.bind(principal.as_str());
+        }
+        let rows = query.fetch_all(&self.pool).await?;
+
+        for row in &rows {
+            let owner_principal = row
+                .try_get::<Option<String>, _>("principaluri")?
+                .unwrap_or_default();
+            // A share of the caller's own book: it is already in the owned list.
+            if owner_principal == principal {
+                continue;
+            }
+            let id: i64 = row.try_get("id")?;
+            let access: i16 = row.try_get("access")?;
+            let read_only = access == ACCESS_READ;
+            if let Some(&position) = index.get(&id) {
+                // Read-write wins: a read-only row never downgrades an existing
+                // entry, and an existing read-write entry is never replaced.
+                if read_only || !books[position].read_only {
+                    continue;
+                }
+            }
+
+            let uri = row.try_get::<Option<String>, _>("uri")?.unwrap_or_default();
+            let displayname: Option<String> = row.try_get("displayname")?;
+            let owner_name = owner_principal
+                .rsplit('/')
+                .next()
+                .unwrap_or_default()
+                .to_string();
+            let owner_displayname = self
+                .user_display_name(&owner_name)
+                .await?
+                .unwrap_or_else(|| owner_name.clone());
+            let visible = VisibleBook {
+                book: AddressBook {
+                    id,
+                    uri: uri.clone(),
+                    displayname: displayname.clone(),
+                    principaluri: owner_principal.clone(),
+                    description: row.try_get("description")?,
+                    synctoken: row.try_get("synctoken")?,
+                },
+                wire_uri: format!("{uri}_shared_by_{owner_name}"),
+                wire_displayname: Some(format!(
+                    "{} ({owner_displayname})",
+                    displayname.clone().unwrap_or_default()
+                )),
+                owner_principal: Some(owner_principal),
+                read_only,
+            };
+            match index.get(&id) {
+                Some(&position) => books[position] = visible,
+                None => {
+                    index.insert(id, books.len());
+                    books.push(visible);
+                }
+            }
+        }
+        Ok(books)
+    }
+
+    /// The visible book served under `wire_uri`, or `None` (the 404 case).
+    pub async fn visible_book_by_uri(
+        &self,
+        principal: &str,
+        group_principals: &[String],
+        wire_uri: &str,
+    ) -> Result<Option<VisibleBook>> {
+        Ok(self
+            .visible_books(principal, group_principals)
+            .await?
+            .into_iter()
+            .find(|book| book.wire_uri == wire_uri))
     }
 
     // ------------------------------------------------------------------
@@ -610,7 +775,10 @@ impl Db {
             "SELECT synctoken FROM {}addressbooks WHERE id = ?",
             self.prefix
         ));
-        let token: i64 = sqlx::query(sqlx::AssertSqlSafe(select))
+        // `oc_addressbooks.synctoken` and `oc_addressbookchanges.created_at`
+        // are PostgreSQL `integer` (int4); bind int4 values so the `Any`
+        // driver sends a format the server accepts.
+        let token: i32 = sqlx::query(sqlx::AssertSqlSafe(select))
             .bind(address_book_id)
             .fetch_one(&mut **tx)
             .await?
@@ -625,7 +793,7 @@ impl Db {
             .bind(token)
             .bind(address_book_id)
             .bind(operation)
-            .bind(now)
+            .bind(now as i32)
             .execute(&mut **tx)
             .await?;
         let update = self.render(&format!(
@@ -823,6 +991,27 @@ pub fn placeholder(index: usize, postgres: bool) -> String {
     }
 }
 
+/// PHP's `urlencode()` (RFC 1738): alphanumerics and `-`, `_`, `.` are left
+/// unescaped, a space becomes `+`, and every other byte is `%XX` with
+/// upper-case hex. This is what `Principal::getGroupMembership()` applies to a
+/// gid before building `principals/groups/<gid>`.
+///
+/// It differs from RFC 3986 percent-encoding (which leaves `~` and escapes a
+/// space as `%20`), and from `rawurlencode()` (which escapes `+` as `%2B`).
+pub fn php_urlencode(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for byte in input.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' => {
+                out.push(byte as char);
+            }
+            b' ' => out.push('+'),
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
 /// Unix seconds, as PHP's `time()`.
 pub fn now_unix() -> i64 {
     std::time::SystemTime::now()
@@ -931,5 +1120,19 @@ mod tests {
             "SELECT * FROM x WHERE a = ?"
         );
         assert_eq!(placeholder(3, false), "?");
+    }
+
+    #[test]
+    fn php_urlencode_matches_php() {
+        // Alphanumerics and `-_.` stay; a space becomes `+`; everything else
+        // is upper-case `%XX` (notably `~` -> `%7E`, unlike RFC 3986).
+        assert_eq!(php_urlencode("team"), "team");
+        assert_eq!(php_urlencode("a-b_c.d"), "a-b_c.d");
+        assert_eq!(php_urlencode("a b"), "a+b");
+        assert_eq!(php_urlencode("a+b"), "a%2Bb");
+        assert_eq!(php_urlencode("a~b"), "a%7Eb");
+        assert_eq!(php_urlencode("a/b"), "a%2Fb");
+        assert_eq!(php_urlencode("grüppe"), "gr%C3%BCppe");
+        assert_eq!(php_urlencode("100%"), "100%25");
     }
 }

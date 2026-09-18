@@ -98,6 +98,25 @@ ensure_book() { # uri
 	echo "MKCOL $1 -> $code"
 }
 
+# bob owns the shared books exercised by section 8. Clean them (and bob's
+# birthday calendar / activity) before the alice checks, so a re-run is
+# reproducible and the global uid counts are not polluted by shared writes.
+reset_bob_state() {
+	sec "reset bob shared state"
+	local bobids
+	bobids=$(q "SELECT coalesce(string_agg(id::text, ','), '-1') FROM oc_addressbooks WHERE principaluri='principals/users/bob'")
+	q "DELETE FROM oc_cards WHERE addressbookid IN ($bobids)" >/dev/null
+	q "DELETE FROM oc_cards_properties WHERE addressbookid IN ($bobids)" >/dev/null
+	q "DELETE FROM oc_addressbookchanges WHERE addressbookid IN ($bobids)" >/dev/null
+	q "UPDATE oc_addressbooks SET synctoken=1 WHERE id IN ($bobids)" >/dev/null
+	q "DELETE FROM oc_calendarobjects WHERE calendarid IN (SELECT id FROM oc_calendars WHERE principaluri='principals/users/bob' AND uri='contact_birthdays')" >/dev/null
+	q "DELETE FROM oc_calendarchanges WHERE calendarid IN (SELECT id FROM oc_calendars WHERE principaluri='principals/users/bob' AND uri='contact_birthdays')" >/dev/null
+	q "DELETE FROM oc_calendar_reminders WHERE calendar_id IN (SELECT id FROM oc_calendars WHERE principaluri='principals/users/bob' AND uri='contact_birthdays')" >/dev/null
+	q "DELETE FROM oc_activity WHERE object_id IN ($bobids)" >/dev/null 2>&1 || true
+	q "DELETE FROM oc_dav_event_outbox WHERE card_uri LIKE 'e2e-shared-%'" >/dev/null
+	echo "reset done (bob book ids: $bobids)"
+}
+
 # ---------------------------------------------------------------------------
 sec "0. preconditions"
 wait_for_nextcloud >/dev/null
@@ -105,6 +124,7 @@ wait_for_sidecar
 echo "sidecar: $(curl -s "$SIDE/healthz" | head -c 200)"
 check P0 "activity app enabled" "yes" "$([ "$(occ app:list 2>/dev/null | sed -n '/^Enabled:/,/^Disabled:/p' | grep -c '  - activity:')" -gt 0 ] && echo yes || echo no)"
 reset_alice_state
+reset_bob_state
 ensure_book crash
 
 BOOK_ID=$(q "SELECT id FROM oc_addressbooks WHERE principaluri='principals/users/alice' AND uri='$BOOK'")
@@ -400,6 +420,88 @@ check C7.2 "birthday effect still ran" "1" "$(birthday_vevent_count e2e-noapp-1)
 check C7.3 "no activity row written (app disabled)" "0" "$(q "SELECT count(*) FROM oc_activity WHERE object_type='addressbook' AND object_id=$BOOK_ID AND subject='card_add_self' AND timestamp > (SELECT created_at FROM oc_dav_event_outbox WHERE seq=$NOAPP_SEQ)" 2>/dev/null || echo 0)"
 occ app:enable activity >/dev/null 2>&1 || true
 occ app:enable notifications >/dev/null 2>&1 || true
+
+# ---------------------------------------------------------------------------
+sec "8. SHARED ADDRESS BOOKS (bob -> alice)"
+# bob's books were seeded by setup.sh: `bobro` shared read-only (access 3) and
+# `bobrw` shared read-write (access 2).
+BOBRO_ID=$(q "SELECT id FROM oc_addressbooks WHERE principaluri='principals/users/bob' AND uri='bobro'")
+BOBRW_ID=$(q "SELECT id FROM oc_addressbooks WHERE principaluri='principals/users/bob' AND uri='bobrw'")
+echo "bobro book id=$BOBRO_ID bobrw book id=$BOBRW_ID"
+# Reproducibility: clear anything a previous run may have left in bob's books.
+q "DELETE FROM oc_cards WHERE addressbookid IN ($BOBRO_ID,$BOBRW_ID)" >/dev/null
+q "DELETE FROM oc_cards_properties WHERE addressbookid IN ($BOBRO_ID,$BOBRW_ID)" >/dev/null
+q "DELETE FROM oc_addressbookchanges WHERE addressbookid IN ($BOBRO_ID,$BOBRW_ID)" >/dev/null
+q "UPDATE oc_addressbooks SET synctoken=1 WHERE id IN ($BOBRO_ID,$BOBRW_ID)" >/dev/null
+q "DELETE FROM oc_calendarobjects WHERE calendarid IN (SELECT id FROM oc_calendars WHERE principaluri='principals/users/bob' AND uri='contact_birthdays')" >/dev/null
+q "DELETE FROM oc_calendarchanges WHERE calendarid IN (SELECT id FROM oc_calendars WHERE principaluri='principals/users/bob' AND uri='contact_birthdays')" >/dev/null
+q "DELETE FROM oc_calendar_reminders WHERE calendar_id IN (SELECT id FROM oc_calendars WHERE principaluri='principals/users/bob' AND uri='contact_birthdays')" >/dev/null
+q "DELETE FROM oc_activity WHERE object_id IN ($BOBRO_ID,$BOBRW_ID)" >/dev/null 2>&1 || true
+q "DELETE FROM oc_dav_event_outbox WHERE card_uri IN ('e2e-shared-ro.vcf','e2e-shared-rw.vcf','e2e-shared-actor.vcf')" >/dev/null
+
+SHARED_RO_URL="$SIDE/remote.php/dav/addressbooks/users/alice/bobro_shared_by_bob"
+SHARED_RW_URL="$SIDE/remote.php/dav/addressbooks/users/alice/bobrw_shared_by_bob"
+
+cat >"$STATE_DIR/pf-shared.xml" <<'XML'
+<?xml version="1.0"?>
+<d:propfind xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns" xmlns:nc="http://nextcloud.com/ns">
+  <d:prop>
+    <d:displayname/><d:owner/><oc:owner-principal/><oc:read-only/>
+    <nc:owner-displayname/><d:current-user-privilege-set/>
+  </d:prop>
+</d:propfind>
+XML
+cat >"$STATE_DIR/card-shared-rw.vcf" <<'EOF'
+BEGIN:VCARD
+VERSION:3.0
+UID:e2e-shared-rw
+FN:Shared RW
+END:VCARD
+EOF
+cat >"$STATE_DIR/card-shared-actor.vcf" <<'EOF'
+BEGIN:VCARD
+VERSION:3.0
+UID:e2e-shared-actor
+FN:Shared Actor
+BDAY:1993-03-03
+END:VCARD
+EOF
+
+PROPF=$(curl -s -K "$CURLRC" -X PROPFIND -H 'Depth: 0' \
+	-H 'Content-Type: application/xml' --data-binary @"$STATE_DIR/pf-shared.xml" \
+	"$SHARED_RO_URL/")
+check S1 "shared displayname is owner-decorated" "yes" "$(has 'Bob bobro (Bob Shared)' "$PROPF")"
+check S2 "shared owner-principal" "yes" "$(has '<oc:owner-principal>principals/users/bob</oc:owner-principal>' "$PROPF")"
+check S3 "read-only share sets oc:read-only=1" "yes" "$(has '<oc:read-only>1</oc:read-only>' "$PROPF")"
+check S4 "read-only share owner href points at bob" "yes" "$(has '/remote.php/dav/principals/users/bob/' "$PROPF")"
+check S5 "owner-displayname" "yes" "$(has '>Bob Shared<' "$PROPF")"
+check S6 "read-only privilege set includes write-properties" "yes" "$(has '<d:write-properties/>' "$PROPF")"
+check S7 "read-only share has no d:write privilege" "no" "$(has '<d:write/>' "$PROPF")"
+
+# A write to the read-only share is 404 (never 403), with no DB write at all.
+RO_PUT=$(put_card "$STATE_DIR/card-create.vcf" "$SHARED_RO_URL/e2e-shared-ro.vcf" | awk '{print $1}')
+check S8 "PUT to read-only share is 404" "404" "$RO_PUT"
+check S9 "no card written to the owner's read-only book" "0" "$(q "SELECT count(*) FROM oc_cards WHERE addressbookid=$BOBRO_ID AND uri='e2e-shared-ro.vcf'")"
+check S10 "no outbox row for the refused write" "0" "$(q "SELECT count(*) FROM oc_dav_event_outbox WHERE card_uri='e2e-shared-ro.vcf'")"
+check S11 "DELETE on read-only share is 404" "404" "$(delete_card "$SHARED_RO_URL/e2e-shared-ro.vcf")"
+
+# A write to the read-write share lands in bob's book, not alice's.
+RW_PUT=$(put_card "$STATE_DIR/card-shared-rw.vcf" "$SHARED_RW_URL/e2e-shared-rw.vcf" | awk '{print $1}')
+check S12 "PUT to read-write share is 201" "201" "$RW_PUT"
+check S13 "card landed in the owner's read-write book" "1" "$(q "SELECT count(*) FROM oc_cards WHERE addressbookid=$BOBRW_ID AND uri='e2e-shared-rw.vcf'")"
+check S14 "card did not leak into alice's book" "0" "$(q "SELECT count(*) FROM oc_cards WHERE addressbookid=$BOOK_ID AND uri='e2e-shared-rw.vcf'")"
+check S15 "outbox row carries the owner's book id" "$BOBRW_ID" "$(q "SELECT addressbookid FROM oc_dav_event_outbox WHERE card_uri='e2e-shared-rw.vcf' ORDER BY seq DESC LIMIT 1")"
+check S16 "DELETE on read-write share is 204" "204" "$(delete_card "$SHARED_RW_URL/e2e-shared-rw.vcf")"
+check S17 "card removed from the owner's book" "0" "$(q "SELECT count(*) FROM oc_cards WHERE addressbookid=$BOBRW_ID AND uri='e2e-shared-rw.vcf'")"
+
+# Confirm the read-write write is attributed to bob (the owner) by the worker:
+# the outbox has no actor column, so the activity row is bob's (declared
+# deviation `shared-write-actor`).
+put_card "$STATE_DIR/card-shared-actor.vcf" "$SHARED_RW_URL/e2e-shared-actor.vcf" >/dev/null
+curl -s -o /dev/null -K "$CURLRC" "$NC_URL/remote.php/dav/addressbooks/users/alice/bobrw_shared_by_bob/e2e-shared-actor.vcf" >/dev/null 2>&1 || true
+run_worker_once >/dev/null
+ACT_AFFECTED=$(q "SELECT affecteduser FROM oc_activity WHERE object_type='addressbook' AND object_id=$BOBRW_ID AND subject='card_add_self' ORDER BY activity_id DESC LIMIT 1" 2>/dev/null || echo "")
+check S18 "shared write activity is attributed to the owner (no actor column)" "bob" "$ACT_AFFECTED"
 
 # ---------------------------------------------------------------------------
 sec "SUMMARY"

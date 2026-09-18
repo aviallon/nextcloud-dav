@@ -148,7 +148,7 @@ async fn stored_size_is_not_recomputed_when_nothing_was_filtered() {
         "UPDATE {}cards SET size = 9999 WHERE uri = 'x.vcf'",
         env.prefix
     );
-    sqlx::query(sqlx::AssertSqlSafe(sql))
+    sqlx::query(common::safe(sql))
         .execute(env.pool())
         .await
         .unwrap();
@@ -313,7 +313,7 @@ async fn authtoken_lookup_filters_on_version_2() {
          VALUES ('alice', 'alice', '', ?, 1, ?, 1, false)",
         env.prefix
     );
-    sqlx::query(sqlx::AssertSqlSafe(sql))
+    sqlx::query(common::safe(sql))
         .bind(&hash)
         .bind(now())
         .execute(env.pool())
@@ -321,8 +321,18 @@ async fn authtoken_lookup_filters_on_version_2() {
         .unwrap();
     assert!(env.db.authtoken_by_hash(&hash).await.unwrap().is_none());
 
-    // Then a v2 row with the same token value is found.
-    env.seed_token("alice", "alice", "pw", 1, 2).await;
+    // Bump the row to version 2: the same token value is now found. (The
+    // `authtoken_token_index` is unique, so a second row with the same token
+    // cannot exist; the real filter to exercise is the version.)
+    let sql = format!(
+        "UPDATE {}authtoken SET version = 2 WHERE token = ?",
+        env.prefix
+    );
+    sqlx::query(common::safe(sql))
+        .bind(&hash)
+        .execute(env.pool())
+        .await
+        .unwrap();
     let row = env.db.authtoken_by_hash(&hash).await.unwrap().unwrap();
     assert_eq!(row.uid, "alice");
     assert_eq!(row.token_type, 1);
@@ -337,7 +347,7 @@ async fn bruteforce_count_is_scoped_by_subnet_and_window() {
          VALUES ('1.2.3.4', '1.2.3.4/32', ?, 'login', '{{}}')",
         env.prefix
     );
-    sqlx::query(sqlx::AssertSqlSafe(sql))
+    sqlx::query(common::safe(sql))
         .bind(now())
         .execute(env.pool())
         .await

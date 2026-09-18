@@ -29,7 +29,11 @@ Status vocabulary:
 | `export-delegated` | delegation | accepted | `?export` → 501 → PHP |
 | `home-listing-php` | routing | accepted | home listing (and app-generated books) served by PHP |
 | `writes-501` | writes | temporary | PUT/DELETE/MKCOL/PROPPATCH/MOVE/COPY/POST → 501 → PHP |
-| `shared-books-php` | routing | accepted | shared/group/system books are PHP-only |
+| `shared-books-php` | routing | resolved | owned + user/group-shared `oc_dav_shares` books are served with the sharing properties |
+| `shared-unshare-tombstone-semantics` | routing | intentional | tombstones exclude by `resourceid` (CalDAV semantics); PHP CardDAV uses `s.id` and never hides a surviving group share |
+| `shared-write-actor` | writes | intentional | the outbox has no actor column, so a shared write is attributed to the owner |
+| `shared-books-group-backends` | routing | intentional | group expansion is database-only; LDAP/circles and `hideFromCollaboration()` are invisible |
+| `shared-books-listing-order` | routing | intentional | owned books first, then shared rows ordered by id |
 | `contactsinteraction-php` | routing | accepted | `z-app-generated--contactsinteraction--recent` is PHP-only |
 | `bruteforce-recording-off` | auth | intentional | failed logins are not recorded by default |
 | `no-event-dispatch` | writes | intentional | no CardCreated/Updated/DeletedEvent, so no search/activity/notification side effects |
@@ -68,9 +72,13 @@ and are replayed to PHP by nginx (`error_page 501`).
 app-generated collections. The sidecar's own `Home` handler (only reachable if
 the route is misconfigured) lists just `oc_addressbooks`.
 
-**`shared-books-php` / `contactsinteraction-php`** — the sidecar queries
-`principaluri = 'principals/users/<uid>'` only. Shared (`oc_dav_shares`), group
-and system books, and the `contactsinteraction` book, are not modelled.
+**`shared-books-php` / `contactsinteraction-php`** — the sidecar now serves
+owned, user-shared and database-group-shared `oc_dav_shares` books through a
+single `visible_books()` path, with the owner's sharing properties and the
+read-only write ACL. The system book and the `contactsinteraction` book stay on
+PHP because they are not backed by `oc_addressbooks`/`oc_cards` rows. The three
+shared-book limitations (tombstone semantics, group backends, write actor) are
+listed above.
 
 ### Writes
 

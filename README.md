@@ -14,8 +14,9 @@ are dispatched asynchronously from a transactional outbox by the companion
 
 > **Status: reads + card writes.** `MKCOL`, `PROPPATCH`, `MOVE`, `COPY`, `POST`,
 > `?photo`/`?export`, and any write to a collection answer `501 Not Implemented`
-> on purpose so nginx can hand them back to PHP. Shared/group/system address
-> books are not served yet and must stay routed to PHP.
+> on purpose so nginx can hand them back to PHP. Owned, user-shared and
+> database-group-shared `oc_dav_shares` books are served; the system book and
+> the app-generated `contactsinteraction` book stay on PHP.
 
 See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the as-built design:
 deployment topology, the nginx split and its failure mode, the app-password
@@ -26,6 +27,7 @@ fast path, the sync-token scheme, the data model, and the operational traps.
 | Capability | Notes |
 |---|---|
 | `PROPFIND` Depth 0/1 | home, address book and card nodes |
+| Shared / group books | `oc_dav_shares` user + database-group books served as `<uri>_shared_by_<owner>` with the sharing properties (`owner-principal`, `read-only`, owner's `{DAV:}owner`); read-only shares are `404` on write (never `403`), read-write writes land in the owner's book |
 | `GET` / `HEAD` a card | `text/vcard; charset=utf-8`, quoted ETag, `Last-Modified` |
 | `REPORT addressbook-multiget` | hrefs resolved, missing hrefs get a 404 propstat |
 | `REPORT addressbook-query` | RFC 6352 §10.5 filters evaluated in Rust, `limit` honoured |
@@ -44,9 +46,10 @@ Properties served include `{DAV:}resourcetype`,
 `{DAV:}sync-token`, `{DAV:}supported-report-set`,
 `{carddav}max-resource-size`, `{carddav}supported-address-data`,
 `{carddav}supported-collation-set`, `{DAV:}owner`,
-`{DAV:}current-user-privilege-set`, `{oc}groups`, `{nc}owner-displayname`,
-`{nc}has-photo`, and on cards `{DAV:}getetag`, `{DAV:}getcontentlength`,
-`{DAV:}getlastmodified`, `{DAV:}getcontenttype`, `{carddav}address-data`.
+`{DAV:}current-user-privilege-set`, `{oc}groups`, `{oc}owner-principal`,
+`{oc}read-only`, `{nc}owner-displayname`, `{nc}has-photo`, and on cards
+`{DAV:}getetag`, `{DAV:}getcontentlength`, `{DAV:}getlastmodified`,
+`{DAV:}getcontenttype`, `{carddav}address-data`.
 
 ## Build and run
 
@@ -187,9 +190,12 @@ as an unprivileged user, keep its config unreadable, and bind it to loopback.
 ## Known limitations / stubs
 
 - **Read-only.** Writes are `501`, by design.
-- **Personal books only.** Shared books (`oc_dav_shares`), group books and the
-  system book (`addressbooks/system/...`, `z-server-generated--system`) are not
-  served; keep them on PHP.
+- **Shared books are database-group only.** LDAP/circles group membership and
+  `hideFromCollaboration()` are not visible in the schema, so those shares fall
+  back to PHP. Tombstone exclusion follows the CalDAV `resourceid` semantics
+  rather than the CardDAV `s.id` bug, and a shared write's activity is
+  attributed to the owner (the outbox has no actor column). See
+  `tests/deviations.toml`.
 - **No vCard version negotiation.** `address-data` is returned as stored
   (typically vCard 3.0); the `version`/`content-type` attributes are parsed but
   ignored, and the `address-data` child `prop` filter is not applied.

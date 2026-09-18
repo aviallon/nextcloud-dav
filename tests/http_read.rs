@@ -277,12 +277,9 @@ async fn propfind_book_depth0_has_all_expected_properties() {
     // Privileges contain d:read.
     let privs = prop_of(r, NS_DAV, "current-user-privilege-set").unwrap();
     assert!(privs.children.iter().any(|p| p
-        .child(NS_DAV, "privilege")
-        .map(|pr| pr
-            .children
-            .iter()
-            .any(|c| c.ns == NS_DAV && c.local == "read"))
-        .unwrap_or(false)));
+        .children
+        .iter()
+        .any(|c| c.ns == NS_DAV && c.local == "read")));
 }
 
 #[tokio::test]
@@ -506,7 +503,23 @@ fn query_body(inner: &str) -> String {
 }
 
 async fn query(app: &axum::Router, inner: &str) -> Vec<String> {
-    let resp = report(app, BOOK_PATH, USER, PASSWORD, &query_body(inner)).await;
+    // addressbook-query on a collection needs Depth: 1; Depth: 0 is the
+    // `query-depth0-on-collection` 415 case and is asserted separately.
+    let request = axum::http::Request::builder()
+        .method("REPORT")
+        .uri(BOOK_PATH)
+        .header(
+            axum::http::header::AUTHORIZATION,
+            common::basic(USER, PASSWORD),
+        )
+        .header(
+            axum::http::header::CONTENT_TYPE,
+            "application/xml; charset=utf-8",
+        )
+        .header("Depth", "1")
+        .body(axum::body::Body::from(query_body(inner)))
+        .unwrap();
+    let resp = call(app, request).await;
     assert_eq!(resp.status, 207, "query failed: {}", resp.text());
     let doc = doc(&resp.body);
     doc.children
@@ -698,21 +711,51 @@ async fn sync_collection_malformed_token_is_403_with_precondition() {
 #[tokio::test]
 async fn other_users_and_missing_resources_are_404_not_403() {
     let (_env, _book, app) = setup!();
-    let cases = [
-        "/remote.php/dav/addressbooks/users/bob",
-        "/remote.php/dav/addressbooks/users/bob/contacts",
+    // Cards that do not exist or belong to another user are 404, never 403.
+    let card_cases = [
         "/remote.php/dav/addressbooks/users/bob/contacts/x.vcf",
-        "/remote.php/dav/addressbooks/users/alice/missing",
         "/remote.php/dav/addressbooks/users/alice/contacts/missing.vcf",
     ];
-    for path in cases {
+    for path in card_cases {
         let resp = get(&app, path, USER, PASSWORD).await;
         assert_eq!(resp.status, 404, "GET {path} should be 404");
     }
-    // PROPFIND on another user's book is also 404.
+    // Collection GETs for another user are hidden (404). A missing book on the
+    // caller's own home is a collection read, so it delegates to PHP (501);
+    // the sidecar never answers 403.
+    for path in [
+        "/remote.php/dav/addressbooks/users/bob",
+        "/remote.php/dav/addressbooks/users/bob/contacts",
+    ] {
+        let resp = get(&app, path, USER, PASSWORD).await;
+        assert_eq!(resp.status, 404, "GET {path} should be hidden");
+    }
+    let resp = get(
+        &app,
+        "/remote.php/dav/addressbooks/users/alice/missing",
+        USER,
+        PASSWORD,
+    )
+    .await;
+    assert_eq!(
+        resp.status, 501,
+        "a missing book GET should delegate to PHP"
+    );
+    // PROPFIND on another user's book is 404 (not 403).
     let resp = propfind(
         &app,
         "/remote.php/dav/addressbooks/users/bob/contacts",
+        USER,
+        PASSWORD,
+        "0",
+        ALL_BOOK_PROPS,
+    )
+    .await;
+    assert_eq!(resp.status, 404);
+    // PROPFIND on a missing book of the caller is also 404.
+    let resp = propfind(
+        &app,
+        "/remote.php/dav/addressbooks/users/alice/missing",
         USER,
         PASSWORD,
         "0",
@@ -781,7 +824,15 @@ async fn unauthenticated_requests_get_401() {
     assert!(resp.header("www-authenticate").is_some());
 
     // OPTIONS without auth still advertises discovery, but is 401.
-    let resp = call(&app, request("OPTIONS", BOOK_PATH, "", "")).await;
+    let resp = call(
+        &app,
+        axum::http::Request::builder()
+            .method("OPTIONS")
+            .uri(BOOK_PATH)
+            .body(axum::body::Body::empty())
+            .unwrap(),
+    )
+    .await;
     assert_eq!(resp.status, 401);
     assert_eq!(resp.header("dav").as_deref(), Some("1, 2, 3, addressbook"));
 }
@@ -803,9 +854,12 @@ async fn status_with(app: &axum::Router, user: &str, password: &str) -> u16 {
 }
 
 #[tokio::test]
-async fn wrong_password_is_401() {
+async fn wrong_password_falls_back_to_php() {
     let (_env, _book, app) = setup!();
-    assert_eq!(status_with(&app, USER, "wrong").await, 401);
+    // A password the app-password hash cannot match is not the fast path's to
+    // judge (it may be the account password, which only PHP can check), so the
+    // request is delegated. PHP is unreachable in this harness, hence 502.
+    assert_eq!(status_with(&app, USER, "wrong").await, 502);
 }
 
 #[tokio::test]
@@ -919,7 +973,9 @@ async fn temporary_token_type_falls_back_to_php() {
 #[tokio::test]
 async fn brute_force_recording_is_off_by_default() {
     let (env, _book, app) = setup!();
-    assert_eq!(status_with(&app, USER, "wrong").await, 401);
+    // A hash miss delegates to PHP (unreachable here, hence 502); the point is
+    // that no failure is recorded locally.
+    assert_eq!(status_with(&app, USER, "wrong").await, 502);
     // `record_bruteforce_attempts` defaults to false: no INSERT happens.
     assert_eq!(env.count("bruteforce_attempts").await, 0);
 }

@@ -133,6 +133,44 @@ if [ "$code" != "201" ] && [ "$code" != "405" ]; then
 	exit 1
 fi
 
+# --- shared address books (bob -> alice) --------------------------------------
+# bob owns two books, one shared read-only and one read-write. The shares are
+# seeded with SQL; the sidecar reads oc_dav_shares directly, exactly like PHP.
+# The harness never needs bob's password (only alice writes to bob's books).
+echo "==> creating bob + shared address books"
+if ! occ user:info bob >/dev/null 2>&1; then
+	BOB_PASSWORD=$(rand_hex 16)
+	printf '%s' "$BOB_PASSWORD" >"$STATE_DIR/bob_password"
+	chmod 600 "$STATE_DIR/bob_password"
+	OC_PASS="$BOB_PASSWORD" docker exec -e OC_PASS -u www-data -w /var/www/html "$NC" \
+		php occ user:add --password-from-env --display-name "Bob Shared" bob >/dev/null
+fi
+# Idempotent: make sure the display name the checks assert is in place.
+q "UPDATE oc_users SET displayname='Bob Shared' WHERE uid='bob'" >/dev/null
+for book in bobro bobrw; do
+	q "INSERT INTO oc_addressbooks (principaluri, displayname, uri, description, synctoken)
+	   SELECT 'principals/users/bob', 'Bob $book', '$book', NULL, 1
+	   WHERE NOT EXISTS (SELECT 1 FROM oc_addressbooks
+	                     WHERE principaluri='principals/users/bob' AND uri='$book')" >/dev/null
+done
+# access 3 = read-only, access 2 = read-write.
+while read -r book access; do
+	q "INSERT INTO oc_dav_shares (principaluri, type, access, resourceid)
+	   SELECT 'principals/users/alice', 'addressbook', $access, a.id
+	   FROM oc_addressbooks a
+	   WHERE a.principaluri='principals/users/bob' AND a.uri='$book'
+	     AND NOT EXISTS (SELECT 1 FROM oc_dav_shares s
+	                     WHERE s.resourceid=a.id AND s.principaluri='principals/users/alice'
+	                       AND s.type='addressbook')" >/dev/null
+done <<'SHARES'
+bobro 3
+bobrw 2
+SHARES
+q "SELECT string_agg(uri||'->'||access, ',' ORDER BY uri)
+   FROM oc_addressbooks a JOIN oc_dav_shares s ON s.resourceid=a.id
+   WHERE a.principaluri='principals/users/bob' AND s.principaluri='principals/users/alice'" |
+	sed 's/^/shares seeded: /'
+
 # --- copy config to the host sidecar -----------------------------------------
 # The sidecar gets a *copy* of the container's config.php plus two sibling
 # config files: the shared dispatch block and a dbhost/dbport override that

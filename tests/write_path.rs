@@ -94,7 +94,7 @@ async fn card_row(
          WHERE addressbookid = ? AND uri = ? LIMIT 1",
         env.prefix
     );
-    let row = sqlx::query(sqlx::AssertSqlSafe(sql))
+    let row = sqlx::query(common::safe(sql))
         .bind(book)
         .bind(uri)
         .fetch_optional(env.pool())
@@ -116,7 +116,7 @@ async fn synctoken(env: &TestEnv, book: i64) -> i64 {
         "SELECT synctoken FROM {}addressbooks WHERE id = ?",
         env.prefix
     );
-    sqlx::query(sqlx::AssertSqlSafe(sql))
+    sqlx::query(common::safe(sql))
         .bind(book)
         .fetch_one(env.pool())
         .await
@@ -132,7 +132,7 @@ async fn last_change(env: &TestEnv, book: i64) -> (String, i64, i64) {
          WHERE addressbookid = ? ORDER BY id DESC LIMIT 1",
         env.prefix
     );
-    let row = sqlx::query(sqlx::AssertSqlSafe(sql))
+    let row = sqlx::query(common::safe(sql))
         .bind(book)
         .fetch_one(env.pool())
         .await
@@ -154,7 +154,7 @@ async fn last_outbox(env: &TestEnv) -> (i64, String, String, Vec<u8>, String) {
          ORDER BY seq DESC LIMIT 1",
         env.prefix
     );
-    let row = sqlx::query(sqlx::AssertSqlSafe(sql))
+    let row = sqlx::query(common::safe(sql))
         .fetch_one(env.pool())
         .await
         .unwrap();
@@ -214,7 +214,7 @@ async fn create_card_201_etag_rows_properties_and_outbox() {
          ORDER BY id",
         env.prefix, env.prefix
     );
-    let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
+    let rows = sqlx::query(common::safe(sql))
         .bind(book)
         .bind("pref.vcf")
         .fetch_all(env.pool())
@@ -301,7 +301,7 @@ async fn delete_card_204_purges_properties_and_queues_pre_delete_snapshot() {
             "SELECT id FROM {}cards WHERE addressbookid = ? AND uri = 'jane.vcf'",
             env.prefix
         );
-        sqlx::query(sqlx::AssertSqlSafe(sql))
+        sqlx::query(common::safe(sql))
             .bind(book)
             .fetch_one(env.pool())
             .await
@@ -323,7 +323,7 @@ async fn delete_card_204_purges_properties_and_queues_pre_delete_snapshot() {
             "SELECT COUNT(*) AS c FROM {}cards_properties WHERE cardid = ?",
             env.prefix
         );
-        sqlx::query(sqlx::AssertSqlSafe(sql))
+        sqlx::query(common::safe(sql))
             .bind(card_id)
             .fetch_one(env.pool())
             .await
@@ -498,8 +498,9 @@ async fn latin1_body_is_transcoded_to_utf8() {
     let resp = put(&app, &card_path("latin.vcf"), body, &[]).await;
     assert_eq!(resp.status, 201, "{}", resp.text());
     let (carddata, _, _, _, _) = card_row(&env, book, "latin.vcf").await.unwrap();
+    let needle = b"Caf\xc3\xa9";
     assert!(
-        carddata.windows(4).any(|w| w == b"Caf\xc3\xa9"),
+        carddata.windows(needle.len()).any(|w| w == needle),
         "stored bytes are not UTF-8: {:?}",
         String::from_utf8_lossy(&carddata)
     );
@@ -518,7 +519,7 @@ async fn failed_write_rolls_back_both_the_card_and_the_outbox_row() {
         "CREATE UNIQUE INDEX test_unique_property ON {}cards_properties (cardid, name)",
         env.prefix
     );
-    sqlx::query(sqlx::AssertSqlSafe(ddl))
+    sqlx::query(common::safe(ddl))
         .execute(env.pool())
         .await
         .unwrap();

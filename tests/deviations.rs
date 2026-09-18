@@ -30,6 +30,10 @@ const DECLARED_IDS: &[&str] = &[
     "home-listing-php",
     "writes-501",
     "shared-books-php",
+    "shared-unshare-tombstone-semantics",
+    "shared-write-actor",
+    "shared-books-group-backends",
+    "shared-books-listing-order",
     "contactsinteraction-php",
     "bruteforce-recording-off",
     "no-event-dispatch",
@@ -138,7 +142,7 @@ async fn latest_outbox(env: &TestEnv) -> (String, i64) {
         "SELECT effects, state FROM {}dav_event_outbox ORDER BY seq DESC LIMIT 1",
         env.prefix
     );
-    let row = sqlx::query(sqlx::AssertSqlSafe(sql))
+    let row = sqlx::query(common::safe(sql))
         .fetch_one(env.pool())
         .await
         .unwrap();
@@ -262,49 +266,206 @@ async fn assert_deviation(id: &str, f: &Fixture) -> Result<(), String> {
             );
         }
         "shared-books-php" => {
-            // Bob shares his book with alice; the sidecar must ignore it.
+            // Bob shares his book with alice; the sidecar now serves it.
             let bob_book = f
                 .env
                 .seed_addressbook("principals/users/bob", "shared", Some("Bob"), None, 1)
                 .await;
-            let sql = format!(
-                "INSERT INTO {}dav_shares (principaluri, type, access, resourceid) \
-                 VALUES ('principals/users/alice', 'addressbook', 3, ?)",
-                f.env.prefix
-            );
-            sqlx::query(sqlx::AssertSqlSafe(sql))
-                .bind(bob_book as i32)
-                .execute(f.env.pool())
-                .await
-                .unwrap();
+            f.env
+                .seed_share("principals/users/alice", 3, bob_book)
+                .await;
+
             let books = f
                 .env
                 .db
-                .address_books_for_user("principals/users/alice")
+                .visible_books("principals/users/alice", &[])
+                .await
+                .unwrap();
+            let shared = books
+                .iter()
+                .find(|book| book.wire_uri == "shared_shared_by_bob")
+                .ok_or("the shared book is not listed")?;
+            ensure!(shared.read_only, "the shared book should be read-only");
+            ensure!(
+                shared.owner_principal.as_deref() == Some("principals/users/bob"),
+                "owner principal is {:?}",
+                shared.owner_principal
+            );
+
+            let path = "/remote.php/dav/addressbooks/users/alice/shared_shared_by_bob";
+            let body = r#"<d:propfind xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns"><d:prop><oc:owner-principal/><oc:read-only/></d:prop></d:propfind>"#;
+            let resp = propfind(&f.app, path, USER, PASSWORD, "0", body).await;
+            ensure!(
+                resp.status == 207,
+                "PROPFIND on the shared book returned {}",
+                resp.status
+            );
+            let d = doc(&resp.body);
+            let r = response(&d, &format!("{path}/")).ok_or("no book response")?;
+            ensure!(
+                prop_text(r, NS_OWNCLOUD, "owner-principal").as_deref()
+                    == Some("principals/users/bob"),
+                "owner-principal is missing"
+            );
+            ensure!(
+                prop_text(r, NS_OWNCLOUD, "read-only").as_deref() == Some("1"),
+                "read-only is missing"
+            );
+        }
+        "shared-unshare-tombstone-semantics" => {
+            // A group share plus an access=5 tombstone for the caller. PHP's
+            // literal `s.id NOT IN (tombstone ids)` would keep it; we hide it.
+            let bob_book = f
+                .env
+                .seed_addressbook("principals/users/bob", "tomb", Some("Tomb"), None, 1)
+                .await;
+            f.env.seed_group("tombgroup").await;
+            f.env.seed_group_member("tombgroup", USER).await;
+            f.env
+                .seed_share("principals/groups/tombgroup", 2, bob_book)
+                .await;
+            f.env
+                .seed_share("principals/users/alice", 5, bob_book)
+                .await;
+            let groups = f.env.db.group_principals(USER).await.unwrap();
+            let books = f
+                .env
+                .db
+                .visible_books("principals/users/alice", &groups)
                 .await
                 .unwrap();
             ensure!(
-                books.len() == 1,
-                "shared book leaked into the listing: {}",
-                books.len()
+                !books.iter().any(|book| book.book.id == bob_book),
+                "a tombstoned group share is still visible"
             );
-            let resp = get(
+        }
+        "shared-write-actor" => {
+            // The outbox has no actor column: a shared write is attributed to
+            // the owner by the worker.
+            let bob_book = f
+                .env
+                .seed_addressbook("principals/users/bob", "actor", Some("Actor"), None, 1)
+                .await;
+            f.env
+                .seed_share("principals/users/alice", 2, bob_book)
+                .await;
+            let path = "/remote.php/dav/addressbooks/users/alice/actor_shared_by_bob/actor.vcf";
+            let resp = put_body(
                 &f.app,
-                "/remote.php/dav/addressbooks/users/alice/shared",
-                USER,
-                PASSWORD,
+                path,
+                b"BEGIN:VCARD\r\nVERSION:3.0\r\nUID:actor-1\r\nFN:Actor\r\nEND:VCARD\r\n",
             )
             .await;
-            ensure!(resp.status == 404, "shared book returned {}", resp.status);
+            ensure!(
+                resp.status == 201,
+                "PUT into the read-write share returned {}",
+                resp.status
+            );
+            let sql = format!(
+                "SELECT COUNT(*) AS c FROM information_schema.columns \
+                 WHERE table_name = '{}dav_event_outbox' AND column_name = 'actor'",
+                f.env.prefix
+            );
+            let row = sqlx::query(common::safe(sql))
+                .fetch_one(f.env.pool())
+                .await
+                .unwrap();
+            use sqlx::Row;
+            ensure!(
+                row.try_get::<i64, _>("c").unwrap() == 0,
+                "the outbox grew an actor column; this deviation is stale"
+            );
+            let sql = format!(
+                "SELECT addressbookid FROM {}dav_event_outbox \
+                 WHERE card_uri = 'actor.vcf' ORDER BY seq DESC LIMIT 1",
+                f.env.prefix
+            );
+            let row = sqlx::query(common::safe(sql))
+                .fetch_one(f.env.pool())
+                .await
+                .unwrap();
+            ensure!(
+                row.try_get::<i64, _>("addressbookid").unwrap() == bob_book,
+                "the outbox row does not carry the owner's book id"
+            );
+        }
+        "shared-books-group-backends" => {
+            // Group expansion is database-only: one principal per oc_group_user
+            // row, and none for a user with no membership.
+            let groups = f.env.db.group_principals(USER).await.unwrap();
+            let sql = format!(
+                "SELECT COUNT(*) AS c FROM {}group_user WHERE uid = ?",
+                f.env.prefix
+            );
+            let row = sqlx::query(common::safe(sql))
+                .bind(USER)
+                .fetch_one(f.env.pool())
+                .await
+                .unwrap();
+            use sqlx::Row;
+            let membership: i64 = row.try_get("c").unwrap();
+            ensure!(
+                groups.len() as i64 == membership,
+                "group expansion is not database-only ({} principals vs {} rows)",
+                groups.len(),
+                membership
+            );
+            ensure!(
+                groups.iter().all(|g| g.starts_with("principals/groups/")),
+                "unexpected group principal shape: {groups:?}"
+            );
+            ensure!(
+                f.env
+                    .db
+                    .group_principals("nobody")
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "a user with no membership has group principals"
+            );
+        }
+        "shared-books-listing-order" => {
+            let groups = f.env.db.group_principals(USER).await.unwrap();
+            let books = f
+                .env
+                .db
+                .visible_books("principals/users/alice", &groups)
+                .await
+                .unwrap();
+            let owned_count = books
+                .iter()
+                .take_while(|book| book.owner_principal.is_none())
+                .count();
+            let owned: Vec<i64> = books[..owned_count]
+                .iter()
+                .map(|book| book.book.id)
+                .collect();
+            let shared: Vec<i64> = books[owned_count..]
+                .iter()
+                .map(|book| book.book.id)
+                .collect();
+            ensure!(
+                owned.windows(2).all(|w| w[0] < w[1]),
+                "owned books are not ordered by id: {owned:?}"
+            );
+            ensure!(
+                shared.windows(2).all(|w| w[0] < w[1]),
+                "shared books are not ordered by id: {shared:?}"
+            );
+            ensure!(
+                books
+                    .iter()
+                    .skip(owned_count)
+                    .all(|b| b.owner_principal.is_some()),
+                "an owned book appears after a shared one"
+            );
         }
         "contactsinteraction-php" => {
-            let resp = get(
-                &f.app,
-                "/remote.php/dav/addressbooks/users/alice/z-app-generated--contactsinteraction--recent",
-                USER,
-                PASSWORD,
-            )
-            .await;
+            let path =
+                "/remote.php/dav/addressbooks/users/alice/z-app-generated--contactsinteraction--recent";
+            let body =
+                r#"<d:propfind xmlns:d="DAV:"><d:prop><d:resourcetype/></d:prop></d:propfind>"#;
+            let resp = propfind(&f.app, path, USER, PASSWORD, "0", body).await;
             ensure!(
                 resp.status == 404,
                 "contactsinteraction returned {}",
@@ -313,8 +474,11 @@ async fn assert_deviation(id: &str, f: &Fixture) -> Result<(), String> {
         }
         "bruteforce-recording-off" => {
             let resp = get(&f.app, card_path, USER, "wrong-password").await;
+            // A password the token hash cannot match is delegated to PHP (502
+            // here, because the test PHP is unreachable); either way it is
+            // rejected and nothing is recorded.
             ensure!(
-                resp.status == 401,
+                resp.status == 401 || resp.status == 502,
                 "wrong password returned {}",
                 resp.status
             );
@@ -359,10 +523,16 @@ async fn assert_deviation(id: &str, f: &Fixture) -> Result<(), String> {
                 f.env.count("dav_event_outbox").await == before + 1,
                 "no exactly-one outbox row was queued"
             );
+            // A create triggers activity + birthday, but not the update/delete
+            // only effects (photo_cache, redis_cloud_id).
             let (effects, _state) = latest_outbox(&f.env).await;
             ensure!(
-                effects.contains("activity_stream") && effects.contains("redis_cloud_id"),
+                effects.contains("activity_stream") && effects.contains("birthday_calendar"),
                 "outbox effects are incomplete: {effects}"
+            );
+            ensure!(
+                !effects.contains("redis_cloud_id"),
+                "a create must not claim the update-only redis effect: {effects}"
             );
         }
         "jcard-rejected" => {

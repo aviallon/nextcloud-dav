@@ -14,6 +14,42 @@ pub struct AddressBook {
     pub synctoken: i64,
 }
 
+/// A book a user can see: an owned book, or a book shared with them through
+/// `oc_dav_shares` (`CardDavBackend::getAddressBooksForUser()`).
+///
+/// `book` is always the owner's `oc_addressbooks` row; the wire-facing name and
+/// the sharing facts live next to it. An owned book has
+/// `owner_principal == None`, `read_only == false` and `wire_uri == book.uri`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VisibleBook {
+    /// The owner's `oc_addressbooks` row (id, stored uri/displayname, token).
+    pub book: AddressBook,
+    /// The name the book is served under: the owned `uri`, or
+    /// `<uri>_shared_by_<owner-name>` for a shared book.
+    pub wire_uri: String,
+    /// The `{DAV:}displayname` sent on the wire. Shared books carry
+    /// `<displayname> (<owner display name>)`.
+    pub wire_displayname: Option<String>,
+    /// `Some(owner principal)` for a shared book; `None` for an owned one.
+    /// Also the switch for `{oc}owner-principal` / `{oc}read-only`.
+    pub owner_principal: Option<String>,
+    /// `true` for a read-only share (`oc_dav_shares.access == 3`).
+    pub read_only: bool,
+}
+
+impl VisibleBook {
+    /// An owned book, with the wire fields derived from the row.
+    pub fn owned(book: AddressBook) -> Self {
+        Self {
+            wire_uri: book.uri.clone(),
+            wire_displayname: book.displayname.clone(),
+            owner_principal: None,
+            read_only: false,
+            book,
+        }
+    }
+}
+
 /// A row of `oc_cards`, after `readBlob()` filtering has been applied.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Card {
