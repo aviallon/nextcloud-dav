@@ -259,6 +259,69 @@ ETag quoted. Verified byte-identical to PHP for 40/40 sampled cards.
 
 ---
 
+### 5.4 WebDAV files `PROPFIND`
+
+`/remote.php/dav/files/<uid>/<path>` `PROPFIND` Depth 0/1 is served natively
+from `oc_filecache` (`src/files.rs`), which removes the per-child PHP object
+graph and XML cost (~0.127 ms × N) for large listings. It is the same
+"authenticate, two indexed queries, serialise a multistatus" shape as CardDAV.
+
+The v1 scope is deliberately narrow, because a files listing is a **filesystem**
+view and `oc_filecache` is only one of its sources:
+
+- own home storage only (`oc_storages.id = 'home::<uid>'`, internal path
+  `files/<rel>`, resolved by `path_hash = md5(NFC(normalized path))`);
+- the app-password fast path only (`AuthMethod::FastPath`);
+- no mount at, under, or (as a collection) below the path — mounts come from
+  `oc_mounts` and are not children in the home cache;
+- every explicitly requested property must be implemented, otherwise **501**.
+
+Anything else — the home root with mounts, a received share, a groupfolder, an
+external storage, `/trashbin`, `/versions`, the legacy `/remote.php/webdav/`,
+`OPTIONS`, `GET`, every write — answers **501** and nginx replays the buffered
+request to PHP. A missing path is a 404, matching Sabre's node resolution.
+
+The property gate is the load-bearing rule: a 404 for a property PHP serves
+would make a client believe the value does not exist, so an unknown qname
+delegates instead. The implemented set is the exact union of the web UI's and
+desktop client's real requests (see `docs/DEVIATIONS.md` § "WebDAV files
+PROPFIND"): constants and already-joined columns (`d:creationdate` from
+`oc_filecache_extended.creation_time`, `nc:metadata-<key>` and `nc:hidden` from
+`oc_files_metadata.json`, `oc:data-fingerprint` from `config.php`,
+`ocs:share-permissions`), PHP 404s that are still served natively
+(`nc:is-encrypted`, `oc:dDC`, `nc:note`, `nc:hide-download`), and one bulk
+`oc_share` query per collection for `oc:share-types` / `nc:sharees`. Anything
+left out — `oc:tags`, `nc:system-tags`, `nc:lock*` when `files_lock` is enabled,
+`oc:downloadURL` on a primary object store — still delegates with 501. See
+`docs/DEVIATIONS.md` for the declared differences (static `nc:has-preview`, the
+finite-quota disk-free approximation, the two delegation cases).
+
+The multistatus writer is the CardDAV one (`src/xml/write.rs`): one
+`<d:multistatus>` with a parent response followed by children in **database
+order** (PHP issues no `ORDER BY`), a trailing slash on collection hrefs, the
+200 propstat then the 404 propstat, and `allprop`/`propname` on Sabre's fixed
+7-property list.
+
+```mermaid
+sequenceDiagram
+  participant C as client
+  participant N as nginx
+  participant D as sidecar
+  participant DB as PostgreSQL
+  C->>N: PROPFIND Depth 1 /files/<uid>/<dir>
+  N->>D: proxy (buffered)
+  D->>DB: authtoken + home storage resolve (path_hash)
+  D->>DB: oc_mounts for the user
+  alt a mount touches the path
+    D-->>N: 501
+    N->>C: PHP (replayed)
+  else clean home path
+    D->>DB: children of the fileid (no ORDER BY)
+    D->>DB: oc_vcategory* / oc_comments / oc_share / quota (per request only)
+    D-->>N: 207 multistatus
+  end
+```
+
 ## 6. Sync tokens (RFC 6578)
 
 Nextcloud's token scheme is unusual and the sidecar reproduces it exactly:

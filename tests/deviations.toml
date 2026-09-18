@@ -299,3 +299,103 @@ sidecar = "The 501 (returned for MKCOL/PROPPATCH/MOVE/COPY/POST, and for any wri
 why = "nginx intercepts every sidecar 501 and re-dispatches to PHP, so a real client never sees this body. It exists to make the delegation explicit in logs."
 test = "tests/deviations.rs::every_declared_deviation_holds (id=error-body-501)"
 evidence = "src/routes.rs:not_implemented"
+
+[[deviation]]
+id = "files-property-gate-501"
+area = "propfind"
+status = "intentional"
+nextcloud = "A files PROPFIND for a property Nextcloud serves returns it; for a property it does not know it returns a 404 propstat."
+sidecar = "An explicit files PROPFIND whose property list contains any qname outside the implemented set is answered 501 (delegated to PHP), never 404. allprop/propname use Sabre's fixed 7-property list."
+why = "A 404 would claim a property PHP serves is absent, which silently breaks clients. Delegating is always safe; the implemented set covers the web, desktop, gvfs and rclone property sets."
+test = "tests/deviations.rs::every_declared_deviation_holds (id=files-property-gate-501)"
+evidence = "src/files.rs:is_implemented; src/files.rs:handle_propfind"
+
+[[deviation]]
+id = "files-mount-delegation"
+area = "delegation"
+status = "intentional"
+nextcloud = "View::getDirectoryContent() merges oc_mounts entries into a listing and View::getFileInfo() adds their sizes to the folder and synthesises its etag; mount roots are not rows in the parent storage's oc_filecache."
+sidecar = "A files PROPFIND is answered 501 whenever an oc_mounts row for the user is at, under, or (for a collection) below the requested path. The home mount itself is ignored."
+why = "oc_filecache alone silently drops every share/groupfolder/external mount and mis-sizes their parent. Delegating is the only way to stay correct without reimplementing the mount/permission wrappers."
+test = "tests/deviations.rs::every_declared_deviation_holds (id=files-mount-delegation)"
+evidence = "src/files.rs:mounts_delegate; docs/recon/files-propfind-model.md §2"
+
+[[deviation]]
+id = "files-non-propfind-501"
+area = "delegation"
+status = "intentional"
+nextcloud = "OPTIONS advertises DAV/Allow for files; GET/HEAD serve bodies; the write methods mutate state."
+sidecar = "Every non-PROPFIND files request (including OPTIONS) is answered 501 before authentication, so nginx replays it to PHP."
+why = "The sidecar's OPTIONS advertises addressbook capabilities, which is wrong for files, and the whole files write path is PHP-owned. A 501 is the correct fallback signal."
+test = "tests/deviations.rs::every_declared_deviation_holds (id=files-non-propfind-501)"
+evidence = "src/routes.rs:handle_files"
+
+[[deviation]]
+id = "files-has-preview-static"
+area = "propfind"
+status = "accepted"
+nextcloud = "nc:has-preview reflects PreviewManager::isAvailable(), which depends on the enabled apps and the loaded imagick/ffmpeg/libreoffice binaries."
+sidecar = "nc:has-preview uses a static mimetype list (the always-registered core providers plus the common imagick/office/video formats); it does not detect the binaries or third-party providers."
+why = "A database reader cannot see the PHP extension set or the provider registry. The list is deliberately generous so images, PDFs, office documents and videos keep their thumbnails; an unsupported type may report true and get a placeholder."
+test = "tests/deviations.rs::every_declared_deviation_holds (id=files-has-preview-static)"
+evidence = "src/files.rs:has_preview; lib/private/PreviewManager.php:registerCoreProviders"
+
+[[deviation]]
+id = "files-shareapi-exclude-groups-delegated"
+area = "delegation"
+status = "intentional"
+nextcloud = "ShareDisableChecker::sharingDisabledForUser() strips the SHARE permission from every child when core/shareapi_exclude_groups is configured and the user is (not) in an excluded group."
+sidecar = "When core/shareapi_exclude_groups is configured, every files PROPFIND is answered 501. Otherwise oc:permissions carries the stored permissions unchanged."
+why = "The group expansion uses every registered group backend (LDAP, circles), which is not visible in the schema. Delegating avoids emitting a wrong R letter; the default (no exclude groups) is served natively."
+test = "tests/deviations.rs::every_declared_deviation_holds (id=files-shareapi-exclude-groups-delegated)"
+evidence = "src/config.rs:Config::sharing_exclude_groups; src/main.rs; src/files.rs:handle_propfind"
+
+[[deviation]]
+id = "files-quota-disk-free-approximation"
+area = "propfind"
+status = "accepted"
+nextcloud = "Directory::getQuotaInfo() -> OC_Helper::getStorageInfo() computes free = min(Local::free_space(), max(quota - used_root, 0)) for a finite quota."
+sidecar = "The sidecar reproduces the quota arithmetic but, when the datadirectory is unavailable or statvfs fails, reports max(quota - used_root, 0) instead of the disk free space."
+why = "The disk free space is an environment property, not database state. On a healthy instance with plenty of disk the two agree; only a nearly-full volume would differ. An unlimited quota is exact (-3)."
+test = "tests/deviations.rs::every_declared_deviation_holds (id=files-quota-disk-free-approximation)"
+evidence = "src/files.rs:quota_available; lib/private/Files/Storage/Wrapper/Quota.php:free_space"
+
+[[deviation]]
+id = "files-lock-props-delegated"
+area = "delegation"
+status = "intentional"
+nextcloud = "When files_lock is enabled, the desktop client also requests nc:lock, nc:lock-owner, nc:lock-owner-displayname, nc:lock-owner-type, nc:lock-owner-editor, nc:lock-time, nc:lock-timeout and nc:lock-token; FilesPlugin serves them from the lock backend."
+sidecar = "Those qnames are outside the implemented set, so an explicit request for any of them is answered 501 and replayed to PHP. The desktop client only adds them when the server advertises files_lock, and files_lock is not enabled on the reference instance."
+why = "A lock is live state owned by the files_lock app, not a row the sidecar reads. Delegating is the only correct answer; the property gate makes it automatic."
+test = "tests/deviations.rs::every_declared_deviation_holds (id=files-lock-props-delegated)"
+evidence = "src/files.rs:is_implemented; nextcloud/desktop src/libsync/networkjobs.cpp:LsColJob::defaultProperties"
+
+[[deviation]]
+id = "files-downloadurl-objectstore-delegated"
+area = "delegation"
+status = "intentional"
+nextcloud = "oc:downloadURL is File::getDirectDownload(): false for a local storage, a presigned URL for ObjectStoreStorage."
+sidecar = "With a primary object store configured ($CONFIG objectstore / objectstore_multibucket) a request containing oc:downloadURL is answered 501. Without one it is served as the empty value PHP returns for a local home storage."
+why = "A presigned URL needs the object-store credentials and a clock, none of which a database reader has. The reference instance has no objectstore, so the desktop client is served natively there."
+test = "tests/deviations.rs::every_declared_deviation_holds (id=files-downloadurl-objectstore-delegated)"
+evidence = "src/files.rs:handle_propfind; src/config.rs:Config::objectstore; lib/private/Files/ObjectStore/ObjectStoreStorage.php:934"
+
+[[deviation]]
+id = "files-is-encrypted-e2ee-delegated"
+area = "delegation"
+status = "intentional"
+nextcloud = "nc:is-encrypted is served only by the end_to_end_encryption app (value 1/0). With no such handler Nextcloud returns a 404 propstat."
+sidecar = "Without end_to_end_encryption enabled the sidecar serves the request natively and leaves nc:is-encrypted at 404, matching PHP. With that app enabled it answers 501 for a request containing nc:is-encrypted so PHP supplies the real value."
+why = "The reference instance does not run end_to_end_encryption, so PHP 404s the property and the web UI / desktop client must still be served natively. Deriving the value from oc_filecache.encrypted would be wrong: that column is server-side encryption, not E2EE."
+test = "tests/deviations.rs::every_declared_deviation_holds (id=files-is-encrypted-e2ee-delegated)"
+evidence = "src/files.rs:handle_propfind; src/config.rs:Config::e2e_encryption; src/main.rs"
+
+[[deviation]]
+id = "files-sharees-ldap-display-name"
+area = "propfind"
+status = "intentional"
+nextcloud = "nc:sharees resolves the sharee display name through the user/group backend (Share::setSharedWithDisplayNameCallback -> userManager/groupManager), so an LDAP or circle sharee gets that backend's display name."
+sidecar = "The display name is LEFT JOINed from oc_users/oc_groups; a sharee the database backend does not know falls back to its id."
+why = "The sidecar cannot query LDAP/circles. The database backend (the reference instance) agrees exactly; only a deployment that shares with LDAP/circle users would see the id instead of a friendly name."
+test = "tests/deviations.rs::every_declared_deviation_holds (id=files-sharees-ldap-display-name)"
+evidence = "src/files.rs:sharee_elements; src/db.rs:folder_share_rows; lib/private/Share20/DefaultShareProvider.php:createShare"

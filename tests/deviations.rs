@@ -13,7 +13,7 @@ mod common;
 use common::{call, get, propfind, report, request, TestEnv};
 use nextcloud_dav::outbox::EffectRegistry;
 use nextcloud_dav::xml::parse::{parse_document, XNode};
-use nextcloud_dav::xml::write::{NS_CARDDAV, NS_DAV, NS_OWNCLOUD};
+use nextcloud_dav::xml::write::{NS_CARDDAV, NS_DAV, NS_NEXTCLOUD_FILES, NS_OWNCLOUD};
 
 const USER: &str = "alice";
 const PASSWORD: &str = "app-password";
@@ -52,6 +52,16 @@ const DECLARED_IDS: &[&str] = &[
     "query-depth0-on-collection",
     "authtoken-v2-only",
     "error-body-501",
+    "files-property-gate-501",
+    "files-mount-delegation",
+    "files-non-propfind-501",
+    "files-has-preview-static",
+    "files-shareapi-exclude-groups-delegated",
+    "files-quota-disk-free-approximation",
+    "files-lock-props-delegated",
+    "files-downloadurl-objectstore-delegated",
+    "files-is-encrypted-e2ee-delegated",
+    "files-sharees-ldap-display-name",
 ];
 
 fn toml_ids() -> Vec<String> {
@@ -87,6 +97,20 @@ fn deviations_toml_ids_match() {
 
 fn doc(body: &[u8]) -> XNode {
     parse_document(body).unwrap()
+}
+
+/// A files PROPFIND body with the `d`/`oc`/`nc` prefixes bound.
+fn files_prop_body(props: &str) -> String {
+    format!(
+        r#"<?xml version="1.0"?><d:propfind xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns" xmlns:nc="http://nextcloud.org/ns"><d:prop>{props}</d:prop></d:propfind>"#
+    )
+}
+
+/// The text of one property of one response in a files multistatus.
+fn files_prop_text(body: &[u8], href: &str, ns: &str, local: &str) -> Option<String> {
+    let d = doc(body);
+    let r = response(&d, href)?;
+    prop_text(r, ns, local)
 }
 
 fn responses(d: &XNode) -> Vec<&XNode> {
@@ -161,6 +185,10 @@ struct Fixture {
     #[allow(dead_code)]
     book: i64,
     app: axum::Router,
+    #[allow(dead_code)]
+    pdf: i64,
+    #[allow(dead_code)]
+    zip: i64,
 }
 
 async fn fixture() -> Option<Fixture> {
@@ -186,8 +214,76 @@ async fn fixture() -> Option<Fixture> {
     )
     .await;
     env.seed_token(USER, USER, PASSWORD, 1, 2).await;
+
+    // Files home, for the files deviations.
+    let storage = env.seed_storage("home::alice").await;
+    let root = env
+        .seed_file(
+            storage,
+            "files",
+            "files",
+            "httpd/unix-directory",
+            100,
+            1_700_000_000,
+            "etagfiles",
+            31,
+            0,
+            None,
+        )
+        .await;
+    let pdf = env
+        .seed_file(
+            storage,
+            "files/Doc.pdf",
+            "Doc.pdf",
+            "application/pdf",
+            10,
+            1_700_000_100,
+            "etagpdf",
+            27,
+            root,
+            None,
+        )
+        .await;
+    let zip = env
+        .seed_file(
+            storage,
+            "files/Archive.zip",
+            "Archive.zip",
+            "application/zip",
+            20,
+            1_700_000_200,
+            "etagzip",
+            27,
+            root,
+            None,
+        )
+        .await;
+    env.seed_file(
+        storage,
+        "files/Sub",
+        "Sub",
+        "httpd/unix-directory",
+        5,
+        1_700_000_300,
+        "etagsub",
+        31,
+        root,
+        None,
+    )
+    .await;
+    // A received share under the home root: any Depth 1 home listing must
+    // delegate, and the mount root itself is not in the home filecache.
+    env.seed_mount(USER, "/alice/files/Shared/").await;
+
     let app = env.app_shared();
-    Some(Fixture { env, book, app })
+    Some(Fixture {
+        env,
+        book,
+        app,
+        pdf,
+        zip,
+    })
 }
 
 macro_rules! ensure {
@@ -765,6 +861,290 @@ async fn assert_deviation(id: &str, f: &Fixture) -> Result<(), String> {
                 resp.text().contains("does not implement this method"),
                 "501 body is not the declared sidecar text: {}",
                 resp.text()
+            );
+        }
+        "files-property-gate-501" => {
+            let pdf = "/remote.php/dav/files/alice/Doc.pdf";
+            let body = files_prop_body("<d:getetag/>");
+            let resp = propfind(&f.app, pdf, USER, PASSWORD, "0", &body).await;
+            ensure!(
+                resp.status == 207,
+                "an implemented property must be served, got {}",
+                resp.status
+            );
+            // A property PHP serves but the sidecar does not implement: 501.
+            let body = files_prop_body("<oc:tags/>");
+            let resp = propfind(&f.app, pdf, USER, PASSWORD, "0", &body).await;
+            ensure!(
+                resp.status == 501,
+                "an unimplemented property must delegate, got {}",
+                resp.status
+            );
+            let body = files_prop_body("<d:getetag/><oc:tags/>");
+            let resp = propfind(&f.app, pdf, USER, PASSWORD, "0", &body).await;
+            ensure!(
+                resp.status == 501,
+                "a mixed property set must delegate, got {}",
+                resp.status
+            );
+        }
+        "files-mount-delegation" => {
+            let body = files_prop_body("<d:getetag/>");
+            // The home root contains a mount, so its listing would drop it.
+            let resp = propfind(
+                &f.app,
+                "/remote.php/dav/files/alice",
+                USER,
+                PASSWORD,
+                "1",
+                &body,
+            )
+            .await;
+            ensure!(
+                resp.status == 501,
+                "the home root with a mount must delegate, got {}",
+                resp.status
+            );
+            // The mount root is not a row in the home storage's filecache.
+            for path in [
+                "/remote.php/dav/files/alice/Shared",
+                "/remote.php/dav/files/alice/Shared/sub",
+            ] {
+                let resp = propfind(&f.app, path, USER, PASSWORD, "0", &body).await;
+                ensure!(resp.status == 501, "{path} must delegate, got {}", resp.status);
+            }
+            // A sibling of the mount is still native.
+            let resp = propfind(
+                &f.app,
+                "/remote.php/dav/files/alice/Doc.pdf",
+                USER,
+                PASSWORD,
+                "0",
+                &body,
+            )
+            .await;
+            ensure!(
+                resp.status == 207,
+                "a mount sibling must stay native, got {}",
+                resp.status
+            );
+        }
+        "files-non-propfind-501" => {
+            for method in [
+                "OPTIONS",
+                "GET",
+                "HEAD",
+                "PUT",
+                "DELETE",
+                "MKCOL",
+                "PROPPATCH",
+                "REPORT",
+            ] {
+                let resp = call(
+                    &f.app,
+                    request(
+                        method,
+                        "/remote.php/dav/files/alice/Doc.pdf",
+                        USER,
+                        PASSWORD,
+                    ),
+                )
+                .await;
+                ensure!(
+                    resp.status == 501,
+                    "{method} must delegate, got {}",
+                    resp.status
+                );
+            }
+        }
+        "files-has-preview-static" => {
+            let body = files_prop_body("<nc:has-preview/>");
+            let pdf = "/remote.php/dav/files/alice/Doc.pdf";
+            let resp = propfind(&f.app, pdf, USER, PASSWORD, "0", &body).await;
+            let text = files_prop_text(&resp.body, pdf, NS_NEXTCLOUD_FILES, "has-preview");
+            ensure!(
+                text.as_deref() == Some("true"),
+                "a PDF is assumed previewable by the static list, got {text:?}"
+            );
+            let zip = "/remote.php/dav/files/alice/Archive.zip";
+            let resp = propfind(&f.app, zip, USER, PASSWORD, "0", &body).await;
+            let text = files_prop_text(&resp.body, zip, NS_NEXTCLOUD_FILES, "has-preview");
+            ensure!(
+                text.as_deref() == Some("false"),
+                "a zip is not previewable, got {text:?}"
+            );
+        }
+        "files-shareapi-exclude-groups-delegated" => {
+            let app = f.env.app_shared_with("testinst", true, None);
+            let body = files_prop_body("<d:getetag/>");
+            let resp = propfind(
+                &app,
+                "/remote.php/dav/files/alice/Doc.pdf",
+                USER,
+                PASSWORD,
+                "0",
+                &body,
+            )
+            .await;
+            ensure!(
+                resp.status == 501,
+                "shareapi_exclude_groups must delegate, got {}",
+                resp.status
+            );
+        }
+        "files-quota-disk-free-approximation" => {
+            f.env.seed_appconfig("files", "default_quota", "1 GB").await;
+            let app = f.env.app_shared_with(
+                "testinst",
+                false,
+                Some(std::path::PathBuf::from("/nonexistent-ncdav")),
+            );
+            let body = files_prop_body("<d:quota-available-bytes/>");
+            let resp = propfind(
+                &app,
+                "/remote.php/dav/files/alice/Sub",
+                USER,
+                PASSWORD,
+                "0",
+                &body,
+            )
+            .await;
+            ensure!(
+                resp.status == 207,
+                "a quota request must be served, got {}",
+                resp.status
+            );
+            let text = files_prop_text(
+                &resp.body,
+                "/remote.php/dav/files/alice/Sub/",
+                NS_DAV,
+                "quota-available-bytes",
+            );
+            let expected = (1024 * 1024 * 1024 - 100).to_string();
+            ensure!(
+                text.as_deref() == Some(expected.as_str()),
+                "quota available is {text:?}, expected {expected}"
+            );
+        }
+        "files-lock-props-delegated" => {
+            // `files_lock` is not enabled on the reference instance, so the
+            // desktop client does not request these. If it did, they need the
+            // lock backend and must delegate (501), never be invented.
+            for prop in ["lock", "lock-owner", "lock-token", "lock-time"] {
+                let body = files_prop_body(&format!("<nc:{prop}/>"));
+                let resp = propfind(
+                    &f.app,
+                    "/remote.php/dav/files/alice/Doc.pdf",
+                    USER,
+                    PASSWORD,
+                    "0",
+                    &body,
+                )
+                .await;
+                ensure!(
+                    resp.status == 501,
+                    "nc:{prop} must delegate, got {}",
+                    resp.status
+                );
+            }
+        }
+        "files-downloadurl-objectstore-delegated" => {
+            // With a primary object store, PHP's `oc:downloadURL` is a presigned
+            // URL the sidecar cannot derive, so it delegates instead of
+            // answering the local-storage empty value.
+            let app = f.env.app_shared_objectstore();
+            let body = files_prop_body("<oc:downloadURL/>");
+            let resp = propfind(
+                &app,
+                "/remote.php/dav/files/alice/Doc.pdf",
+                USER,
+                PASSWORD,
+                "0",
+                &body,
+            )
+            .await;
+            ensure!(
+                resp.status == 501,
+                "objectstore downloadURL must delegate, got {}",
+                resp.status
+            );
+            // Without the objectstore it is served (empty, like PHP's false).
+            let body = files_prop_body("<oc:downloadURL/>");
+            let resp = propfind(
+                &f.app,
+                "/remote.php/dav/files/alice/Doc.pdf",
+                USER,
+                PASSWORD,
+                "0",
+                &body,
+            )
+            .await;
+            ensure!(resp.status == 207, "downloadURL returned {}", resp.status);
+        }
+        "files-is-encrypted-e2ee-delegated" => {
+            // Without end-to-end encryption, PHP has no `nc:is-encrypted`
+            // handler, so the sidecar serves the request natively (the property
+            // itself is a 404 propstat, checked in tests/files_read_path.rs).
+            let body = files_prop_body("<nc:is-encrypted/>");
+            let resp = propfind(
+                &f.app,
+                "/remote.php/dav/files/alice/Doc.pdf",
+                USER,
+                PASSWORD,
+                "0",
+                &body,
+            )
+            .await;
+            ensure!(resp.status == 207, "is-encrypted returned {}", resp.status);
+            // With the E2EE app enabled it is delegated instead.
+            let app = f.env.app_shared_e2ee();
+            let resp = propfind(
+                &app,
+                "/remote.php/dav/files/alice/Doc.pdf",
+                USER,
+                PASSWORD,
+                "0",
+                &body,
+            )
+            .await;
+            ensure!(
+                resp.status == 501,
+                "E2EE is-encrypted must delegate, got {}",
+                resp.status
+            );
+        }
+        "files-sharees-ldap-display-name" => {
+            // `nc:sharees` display-name is joined from oc_users/oc_groups. A
+            // sharee the database backend does not know (an LDAP/circle user)
+            // falls back to the id, where PHP would ask that backend.
+            f.env
+                .seed_file_share(0, Some("ldapuser"), USER, USER, f.pdf, 19)
+                .await;
+            let body = files_prop_body("<oc:share-types/><nc:sharees/>");
+            let resp = propfind(
+                &f.app,
+                "/remote.php/dav/files/alice/Doc.pdf",
+                USER,
+                PASSWORD,
+                "0",
+                &body,
+            )
+            .await;
+            ensure!(resp.status == 207, "sharees returned {}", resp.status);
+            let d = doc(&resp.body);
+            let node = response(&d, "/remote.php/dav/files/alice/Doc.pdf").unwrap();
+            let sharee = prop_of(node, NS_NEXTCLOUD_FILES, "sharees")
+                .and_then(|sharees| sharees.children.first())
+                .ok_or("no sharee element")?;
+            let display = sharee
+                .children
+                .iter()
+                .find(|c| c.local == "display-name")
+                .map(|c| c.text.clone())
+                .unwrap_or_default();
+            ensure!(
+                display == "ldapuser",
+                "sharee display-name is {display:?}, expected the id fallback"
             );
         }
         other => {

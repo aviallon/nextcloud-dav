@@ -197,3 +197,64 @@ deviations. Each is a candidate for a live differential check.
 - `tests/deviations.rs::every_declared_deviation_holds` runs one assertion per
   id and reports every failure, so a silent behaviour change fails the suite and
   points at the exact declaration that needs revisiting.
+
+## WebDAV files `PROPFIND` (v1)
+
+The sidecar also serves `PROPFIND` for `/remote.php/dav/files/<uid>/<path>`
+(Depth 0/1) directly from `oc_filecache`. The scope and the delegation rules are
+in `src/files.rs`; the recon is `recon/files-propfind-model.md`.
+
+| id | area | status | one-line difference |
+|---|---|---|---|
+| `files-property-gate-501` | propfind | intentional | an explicit request for any unimplemented qname → 501, never 404 |
+| `files-mount-delegation` | delegation | intentional | any mount at/under the path, or below a collection → 501 |
+| `files-non-propfind-501` | delegation | intentional | every non-PROPFIND method (including OPTIONS) → 501 |
+| `files-has-preview-static` | propfind | accepted | `nc:has-preview` uses a static mimetype list, not the live provider registry |
+| `files-shareapi-exclude-groups-delegated` | delegation | intentional | `core/shareapi_exclude_groups` configured → 501 |
+| `files-quota-disk-free-approximation` | propfind | accepted | finite quota without a readable datadirectory ignores disk free |
+| `files-lock-props-delegated` | delegation | intentional | `nc:lock*` (only requested when `files_lock` is enabled) → 501 |
+| `files-downloadurl-objectstore-delegated` | delegation | intentional | primary object store configured → `oc:downloadURL` → 501 |
+| `files-is-encrypted-e2ee-delegated` | delegation | intentional | `end_to_end_encryption` enabled → `nc:is-encrypted` → 501 (else 404, like PHP) |
+| `files-sharees-ldap-display-name` | propfind | intentional | `nc:sharees` display-name is joined from `oc_users`/`oc_groups`; an LDAP/circle sharee falls back to the id |
+
+**The property gate** is the safety rule that makes the whole thing honest: an
+explicit property list is only served when *every* requested qname is in the
+implemented set. That set is the exact union of the web UI's and desktop
+client's real requests:
+
+- constants / joined columns: `d:getetag`, `d:getlastmodified`,
+  `d:resourcetype`, `d:getcontentlength`, `d:getcontenttype`, `d:displayname`,
+  `d:quota-available-bytes`, `d:quota-used-bytes`, `d:creationdate`
+  (`oc_filecache_extended.creation_time`), `oc:size`, `oc:fileid`, `oc:id`,
+  `oc:permissions`, `oc:owner-id`, `oc:owner-display-name`, `oc:favorite`,
+  `oc:comments-unread`, `oc:checksums`, `oc:downloadURL` (empty for local
+  storage; files only), `oc:data-fingerprint` (the `data-fingerprint` config),
+  `nc:has-preview`, `nc:mount-type`, `nc:is-mount-root`, `nc:hidden`,
+  `nc:metadata-<key>` (`oc_files_metadata.json`), `ocs:share-permissions`;
+- one bulk `oc_share` query per collection: `oc:share-types`, `nc:sharees`;
+- PHP 404s that are still served natively: `nc:is-encrypted` (no handler in
+  Nextcloud 33/36, nor in the encryption app), `oc:dDC` (disallowed by
+  `CustomPropertiesBackend`), `nc:note` / `nc:hide-download` (null for a
+  non-shared storage).
+
+Anything else — `oc:tags`, `nc:system-tags`, `nc:lock*`, `d:owner`, … —
+delegates with 501, because a 404 would tell the client a property PHP serves
+does not exist. `allprop` and `propname` use Sabre's fixed 7-property list
+(`PropFind::ALLPROPS`), so they are always servable.
+
+**Mounts.** A received share, a groupfolder or an external storage is an
+`oc_mounts` row, not a child row in the home storage's `oc_filecache`. Serving a
+listing from `oc_filecache` alone would silently drop it, and a directory's
+`oc:size`/`getetag` include its submounts (`View::getFileInfo()`), so any path
+that has a mount at, under, or (as a collection) below it is delegated.
+
+**`nc:has-preview`.** `PreviewManager::isAvailable()` depends on the enabled
+apps, the loaded imagick/ffmpeg/libreoffice binaries and third-party providers,
+none of which a database reader can see. The static list matches the
+always-registered core providers plus the common imagick/office/video formats.
+
+**Quota.** `d:quota-used-bytes` is the directory's own raw size and
+`d:quota-available-bytes` is `-3` for an unlimited quota, or
+`min(disk_free, max(quota - used_root, 0))` for a finite one. `disk_free` is read
+with `statvfs(datadirectory)`; when that is unavailable the sidecar reports
+`max(quota - used_root, 0)`.

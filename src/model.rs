@@ -3,6 +3,9 @@
 
 //! Row types mirroring the Nextcloud `oc_*` schema (see `dav-bench/CARDDAV_DESIGN.md` §1).
 
+use serde_json::Value;
+use std::collections::HashMap;
+
 /// A row of `oc_addressbooks`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AddressBook {
@@ -97,4 +100,79 @@ pub struct ChangeRow {
 pub struct CardIdUri {
     pub id: i64,
     pub uri: String,
+}
+
+/// A row of `oc_filecache` relevant to a files `PROPFIND`.
+///
+/// `size` is the stored size; callers must apply [`FileCacheRow::effective_size`]
+/// to reproduce `FileInfo::getSize()` (which substitutes `unencrypted_size` for
+/// encrypted rows).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileCacheRow {
+    pub fileid: i64,
+    /// `oc_filecache.storage` (the numeric id, not `oc_storages.id`).
+    pub storage: i64,
+    pub path: String,
+    pub name: String,
+    pub size: i64,
+    pub mtime: i64,
+    pub etag: String,
+    pub permissions: i64,
+    pub encrypted: i64,
+    pub unencrypted_size: Option<i64>,
+    pub checksum: Option<String>,
+    pub parent: i64,
+    /// The resolved `oc_mimetypes.mimetype` (empty when the LEFT JOIN missed).
+    pub mimetype: String,
+    /// `oc_filecache_extended.creation_time` (0 when the LEFT JOIN missed, like
+    /// PHP's `(int) null`).
+    pub creation_time: i64,
+    /// `oc_files_metadata.json`, already reduced to `key -> value` (the inner
+    /// `value` field of each entry, exactly like `FileInfo::getMetadata()`).
+    pub metadata: HashMap<String, Value>,
+}
+
+impl FileCacheRow {
+    /// `httpd/unix-directory` is Nextcloud's folder mimetype.
+    pub fn is_directory(&self) -> bool {
+        self.mimetype == "httpd/unix-directory"
+    }
+
+    /// `FileInfo::getSize()` / `FileInfo::rawSize`: an encrypted row reports its
+    /// `unencrypted_size` when present.
+    pub fn effective_size(&self) -> i64 {
+        if self.encrypted != 0 {
+            if let Some(size) = self.unencrypted_size {
+                return size;
+            }
+        }
+        self.size
+    }
+
+    /// `FileInfo::getName()`: the `name` column, or the last `path` segment when
+    /// it is empty.
+    pub fn display_name(&self) -> String {
+        if !self.name.is_empty() {
+            return self.name.clone();
+        }
+        self.path
+            .rsplit('/')
+            .find(|segment| !segment.is_empty())
+            .unwrap_or_default()
+            .to_string()
+    }
+}
+
+/// A row of `oc_share` relevant to the files sharing properties
+/// (`oc:share-types` / `nc:sharees`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShareRow {
+    pub file_source: i64,
+    pub share_type: i64,
+    pub share_with: Option<String>,
+    pub permissions: i64,
+    /// `oc_users.displayname` for a user sharee (type 0), when resolvable.
+    pub user_displayname: Option<String>,
+    /// `oc_groups.displayname` for a group sharee (type 1), when resolvable.
+    pub group_displayname: Option<String>,
 }

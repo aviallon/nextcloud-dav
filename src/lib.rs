@@ -12,6 +12,7 @@ pub mod config;
 pub mod dav_error;
 pub mod db;
 pub mod error;
+pub mod files;
 pub mod model;
 pub mod outbox;
 pub mod php;

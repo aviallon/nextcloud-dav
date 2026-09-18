@@ -33,6 +33,8 @@ toolchain (the sidecar is built with
 | `lib.sh` | shared helpers (compose, occ, psql, sidecar lifecycle) |
 | `setup.sh` | bring up, install, enable the app, create user/app-password/address book, copy `config.php`, build + start the sidecar |
 | `e2e.sh` | the acceptance checks; writes `state/evidence/e2e.txt` |
+| `files_parity.sh` | seeds a large `files/ParityBig` directory and diffs the sidecar's files PROPFIND against PHP's (canonicalised XML); writes `state/evidence/files-parity.txt` |
+| `canonicalize_propfind.py` | canonicaliser used by `files_parity.sh` |
 | `teardown.sh` | `compose down -v` + remove `state/` |
 | `state/` (git-ignored) | generated secrets, copied `config.php`, sidecar/worker logs, evidence |
 
@@ -92,3 +94,15 @@ See `REPORT.md` for the full write-up of the run that found them.
   exercised by criterion 6b.
 - `e2e.sh` resets only alice's test data (cards, changes, properties, birthday
   calendar, activity, outbox) before it starts, so re-runs are reproducible.
+
+## Files PROPFIND parity
+
+After `setup.sh`, `./files_parity.sh` seeds an `8000`-child directory
+(`BIG=2000 ./files_parity.sh` to override), favorites, unread comments, a
+metadata row and a share, then issues the **real client property sets** — the
+web UI's (`@nextcloud/files` defaults plus the `files_sharing` / `files` /
+LivePhotos registrations) and the desktop client's (`LsColJob::defaultProperties`)
+— as `PROPFIND Depth 1` against PHP and against the sidecar. It canonicalises
+both multistatus bodies and diffs them per set, printing both wall-clock times
+and the child count, and asserts the sidecar answered `207` (not a delegated
+`501`). It never touches production.

@@ -24,6 +24,7 @@ env_logger = "0.11.11"
 hex = "0.4.3"
 md-5 = "0.10.6"
 httpdate = "1.0.3"
+libc = "0.2.189"
 indexmap = "2.14.2"
 log = "0.4.33"
 nextcloud-config-parser = "0.15.4"
@@ -52,6 +53,7 @@ tokio = { version = "1.52.3", features = [
   "signal",
   "net",
 ] }
+unicode-normalization = "0.1.25"
 
 [dev-dependencies]
 tokio = { version = "1.52.3", features = ["macros", "rt-multi-thread"] }

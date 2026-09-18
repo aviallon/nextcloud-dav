@@ -15,11 +15,13 @@
 //! `CASE WHEN ... THEN '1' ELSE '0' END`.
 
 use crate::error::{Error, Result};
-use crate::model::{AddressBook, AuthToken, Card, CardIdUri, ChangeRow, VisibleBook};
+use crate::model::{AddressBook, AuthToken, Card, CardIdUri, ChangeRow, FileCacheRow, ShareRow, VisibleBook};
 use crate::vcard;
 use md5::{Digest, Md5};
+use serde_json::Value;
 use sqlx::any::{AnyConnectOptions, AnyPoolOptions, AnyRow};
 use sqlx::{Any, AnyPool, Row};
+use std::collections::{HashMap, HashSet};
 
 /// `OCA\DAV\DAV\Sharing\Backend` access levels.
 const ACCESS_READ: i16 = 3;
@@ -915,6 +917,259 @@ impl Db {
     }
 
     // ------------------------------------------------------------------
+    // Files (WebDAV files PROPFIND)
+    // ------------------------------------------------------------------
+
+    /// Resolves `<internal path>` inside `home::<uid>` by `path_hash`, exactly
+    /// like `Cache::get()` (`fs_storage_path_hash` is the unique index).
+    pub async fn resolve_home_file(
+        &self,
+        uid: &str,
+        path_hash: &str,
+    ) -> Result<Option<FileCacheRow>> {
+        let sql = self.render(&format!(
+            "SELECT f.fileid, f.storage, f.path, f.name, f.size, f.mtime, f.etag, \
+                    f.permissions, f.encrypted, f.unencrypted_size, f.checksum, f.parent, \
+                    mt.mimetype, fe.creation_time, md.json AS meta_json \
+             FROM {p}filecache f \
+             JOIN {p}storages s ON s.numeric_id = f.storage \
+             LEFT JOIN {p}mimetypes mt ON mt.id = f.mimetype \
+             LEFT JOIN {p}filecache_extended fe ON fe.fileid = f.fileid \
+             LEFT JOIN {p}files_metadata md ON md.file_id = f.fileid \
+             WHERE s.id = ? AND f.path_hash = ? LIMIT 1",
+            p = self.prefix
+        ));
+        let row = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(format!("home::{uid}"))
+            .bind(path_hash)
+            .fetch_optional(&self.pool)
+            .await?;
+        row.as_ref().map(file_cache_row_from_row).transpose()
+    }
+
+    /// `Cache::getFolderContentsById()`: all children of `parent` in `storage`.
+    ///
+    /// The joins mirror `CacheQueryBuilder::selectFileCache()` /
+    /// `selectMetadata()` so the (unordered) row order matches PHP's; no
+    /// `ORDER BY` is issued, exactly like PHP.
+    pub async fn file_children(&self, storage: i64, parent: i64) -> Result<Vec<FileCacheRow>> {
+        let sql = self.render(&format!(
+            "SELECT f.fileid, f.storage, f.path, f.name, f.size, f.mtime, f.etag, \
+                    f.permissions, f.encrypted, f.unencrypted_size, f.checksum, f.parent, \
+                    mt.mimetype, fe.creation_time, md.json AS meta_json \
+             FROM {p}filecache f \
+             LEFT JOIN {p}mimetypes mt ON mt.id = f.mimetype \
+             LEFT JOIN {p}filecache_extended fe ON fe.fileid = f.fileid \
+             LEFT JOIN {p}files_metadata md ON md.file_id = f.fileid \
+             WHERE f.storage = ? AND f.parent = ?",
+            p = self.prefix
+        ));
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(storage)
+            .bind(parent)
+            .fetch_all(&self.pool)
+            .await?;
+        rows.iter().map(file_cache_row_from_row).collect()
+    }
+
+    /// The permissions of a single filecache row (the parent of a Depth 0 node,
+    /// for `DavUtil::canRename()`).
+    pub async fn file_permissions(&self, fileid: i64) -> Result<Option<i64>> {
+        let sql = self.render(&format!(
+            "SELECT permissions FROM {p}filecache WHERE fileid = ? LIMIT 1",
+            p = self.prefix
+        ));
+        let row = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(fileid)
+            .fetch_optional(&self.pool)
+            .await?;
+        match row {
+            Some(row) => Ok(Some(row.try_get("permissions")?)),
+            None => Ok(None),
+        }
+    }
+
+    /// `oc_mounts.mount_point` for every mount the user has (the home mount
+    /// included). These are *not* rows in the home storage's `oc_filecache`.
+    pub async fn user_mount_points(&self, uid: &str) -> Result<Vec<String>> {
+        let sql = self.render(&format!(
+            "SELECT mount_point FROM {p}mounts WHERE user_id = ?",
+            p = self.prefix
+        ));
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(uid)
+            .fetch_all(&self.pool)
+            .await?;
+        let mut mounts = Vec::with_capacity(rows.len());
+        for row in &rows {
+            if let Some(mount) = row.try_get::<Option<String>, _>("mount_point")? {
+                mounts.push(mount);
+            }
+        }
+        Ok(mounts)
+    }
+
+    /// Shares in a folder, keyed by `file_source`, exactly like
+    /// `SharesPlugin::preloadCollection()` -> `DefaultShareProvider::getSharesInFolder()`:
+    /// user/group/link shares the caller owns or initiated, on a direct child of
+    /// `parent`. One query for the whole folder (never per child).
+    pub async fn folder_share_rows(
+        &self,
+        uid: &str,
+        parent: i64,
+    ) -> Result<HashMap<i64, Vec<ShareRow>>> {
+        let sql = self.render(&format!(
+            "SELECT s.file_source, s.share_type, s.share_with, s.permissions, \
+                    u.displayname AS user_displayname, g.displayname AS group_displayname \
+             FROM {p}share s \
+             JOIN {p}filecache f ON f.fileid = s.file_source \
+             LEFT JOIN {p}users u ON s.share_type = 0 AND u.uid = s.share_with \
+             LEFT JOIN {p}groups g ON s.share_type = 1 AND g.gid = s.share_with \
+             WHERE s.item_type IN ('file', 'folder') \
+               AND s.share_type IN (0, 1, 3) \
+               AND (s.uid_owner = ? OR s.uid_initiator = ?) \
+               AND f.parent = ?",
+            p = self.prefix
+        ));
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(uid)
+            .bind(uid)
+            .bind(parent)
+            .fetch_all(&self.pool)
+            .await?;
+        let mut shares: HashMap<i64, Vec<ShareRow>> = HashMap::new();
+        for row in &rows {
+            let share = share_row_from_row(row)?;
+            shares.entry(share.file_source).or_default().push(share);
+        }
+        Ok(shares)
+    }
+
+    /// Shares on a single node, exactly like `SharesPlugin::getShares()` ->
+    /// `getSharesBy(..., reshares=false)`: shares the caller initiated, across
+    /// every type the plugin asks for. Received shares are not included: a
+    /// received share is a mount, and any listing containing one is delegated.
+    pub async fn node_share_rows(&self, uid: &str, fileid: i64) -> Result<Vec<ShareRow>> {
+        let sql = self.render(&format!(
+            "SELECT s.file_source, s.share_type, s.share_with, s.permissions, \
+                    u.displayname AS user_displayname, g.displayname AS group_displayname \
+             FROM {p}share s \
+             LEFT JOIN {p}users u ON s.share_type = 0 AND u.uid = s.share_with \
+             LEFT JOIN {p}groups g ON s.share_type = 1 AND g.gid = s.share_with \
+             WHERE s.item_type IN ('file', 'folder') \
+               AND s.share_type IN (0, 1, 3, 4, 6, 7, 10, 12) \
+               AND s.uid_initiator = ? \
+               AND s.file_source = ?",
+            p = self.prefix
+        ));
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(uid)
+            .bind(fileid)
+            .fetch_all(&self.pool)
+            .await?;
+        rows.iter().map(share_row_from_row).collect()
+    }
+
+    /// `TagsPlugin`'s favorite prefetch: which of `ids` carry the
+    /// `_$!<Favorite>!$_` tag for `uid`. Batched by 900, like
+    /// `Tags::getTagsForObjects()`.
+    pub async fn favorite_fileids(&self, uid: &str, ids: &[i64]) -> Result<HashSet<i64>> {
+        let mut favorites = HashSet::new();
+        for chunk in ids.chunks(900) {
+            let mut sql = format!(
+                "SELECT r.objid FROM {p}vcategory_to_object r \
+                 JOIN {p}vcategory t ON t.id = r.categoryid \
+                 WHERE t.uid = {} AND r.type = 'files' AND t.category = {} AND r.objid IN (",
+                self.ph(1),
+                self.ph(2),
+                p = self.prefix
+            );
+            for i in 0..chunk.len() {
+                if i > 0 {
+                    sql.push_str(", ");
+                }
+                sql.push_str(&self.ph(i + 3));
+            }
+            sql.push(')');
+            let mut query = sqlx::query(sqlx::AssertSqlSafe(sql))
+                .bind(uid)
+                .bind(crate::files::TAG_FAVORITE);
+            for id in chunk {
+                query = query.bind(*id);
+            }
+            let rows = query.fetch_all(&self.pool).await?;
+            for row in &rows {
+                favorites.insert(row.try_get::<i64, _>("objid")?);
+            }
+        }
+        Ok(favorites)
+    }
+
+    /// `CommentPropertiesPlugin`'s unread prefetch
+    /// (`Comments\Manager::getNumberOfUnreadCommentsForObjects()`), batched the
+    /// same way (1000 ids per query).
+    pub async fn unread_comment_counts(
+        &self,
+        uid: &str,
+        ids: &[i64],
+    ) -> Result<HashMap<i64, i64>> {
+        let mut counts = HashMap::new();
+        for chunk in ids.chunks(1000) {
+            let mut sql = format!(
+                "SELECT c.object_id, count(c.id) AS num_comments \
+                 FROM {p}comments c \
+                 LEFT JOIN {p}comments_read_markers m \
+                   ON m.user_id = {} AND c.object_type = m.object_type AND c.object_id = m.object_id \
+                 WHERE c.object_type = {} AND c.object_id IN (",
+                self.ph(1),
+                self.ph(2),
+                p = self.prefix
+            );
+            for i in 0..chunk.len() {
+                if i > 0 {
+                    sql.push_str(", ");
+                }
+                sql.push_str(&self.ph(i + 3));
+            }
+            sql.push_str(") AND (c.creation_timestamp > m.marker_datetime OR m.marker_datetime IS NULL) GROUP BY c.object_id");
+            let mut query = sqlx::query(sqlx::AssertSqlSafe(sql))
+                .bind(uid)
+                .bind("files");
+            for id in chunk {
+                query = query.bind(id.to_string());
+            }
+            let rows = query.fetch_all(&self.pool).await?;
+            for row in &rows {
+                let object_id: String = row.try_get("object_id")?;
+                let count: i64 = row.try_get("num_comments")?;
+                if let Ok(id) = object_id.parse::<i64>() {
+                    counts.insert(id, count);
+                }
+            }
+        }
+        Ok(counts)
+    }
+
+    /// `oc_preferences` lookup (the user quota lives at `files/quota`).
+    pub async fn user_preference(&self, uid: &str, app: &str, key: &str) -> Result<Option<String>> {
+        let sql = self.render(&format!(
+            "SELECT configvalue FROM {p}preferences \
+             WHERE userid = ? AND appid = ? AND configkey = ? LIMIT 1",
+            p = self.prefix
+        ));
+        let row = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(uid)
+            .bind(app)
+            .bind(key)
+            .fetch_optional(&self.pool)
+            .await?;
+        match row {
+            Some(row) => Ok(row.try_get::<Option<String>, _>("configvalue")?),
+            None => Ok(None),
+        }
+    }
+
+    // ------------------------------------------------------------------
     // Brute force (read + the single opt-in write)
     // ------------------------------------------------------------------
 
@@ -1070,6 +1325,71 @@ fn card_from_row(row: &AnyRow) -> Result<Card> {
         size,
         lastmodified: row.try_get("lastmodified")?,
         carddata,
+    })
+}
+
+fn file_cache_row_from_row(row: &AnyRow) -> Result<FileCacheRow> {
+    Ok(FileCacheRow {
+        fileid: row.try_get("fileid")?,
+        storage: row.try_get("storage")?,
+        path: row.try_get::<Option<String>, _>("path")?.unwrap_or_default(),
+        name: row.try_get::<Option<String>, _>("name")?.unwrap_or_default(),
+        size: row.try_get::<Option<i64>, _>("size")?.unwrap_or_default(),
+        mtime: row.try_get::<Option<i64>, _>("mtime")?.unwrap_or_default(),
+        etag: row.try_get::<Option<String>, _>("etag")?.unwrap_or_default(),
+        permissions: row
+            .try_get::<Option<i64>, _>("permissions")?
+            .unwrap_or_default(),
+        encrypted: row.try_get::<Option<i64>, _>("encrypted")?.unwrap_or_default(),
+        unencrypted_size: row.try_get::<Option<i64>, _>("unencrypted_size")?,
+        checksum: row.try_get("checksum")?,
+        parent: row.try_get::<Option<i64>, _>("parent")?.unwrap_or_default(),
+        mimetype: row
+            .try_get::<Option<String>, _>("mimetype")?
+            .unwrap_or_default(),
+        creation_time: row
+            .try_get::<Option<i64>, _>("creation_time")?
+            .unwrap_or_default(),
+        metadata: parse_metadata(row.try_get::<Option<String>, _>("meta_json")?),
+    })
+}
+
+/// Parses `oc_files_metadata.json` into `key -> value`, exactly like
+/// `FileInfo::getMetadata()`: each entry is `{"value": …, "type": …}` and the
+/// inner `value` is what `FilesPlugin` serialises. Entries without a value are
+/// dropped (PHP's `isset()`/`getValueAny()` semantics).
+fn parse_metadata(raw: Option<String>) -> HashMap<String, Value> {
+    let Some(raw) = raw else {
+        return HashMap::new();
+    };
+    let Ok(Value::Object(map)) = serde_json::from_str::<Value>(&raw) else {
+        return HashMap::new();
+    };
+    let mut metadata = HashMap::with_capacity(map.len());
+    for (key, entry) in map {
+        if let Some(value) = entry.get("value") {
+            if !value.is_null() {
+                metadata.insert(key, value.clone());
+            }
+        }
+    }
+    metadata
+}
+
+fn share_row_from_row(row: &AnyRow) -> Result<ShareRow> {
+    Ok(ShareRow {
+        file_source: row.try_get("file_source")?,
+        share_type: row.try_get("share_type")?,
+        share_with: row.try_get::<Option<String>, _>("share_with")?,
+        permissions: row
+            .try_get::<Option<i64>, _>("permissions")?
+            .unwrap_or_default(),
+        user_displayname: row
+            .try_get::<Option<String>, _>("user_displayname")?
+            .filter(|name| !name.is_empty()),
+        group_displayname: row
+            .try_get::<Option<String>, _>("group_displayname")?
+            .filter(|name| !name.is_empty()),
     })
 }
 

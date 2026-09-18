@@ -147,6 +147,29 @@ pub struct Config {
     /// Accept invalid TLS certificates on the PHP fallback.
     pub allow_self_signed: bool,
     pub config_path: PathBuf,
+    /// `$CONFIG['instanceid']`, needed for the `oc:id` property
+    /// (`DavUtil::getDavFileId()` = `sprintf('%08d', $id) . instanceid`).
+    pub instance_id: String,
+    /// `$CONFIG['datadirectory']`, needed to reproduce `Local::free_space()`
+    /// (`disk_free_space`) for a finite user quota.
+    pub datadirectory: Option<PathBuf>,
+    /// `$CONFIG['enable_previews']` (default true). Gates `nc:has-preview`.
+    pub previews_enabled: bool,
+    /// `$CONFIG['data-fingerprint']` (default `''`), served as
+    /// `oc:data-fingerprint` for every node (`FilesPlugin`).
+    pub data_fingerprint: String,
+    /// True when a primary object store is configured (`objectstore` or
+    /// `objectstore_multibucket`). `oc:downloadURL` is then a presigned URL the
+    /// sidecar cannot derive, so a request for it delegates.
+    pub objectstore: bool,
+    /// True when the `end_to_end_encryption` app is enabled. That app is the
+    /// only handler of `nc:is-encrypted`, so when it is on the sidecar must
+    /// delegate that property instead of answering PHP's no-handler 404.
+    pub e2e_encryption: bool,
+    /// True when `core/shareapi_exclude_groups` is configured. The sidecar then
+    /// delegates, because it cannot reproduce `ShareDisableChecker` group
+    /// expansion for LDAP/circles.
+    pub sharing_exclude_groups: bool,
 }
 
 #[derive(Debug, Default)]
@@ -338,6 +361,21 @@ impl Config {
             php_timeout,
             allow_self_signed,
             config_path,
+            instance_id: raw.get_str("instanceid").unwrap_or_default().to_string(),
+            datadirectory: raw
+                .get_str("datadirectory")
+                .filter(|dir| !dir.is_empty())
+                .map(PathBuf::from),
+            previews_enabled: raw.get_bool("enable_previews", true),
+            data_fingerprint: raw
+                .get_str("data-fingerprint")
+                .unwrap_or_default()
+                .to_string(),
+            objectstore: raw.get_str("objectstore").is_some()
+                || raw.get("objectstore_multibucket").is_some(),
+            // Set from `oc_appconfig` at startup (see `main.rs`).
+            e2e_encryption: false,
+            sharing_exclude_groups: false,
         })
     }
 

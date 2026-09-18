@@ -5,7 +5,7 @@ Three layers, all runnable from this directory:
 | layer | files | needs PostgreSQL? | needs a live Nextcloud? |
 |---|---|---|---|
 | Pure protocol/wire | `protocol_wire.rs`, `auth_gates.rs` | no | no |
-| DB-backed read path | `db_read_path.rs`, `http_read.rs`, `deviations.rs` | yes (auto-started) | no |
+| DB-backed read path | `db_read_path.rs`, `http_read.rs`, `files_read_path.rs`, `deviations.rs` | yes (auto-started) | no |
 | Differential conformance | `conformance/conformance.py` | no | yes (sidecar + PHP) |
 
 ## Running
@@ -133,6 +133,15 @@ The production router with native writes enabled and the outbox table present:
   bad `VERSION` 415, oversized body 403, ISO-8859-1 → UTF-8 conversion.
 - Atomicity: the outbox row is present on success and absent when the
   transaction fails (a forced mid-transaction error rolls back the card too).
+
+### `files_read_path.rs` — the native files `PROPFIND`
+
+The router and `src/files.rs` against a seeded `oc_filecache`/`oc_storages`:
+Depth 0/1 shapes, the fixed `allprop`/`propname` list, `Prefer: return=minimal`,
+the property gate returning 501, mount delegation in both directions, every
+non-PROPFIND method returning 501, NFC/decomposed path resolution, a >5000-child
+listing, the `oc:comments-unread` and quota bulk queries, and the
+fast-path-only requirement.
 
 ### `deviations.rs` — the declared exceptions
 

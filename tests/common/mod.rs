@@ -443,6 +443,273 @@ impl TestEnv {
             .unwrap();
     }
 
+    // ------------------------------------------------------------------
+    // Files (WebDAV files PROPFIND)
+    // ------------------------------------------------------------------
+
+    /// Inserts an `oc_appconfig` row.
+    pub async fn seed_appconfig(&self, app: &str, key: &str, value: &str) {
+        let sql = format!(
+            "INSERT INTO {}appconfig (appid, configkey, configvalue) VALUES (?, ?, ?)",
+            self.prefix
+        );
+        sqlx::query(safe(sql))
+            .bind(app)
+            .bind(key)
+            .bind(value)
+            .execute(self.pool())
+            .await
+            .unwrap();
+    }
+
+    /// Inserts an `oc_storages` row and returns its `numeric_id`.
+    pub async fn seed_storage(&self, id: &str) -> i64 {
+        let sql = format!(
+            "INSERT INTO {}storages (id) VALUES (?) RETURNING numeric_id",
+            self.prefix
+        );
+        sqlx::query(safe(sql))
+            .bind(id)
+            .fetch_one(self.pool())
+            .await
+            .unwrap()
+            .get("numeric_id")
+    }
+
+    /// Inserts an `oc_mimetypes` row and returns its id.
+    pub async fn seed_mimetype(&self, mimetype: &str) -> i64 {
+        let insert = format!(
+            "INSERT INTO {}mimetypes (mimetype) VALUES (?) \
+             ON CONFLICT (mimetype) DO NOTHING RETURNING id",
+            self.prefix
+        );
+        if let Some(row) = sqlx::query(safe(insert))
+            .bind(mimetype)
+            .fetch_optional(self.pool())
+            .await
+            .unwrap()
+        {
+            return row.get("id");
+        }
+        let select = format!(
+            "SELECT id FROM {}mimetypes WHERE mimetype = ?",
+            self.prefix
+        );
+        sqlx::query(safe(select))
+            .bind(mimetype)
+            .fetch_one(self.pool())
+            .await
+            .unwrap()
+            .get("id")
+    }
+
+    /// Inserts an `oc_filecache` row with a faithful `path_hash`.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn seed_file(
+        &self,
+        storage: i64,
+        path: &str,
+        name: &str,
+        mimetype: &str,
+        size: i64,
+        mtime: i64,
+        etag: &str,
+        permissions: i64,
+        parent: i64,
+        checksum: Option<&str>,
+    ) -> i64 {
+        let mimetype_id = self.seed_mimetype(mimetype).await;
+        let mimepart = mimetype.split('/').next().unwrap_or(mimetype);
+        let mimepart_id = self.seed_mimetype(mimepart).await;
+        let path_hash = md5_hex(path.as_bytes());
+        let sql = format!(
+            "INSERT INTO {}filecache \
+             (storage, path, path_hash, parent, name, mimetype, mimepart, size, mtime, \
+              storage_mtime, encrypted, unencrypted_size, etag, permissions, checksum) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?) RETURNING fileid",
+            self.prefix
+        );
+        sqlx::query(safe(sql))
+            .bind(storage)
+            .bind(path)
+            .bind(&path_hash)
+            .bind(parent)
+            .bind(name)
+            .bind(mimetype_id)
+            .bind(mimepart_id)
+            .bind(size)
+            .bind(mtime)
+            .bind(mtime)
+            .bind(etag)
+            .bind(permissions)
+            .bind(checksum)
+            .fetch_one(self.pool())
+            .await
+            .unwrap()
+            .get("fileid")
+    }
+
+    /// A `oc_mounts` row for `user_id`.
+    pub async fn seed_mount(&self, user_id: &str, mount_point: &str) {
+        let sql = format!(
+            "INSERT INTO {}mounts (storage_id, root_id, user_id, mount_point) \
+             VALUES (0, 0, ?, ?)",
+            self.prefix
+        );
+        sqlx::query(safe(sql))
+            .bind(user_id)
+            .bind(mount_point)
+            .execute(self.pool())
+            .await
+            .unwrap();
+    }
+
+    /// An `oc_groups` row carrying a display name (used by `nc:sharees`).
+    pub async fn seed_group_with_displayname(&self, gid: &str, displayname: &str) {
+        let sql = format!(
+            "INSERT INTO {}groups (gid, displayname) VALUES (?, ?)",
+            self.prefix
+        );
+        sqlx::query(safe(sql))
+            .bind(gid)
+            .bind(displayname)
+            .execute(self.pool())
+            .await
+            .unwrap();
+    }
+
+    /// An `oc_filecache_extended` row, so `d:creationdate` has a source.
+    pub async fn seed_extended(&self, fileid: i64, creation_time: i64) {
+        let sql = format!(
+            "INSERT INTO {}filecache_extended (fileid, creation_time) VALUES (?, ?)",
+            self.prefix
+        );
+        sqlx::query(safe(sql))
+            .bind(fileid)
+            .bind(creation_time)
+            .execute(self.pool())
+            .await
+            .unwrap();
+    }
+
+    /// An `oc_files_metadata` row (`nc:metadata-*`, `nc:hidden`).
+    pub async fn seed_metadata(&self, fileid: i64, json: &str) {
+        let sql = format!(
+            "INSERT INTO {}files_metadata (file_id, json) VALUES (?, ?)",
+            self.prefix
+        );
+        sqlx::query(safe(sql))
+            .bind(fileid)
+            .bind(json)
+            .execute(self.pool())
+            .await
+            .unwrap();
+    }
+
+    /// An `oc_share` row (`oc:share-types` / `nc:sharees`).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn seed_file_share(
+        &self,
+        share_type: i64,
+        share_with: Option<&str>,
+        uid_owner: &str,
+        uid_initiator: &str,
+        file_source: i64,
+        permissions: i64,
+    ) -> i64 {
+        let sql = format!(
+            "INSERT INTO {}share \
+             (share_type, share_with, uid_owner, uid_initiator, item_type, file_source, permissions) \
+             VALUES (?, ?, ?, ?, 'file', ?, ?) RETURNING id",
+            self.prefix
+        );
+        sqlx::query(safe(sql))
+            .bind(share_type as i16)
+            .bind(share_with)
+            .bind(uid_owner)
+            .bind(uid_initiator)
+            .bind(file_source)
+            .bind(permissions)
+            .fetch_one(self.pool())
+            .await
+            .unwrap()
+            .get("id")
+    }
+
+    /// Tags `objid` as a favorite for `uid` (`oc_vcategory*`).
+    pub async fn seed_favorite(&self, uid: &str, objid: i64) {
+        let insert_category = format!(
+            "INSERT INTO {}vcategory (uid, type, category) VALUES (?, 'files', ?) \
+             ON CONFLICT (uid, type, category) DO NOTHING RETURNING id",
+            self.prefix
+        );
+        let category = "_$!<Favorite>!$_";
+        let category_id: i64 = match sqlx::query(safe(insert_category))
+            .bind(uid)
+            .bind(category)
+            .fetch_optional(self.pool())
+            .await
+            .unwrap()
+        {
+            Some(row) => row.get("id"),
+            None => {
+                let select = format!(
+                    "SELECT id FROM {}vcategory WHERE uid = ? AND type = 'files' AND category = ?",
+                    self.prefix
+                );
+                sqlx::query(safe(select))
+                    .bind(uid)
+                    .bind(category)
+                    .fetch_one(self.pool())
+                    .await
+                    .unwrap()
+                    .get("id")
+            }
+        };
+        let insert = format!(
+            "INSERT INTO {}vcategory_to_object (objid, categoryid, type) VALUES (?, ?, 'files') \
+             ON CONFLICT DO NOTHING",
+            self.prefix
+        );
+        sqlx::query(safe(insert))
+            .bind(objid)
+            .bind(category_id)
+            .execute(self.pool())
+            .await
+            .unwrap();
+    }
+
+    /// Inserts a comment (`oc_comments`) on a file object.
+    pub async fn seed_comment(&self, object_id: i64, creation_timestamp: &str) {
+        let sql = format!(
+            "INSERT INTO {}comments (actor_type, actor_id, message, verb, object_type, object_id, creation_timestamp) \
+             VALUES ('users', 'bob', 'hi', 'comment', 'files', ?, CAST(? AS timestamp))",
+            self.prefix
+        );
+        sqlx::query(safe(sql))
+            .bind(object_id.to_string())
+            .bind(creation_timestamp)
+            .execute(self.pool())
+            .await
+            .unwrap();
+    }
+
+    /// Inserts a read marker (`oc_comments_read_markers`) for `uid`.
+    pub async fn seed_comment_marker(&self, uid: &str, object_id: i64, marker_datetime: &str) {
+        let sql = format!(
+            "INSERT INTO {}comments_read_markers (user_id, marker_datetime, object_type, object_id) \
+             VALUES (?, CAST(? AS timestamp), 'files', ?) ON CONFLICT DO NOTHING",
+            self.prefix
+        );
+        sqlx::query(safe(sql))
+            .bind(uid)
+            .bind(marker_datetime)
+            .bind(object_id.to_string())
+            .execute(self.pool())
+            .await
+            .unwrap();
+    }
+
     /// Inserts a valid app-password token row for `uid`/`password`.
     pub async fn seed_token(
         &self,
@@ -533,6 +800,13 @@ impl TestEnv {
             php_timeout: Duration::from_millis(500),
             allow_self_signed: false,
             config_path: std::path::PathBuf::from("/dev/null"),
+            instance_id: "testinst".to_string(),
+            datadirectory: None,
+            previews_enabled: true,
+            data_fingerprint: String::new(),
+            objectstore: false,
+            e2e_encryption: false,
+            sharing_exclude_groups: false,
         };
         router(Arc::new(AppState {
             db,
@@ -546,6 +820,40 @@ impl TestEnv {
 
     /// A router that shares this env's pool instead of opening a new one.
     pub fn app_shared(&self) -> Router {
+        self.app_shared_blocking("testinst", false, None, false, false)
+    }
+
+    /// Like [`TestEnv::app_shared`] but with explicit files flags, for the
+    /// deviation assertions that pin the delegation conditions.
+    pub fn app_shared_with(
+        &self,
+        instance_id: &str,
+        sharing_exclude_groups: bool,
+        datadirectory: Option<std::path::PathBuf>,
+    ) -> Router {
+        self.app_shared_blocking(instance_id, sharing_exclude_groups, datadirectory, false, false)
+    }
+
+    /// Like [`TestEnv::app_shared`] but with a primary object store configured,
+    /// for the `oc:downloadURL` delegation deviation.
+    pub fn app_shared_objectstore(&self) -> Router {
+        self.app_shared_blocking("testinst", false, None, true, false)
+    }
+
+    /// Like [`TestEnv::app_shared`] but with `end_to_end_encryption` enabled, for
+    /// the `nc:is-encrypted` delegation deviation.
+    pub fn app_shared_e2ee(&self) -> Router {
+        self.app_shared_blocking("testinst", false, None, false, true)
+    }
+
+    fn app_shared_blocking(
+        &self,
+        instance_id: &str,
+        sharing_exclude_groups: bool,
+        datadirectory: Option<std::path::PathBuf>,
+        objectstore: bool,
+        e2e_encryption: bool,
+    ) -> Router {
         let php = PhpClient::new("http://127.0.0.1:1/", Duration::from_millis(500), false).unwrap();
         let auth = Authenticator::new(
             self.db.clone(),
@@ -567,6 +875,13 @@ impl TestEnv {
             php_timeout: Duration::from_millis(500),
             allow_self_signed: false,
             config_path: std::path::PathBuf::from("/dev/null"),
+            instance_id: instance_id.to_string(),
+            datadirectory,
+            previews_enabled: true,
+            data_fingerprint: String::new(),
+            objectstore,
+            e2e_encryption,
+            sharing_exclude_groups,
         };
         router(Arc::new(AppState {
             db: self.db.clone(),
@@ -841,7 +1156,8 @@ CREATE TABLE oc_dav_shares (
     publicuri varchar(255) NULL
 );
 CREATE TABLE oc_groups (
-    gid varchar(64) NOT NULL PRIMARY KEY
+    gid varchar(64) NOT NULL PRIMARY KEY,
+    displayname varchar(255) NULL
 );
 CREATE TABLE oc_group_user (
     gid varchar(64) NOT NULL,
@@ -897,6 +1213,126 @@ CREATE TABLE oc_dav_event_outbox (
 );
 CREATE INDEX oc_dav_event_outbox_pending_idx
     ON oc_dav_event_outbox (state, next_attempt_at, seq);
+
+-- Files (WebDAV files PROPFIND) tables, mirroring the Nextcloud migrations.
+CREATE TABLE oc_storages (
+    numeric_id bigint GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+    id varchar(64) NULL,
+    available integer NOT NULL DEFAULT 1,
+    last_checked integer NULL
+);
+CREATE UNIQUE INDEX storages_id_index ON oc_storages (id);
+
+CREATE TABLE oc_mimetypes (
+    id bigint GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+    mimetype varchar(255) NOT NULL DEFAULT ''
+);
+CREATE UNIQUE INDEX mimetype_id_index ON oc_mimetypes (mimetype);
+
+CREATE TABLE oc_filecache (
+    fileid bigint GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+    storage bigint NOT NULL DEFAULT 0,
+    path varchar(4000) NULL,
+    path_hash varchar(32) NOT NULL DEFAULT '',
+    parent bigint NOT NULL DEFAULT 0,
+    name varchar(250) NULL,
+    mimetype bigint NOT NULL DEFAULT 0,
+    mimepart bigint NOT NULL DEFAULT 0,
+    size bigint NOT NULL DEFAULT 0,
+    mtime bigint NOT NULL DEFAULT 0,
+    storage_mtime bigint NOT NULL DEFAULT 0,
+    encrypted integer NOT NULL DEFAULT 0,
+    unencrypted_size bigint NOT NULL DEFAULT 0,
+    etag varchar(40) NULL,
+    permissions integer NULL DEFAULT 0,
+    checksum varchar(255) NULL
+);
+CREATE UNIQUE INDEX fs_storage_path_hash ON oc_filecache (storage, path_hash);
+CREATE INDEX fs_parent ON oc_filecache (parent);
+CREATE INDEX fs_parent_name_hash ON oc_filecache (parent, name);
+
+CREATE TABLE oc_filecache_extended (
+    fileid bigint NOT NULL PRIMARY KEY,
+    metadata_etag varchar(40) NULL,
+    creation_time bigint NOT NULL DEFAULT 0,
+    upload_time bigint NOT NULL DEFAULT 0
+);
+
+CREATE TABLE oc_files_metadata (
+    id bigint GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+    file_id bigint NOT NULL,
+    json text NOT NULL DEFAULT '',
+    sync_token varchar(15) NOT NULL DEFAULT '',
+    last_update timestamp NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX files_meta_fileid ON oc_files_metadata (file_id);
+
+CREATE TABLE oc_mounts (
+    id integer GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+    storage_id bigint NOT NULL,
+    root_id bigint NOT NULL,
+    user_id varchar(64) NOT NULL,
+    mount_point varchar(4000) NOT NULL,
+    mount_id bigint NULL
+);
+CREATE INDEX mounts_user_index ON oc_mounts (user_id);
+
+CREATE TABLE oc_share (
+    id bigint GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+    share_type smallint NOT NULL DEFAULT 0,
+    share_with varchar(255) NULL,
+    uid_owner varchar(64) NOT NULL DEFAULT '',
+    uid_initiator varchar(64) NULL,
+    item_type varchar(64) NOT NULL DEFAULT '',
+    file_source bigint NOT NULL DEFAULT 0,
+    file_target varchar(512) NULL,
+    permissions integer NOT NULL DEFAULT 0,
+    accepted smallint NOT NULL DEFAULT 0,
+    note text NULL,
+    hide_download smallint NOT NULL DEFAULT 0,
+    attributes text NULL
+);
+CREATE INDEX share_file_source_index ON oc_share (file_source);
+
+CREATE TABLE oc_vcategory (
+    id integer GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+    uid varchar(64) NOT NULL DEFAULT '',
+    type varchar(64) NOT NULL DEFAULT '',
+    category varchar(255) NOT NULL DEFAULT ''
+);
+CREATE UNIQUE INDEX unique_category_per_user ON oc_vcategory (uid, type, category);
+
+CREATE TABLE oc_vcategory_to_object (
+    objid integer NOT NULL DEFAULT 0,
+    categoryid integer NOT NULL DEFAULT 0,
+    type varchar(64) NOT NULL DEFAULT '',
+    PRIMARY KEY (categoryid, objid, type)
+);
+CREATE INDEX vcategory_objectd_index ON oc_vcategory_to_object (objid, type);
+
+CREATE TABLE oc_comments (
+    id integer GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+    parent_id integer NOT NULL DEFAULT 0,
+    topmost_parent_id integer NOT NULL DEFAULT 0,
+    children_count integer NOT NULL DEFAULT 0,
+    actor_type varchar(64) NOT NULL DEFAULT '',
+    actor_id varchar(64) NOT NULL DEFAULT '',
+    message text NULL,
+    verb varchar(64) NULL,
+    creation_timestamp timestamp NULL,
+    latest_child_timestamp timestamp NULL,
+    object_type varchar(64) NOT NULL DEFAULT '',
+    object_id varchar(64) NOT NULL DEFAULT ''
+);
+CREATE INDEX comments_object_index ON oc_comments (object_type, object_id);
+
+CREATE TABLE oc_comments_read_markers (
+    user_id varchar(64) NOT NULL DEFAULT '',
+    marker_datetime timestamp NULL,
+    object_type varchar(64) NOT NULL DEFAULT '',
+    object_id varchar(64) NOT NULL DEFAULT '',
+    PRIMARY KEY (user_id, object_type, object_id)
+);
 "#;
     for statement in ddl.split(';') {
         let statement = statement.trim();

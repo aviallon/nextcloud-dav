@@ -13,6 +13,13 @@ pub const NS_CALENDARSERVER: &str = "http://calendarserver.org/ns/";
 pub const NS_SABREDAV: &str = "http://sabredav.org/ns";
 pub const NS_OWNCLOUD: &str = "http://owncloud.org/ns";
 pub const NS_NEXTCLOUD: &str = "http://nextcloud.com/ns";
+/// The **files** `nc` namespace (`FilesPlugin::NS_NEXTCLOUD`). It differs from
+/// the CardDAV/CalDAV sharing one (`NS_NEXTCLOUD`) and is bound to the `nc`
+/// prefix in a files multistatus, exactly like Nextcloud.
+pub const NS_NEXTCLOUD_FILES: &str = "http://nextcloud.org/ns";
+/// The Open Collaboration Services namespace (`ocs`), used by the files
+/// property `ocs:share-permissions` (`FilesPlugin::SHARE_PERMISSIONS_PROPERTYNAME`).
+pub const NS_OCS: &str = "http://open-collaboration-services.org/ns";
 
 /// A namespace-qualified element name.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -37,7 +44,8 @@ impl PropQName {
             NS_CALENDARSERVER => Some("cs"),
             NS_SABREDAV => Some("s"),
             NS_OWNCLOUD => Some("oc"),
-            NS_NEXTCLOUD => Some("nc"),
+            NS_NEXTCLOUD | NS_NEXTCLOUD_FILES => Some("nc"),
+            NS_OCS => Some("ocs"),
             _ => None,
         }
     }
@@ -161,23 +169,54 @@ pub struct MultiStatus {
 }
 
 impl MultiStatus {
+    /// CardDAV's namespace map (`d`, `card`, `cs`, `s`, `oc`, `nc`).
+    pub const CARDDAV_NAMESPACES: &'static [(&'static str, &'static str)] = &[
+        ("d", NS_DAV),
+        ("card", NS_CARDDAV),
+        ("cs", NS_CALENDARSERVER),
+        ("s", NS_SABREDAV),
+        ("oc", NS_OWNCLOUD),
+        ("nc", NS_NEXTCLOUD),
+    ];
+
+    /// The files namespace map (`d`, `s`, `oc`, `nc` = the `.org` namespace,
+    /// `ocs`), matching a Nextcloud files PROPFIND. Nextcloud registers `ocs`
+    /// only client-side (it is serialised ad-hoc by Sabre); the sidecar declares
+    /// it up front, which is namespace-equivalent on the wire.
+    pub const FILES_NAMESPACES: &'static [(&'static str, &'static str)] = &[
+        ("d", NS_DAV),
+        ("s", NS_SABREDAV),
+        ("oc", NS_OWNCLOUD),
+        ("nc", NS_NEXTCLOUD_FILES),
+        ("ocs", NS_OCS),
+    ];
+
     pub fn to_xml(&self) -> String {
+        self.to_xml_with(Self::CARDDAV_NAMESPACES)
+    }
+
+    pub fn to_xml_files(&self) -> String {
+        self.to_xml_with(Self::FILES_NAMESPACES)
+    }
+
+    pub fn to_xml_with(&self, namespaces: &[(&str, &str)]) -> String {
         let mut writer = Writer::new_with_indent(Vec::new(), b' ', 2);
-        self.write_to(&mut writer)
+        self.write_to(&mut writer, namespaces)
             .expect("writing XML to a Vec cannot fail");
         // The writer only ever emits UTF-8 (all inputs are Rust `String`s).
         String::from_utf8(writer.into_inner()).expect("quick-xml writes UTF-8")
     }
 
-    fn write_to<W: Write>(&self, writer: &mut Writer<W>) -> std::io::Result<()> {
+    fn write_to<W: Write>(
+        &self,
+        writer: &mut Writer<W>,
+        namespaces: &[(&str, &str)],
+    ) -> std::io::Result<()> {
         writer.write_event(Event::Decl(BytesDecl::new("1.0", Some("utf-8"), None)))?;
         let mut root = BytesStart::new("d:multistatus");
-        root.push_attribute(("xmlns:d", NS_DAV));
-        root.push_attribute(("xmlns:card", NS_CARDDAV));
-        root.push_attribute(("xmlns:cs", NS_CALENDARSERVER));
-        root.push_attribute(("xmlns:s", NS_SABREDAV));
-        root.push_attribute(("xmlns:oc", NS_OWNCLOUD));
-        root.push_attribute(("xmlns:nc", NS_NEXTCLOUD));
+        for (prefix, uri) in namespaces {
+            root.push_attribute((format!("xmlns:{prefix}").as_str(), *uri));
+        }
         writer.write_event(Event::Start(root.borrow()))?;
         for response in &self.responses {
             self.write_response(writer, response)?;

@@ -56,6 +56,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/healthz", get(healthz))
         .route("/remote.php/dav/addressbooks", any(dispatch))
         .route("/remote.php/dav/addressbooks/{*rest}", any(dispatch))
+        .route("/remote.php/dav/files", any(dispatch_files))
+        .route("/remote.php/dav/files/{*rest}", any(dispatch_files))
         .with_state(state)
 }
 
@@ -162,6 +164,69 @@ async fn dispatch(State(state): State<Arc<AppState>>, request: Request) -> Respo
     match handle(state, request).await {
         Ok(response) => response,
         Err(error) => error.into_response(),
+    }
+}
+
+/// WebDAV **files** (`/remote.php/dav/files/**`) dispatch.
+///
+/// Only a native `PROPFIND` Depth 0/1 for the caller's own, mount-free home
+/// storage is served; everything else (including `OPTIONS`, whose DAV/Allow
+/// headers the sidecar advertises for address books) answers 501 so nginx
+/// replays the request to PHP. See `src/files.rs`.
+async fn dispatch_files(State(state): State<Arc<AppState>>, request: Request) -> Response {
+    match handle_files(state, request).await {
+        Ok(response) => response,
+        Err(error) => error.into_response(),
+    }
+}
+
+async fn handle_files(state: Arc<AppState>, request: Request) -> Result<Response> {
+    // Every non-PROPFIND method is delegated before touching credentials: PHP
+    // owns OPTIONS discovery and the whole write path for files.
+    if request.method().as_str() != "PROPFIND" {
+        return Ok(not_implemented());
+    }
+
+    let path = request.uri().path().to_string();
+    let headers = request.headers().clone();
+    let Some(parsed) = crate::files::parse_files_path(&path) else {
+        return Ok(Error::NotFound.into_response());
+    };
+
+    let Some((username, password)) = parse_basic_auth(headers.get(header::AUTHORIZATION)) else {
+        return Ok(unauthorized());
+    };
+    let client_ip = client_ip(&headers);
+    let user = match state.auth.authenticate(&username, &password, client_ip).await {
+        Ok(user) => user,
+        Err(error) => return Ok(auth_error_response(error)),
+    };
+
+    // `Files\RootCollection::getChildForPrincipal()` only serves the caller's
+    // own home; a different principal is a 404, not a 403.
+    if parsed.uid != user.uid {
+        return Ok(Error::NotFound.into_response());
+    }
+
+    let body = read_body(request).await?;
+    let depth = crate::files::parse_depth(&headers);
+    let minimal = crate::files::prefer_minimal(&headers);
+    match crate::files::handle_propfind(
+        &state.db,
+        &state.config,
+        &user,
+        &parsed,
+        depth,
+        minimal,
+        &body,
+    )
+    .await?
+    {
+        Some(multistatus) => Ok(xml_response(
+            StatusCode::MULTI_STATUS,
+            multistatus.to_xml_files(),
+        )),
+        None => Ok(not_implemented()),
     }
 }
 

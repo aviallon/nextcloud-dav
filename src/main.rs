@@ -32,7 +32,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
     let log_level = opt.log_level.clone().unwrap_or_else(|| "info".to_string());
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(log_level)).init();
 
-    let config = Config::from_opt(opt)?;
+    let mut config = Config::from_opt(opt)?;
     log::info!(
         "starting nextcloud-dav: config={}, listen={}, db_prefix={}, secret_configured={}",
         config.config_path.display(),
@@ -50,6 +50,34 @@ async fn run() -> Result<(), Box<dyn Error>> {
         .await?,
     );
     db.ping().await?;
+
+    // `ShareDisableChecker` strips the SHARE permission from listings when
+    // `core/shareapi_exclude_groups` is configured. The sidecar cannot
+    // reproduce LDAP/circle group expansion, so it delegates instead. The
+    // check is cached for the process lifetime (an app-config change needs a
+    // restart, like `card_size_limit`).
+    config.sharing_exclude_groups = db
+        .appconfig_value("core", "shareapi_exclude_groups")
+        .await?
+        .map(|value| !value.is_empty() && value != "no")
+        .unwrap_or(false);
+    if config.sharing_exclude_groups {
+        log::warn!("core/shareapi_exclude_groups is configured; files PROPFIND stays on PHP");
+    }
+    // `nc:is-encrypted` is served only by the end-to-end encryption app. Without
+    // it PHP has no handler and answers 404, which the sidecar reproduces; with
+    // it the sidecar must delegate so the client sees the real value.
+    config.e2e_encryption = db
+        .appconfig_value("end_to_end_encryption", "enabled")
+        .await?
+        .map(|value| value == "yes")
+        .unwrap_or(false);
+    if config.e2e_encryption {
+        log::warn!("end_to_end_encryption is enabled; nc:is-encrypted delegates to PHP");
+    }
+    if config.instance_id.is_empty() {
+        log::warn!("config.php has no instanceid; files PROPFIND stays on PHP");
+    }
 
     // The write-size limit: config override first, then the `dav` app-config
     // value, then Nextcloud's default. Cached for the process lifetime.
