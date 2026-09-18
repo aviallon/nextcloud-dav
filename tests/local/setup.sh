@@ -1,0 +1,165 @@
+#!/usr/bin/env bash
+# Stand up a disposable Nextcloud 33.0.5 + PostgreSQL 18, install the
+# nextcloud_dav companion app, create a user/app-password/address book, copy the
+# container's config.php to the host, build (if needed) and start the sidecar.
+#
+# Idempotent: safe to re-run. Recreates from scratch with teardown.sh first.
+#
+#   ./setup.sh            # bring everything up
+#   ./setup.sh --rebuild  # force a sidecar rebuild
+#
+# Never prints secrets.
+set -euo pipefail
+
+LOCAL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib.sh
+. "$LOCAL_DIR/lib.sh"
+
+REBUILD=0
+[ "${1:-}" = "--rebuild" ] && REBUILD=1
+
+mkdir -p "$STATE_DIR" "$CONFIG_DIR" "$EVIDENCE_DIR"
+chmod 700 "$STATE_DIR"
+
+# --- secrets -----------------------------------------------------------------
+if [ ! -f "$ENV_FILE" ]; then
+	{
+		echo "DB_PASSWORD=$(rand_hex 24)"
+		echo "ADMIN_PASSWORD=$(rand_hex 16)"
+		echo "ALICE_PASSWORD=$(rand_hex 16)"
+	} >"$ENV_FILE"
+	chmod 600 "$ENV_FILE"
+	echo "generated state/env (secrets not shown)"
+fi
+load_env
+
+# --- containers --------------------------------------------------------------
+echo "==> starting containers"
+compose up -d
+
+echo "==> waiting for Nextcloud install"
+wait_for_nextcloud
+wait_for_http
+occ status | sed -n 's/^  - installed: /installed: /p; s/^  - version: /version: /p'
+
+# --- extra config ------------------------------------------------------------
+# Nextcloud loads config/*.config.php automatically; the sidecar loads the
+# same file from its host-side copy via --glob-config.
+write_extra_config() {
+	local php="$1"
+	docker exec -i -u www-data "$NC" sh -c \
+		'cat > /var/www/html/config/nextcloud_dav.config.php' <<<"$php"
+}
+DISPATCH_CONFIG='<?php
+$CONFIG = [
+    "nextcloud_dav" => [
+        "event_dispatch" => [
+            "enabled" => true,
+            "max_attempts" => 3,
+            "backoff_ms" => [200, 200, 200],
+            "claim_timeout_s" => 5,
+            "idle_poll_ms" => 100,
+        ],
+    ],
+];
+'
+write_extra_config "$DISPATCH_CONFIG"
+
+# --- companion app -----------------------------------------------------------
+# NOTE: this harness used to install a test-only OCP\Files\ISetupManager shim,
+# because the app type-hinted that interface and Nextcloud 33.0.5 does not have
+# it (only the private OC\Files\SetupManager). The app now resolves the setup
+# manager by name at runtime, so the shim is gone and this harness exercises the
+# real code path on the production version.
+echo "==> installing nextcloud_dav app"
+docker exec "$NC" rm -rf /var/www/html/custom_apps/nextcloud_dav
+docker cp "$REPO_DIR/app/nextcloud_dav" "$NC:/var/www/html/custom_apps/nextcloud_dav"
+docker exec "$NC" chown -R www-data:www-data /var/www/html/custom_apps/nextcloud_dav
+occ app:enable nextcloud_dav
+occ app:list 2>/dev/null | grep nextcloud_dav || true
+
+echo "==> outbox table columns + types"
+q "SELECT string_agg(column_name||' '||data_type, ',' ORDER BY ordinal_position)
+     FROM information_schema.columns
+    WHERE table_name = 'oc_dav_event_outbox'"
+echo "expected (src/outbox.rs::OUTBOX_COLUMNS):"
+printf '%s\n' "seq,created_at,event_type,addressbookid,card_uri,card_row,card_data,effects,state,attempts,next_attempt_at,reserved_by,reserved_at,processed_at,last_error"
+
+# --- user + app password -----------------------------------------------------
+echo "==> creating user alice"
+if ! occ user:info alice >/dev/null 2>&1; then
+	OC_PASS="$ALICE_PASSWORD" docker exec -e OC_PASS -u www-data -w /var/www/html "$NC" \
+		php occ user:add --password-from-env --display-name "Alice E2E" alice >/dev/null
+fi
+
+echo "==> creating app password"
+occ user:add-app-password alice >"$STATE_DIR/apppw.raw" 2>&1 || true
+# Extract the token: the last whitespace-delimited field of the last non-empty
+# line that looks like an opaque token.
+awk '
+  NF>0 { last=$0 }
+  END {
+    n=split(last, f, /[ \t]+/);
+    print f[n];
+  }' "$STATE_DIR/apppw.raw" >"$STATE_DIR/app_password"
+chmod 600 "$STATE_DIR/app_password"
+if [ ! -s "$STATE_DIR/app_password" ] || [ "$(wc -c <"$STATE_DIR/app_password")" -lt 20 ]; then
+	echo "ERROR: could not parse an app password (occ output had $(wc -l <"$STATE_DIR/apppw.raw") lines)" >&2
+	# Show the shape without the token.
+	sed -E 's/[A-Za-z0-9_-]{20,}/<REDACTED>/g' "$STATE_DIR/apppw.raw" >&2 || true
+	exit 1
+fi
+rm -f "$STATE_DIR/apppw.raw"
+printf 'user = "alice:%s"\n' "$(cat "$STATE_DIR/app_password")" >"$STATE_DIR/curlrc"
+chmod 600 "$STATE_DIR/curlrc"
+echo "app password stored (not shown)"
+
+# --- address book (MKCOL through Apache) -------------------------------------
+echo "==> creating address book via MKCOL"
+MKCOL_BODY='<?xml version="1.0" encoding="utf-8"?>
+<mkcol xmlns="DAV:" xmlns:card="urn:ietf:params:xml:ns:carddav">
+  <set><prop>
+    <resourcetype><collection/><card:addressbook/></resourcetype>
+    <displayname>E2E contacts</displayname>
+  </prop></set>
+</mkcol>'
+code=$(curl -s -o /dev/null -w '%{http_code}' -K "$STATE_DIR/curlrc" \
+	-X MKCOL -H 'Content-Type: application/xml; charset=utf-8' \
+	--data-binary "$MKCOL_BODY" \
+	"$NC_URL/remote.php/dav/addressbooks/users/alice/contacts/")
+echo "MKCOL status: $code"
+if [ "$code" != "201" ] && [ "$code" != "405" ]; then
+	echo "MKCOL failed" >&2
+	exit 1
+fi
+
+# --- copy config to the host sidecar -----------------------------------------
+# The sidecar gets a *copy* of the container's config.php plus two sibling
+# config files: the shared dispatch block and a dbhost/dbport override that
+# points at the published Postgres port. Nextcloud never sees the override.
+echo "==> copying container config.php to host"
+docker cp "$NC:/var/www/html/config/config.php" "$CONFIG_DIR/config.php"
+chmod 600 "$CONFIG_DIR/config.php"
+printf '%s\n' "$DISPATCH_CONFIG" >"$CONFIG_DIR/nextcloud_dav.config.php"
+printf '<?php\n$CONFIG = ["dbhost" => "127.0.0.1", "dbport" => %s];\n' "$PG_PORT" \
+	>"$CONFIG_DIR/sidecar-db.config.php"
+
+# --- build sidecar -----------------------------------------------------------
+if [ "$REBUILD" = 1 ] || [ ! -x "$SIDECAR_BIN" ]; then
+	echo "==> building sidecar (release)"
+	(cd "$REPO_DIR" && CARGO_BUILD_JOBS=6 nice -n 19 \
+		nix shell nixpkgs#cargo nixpkgs#rustc nixpkgs#pkg-config nixpkgs#cmake nixpkgs#openssl \
+		-c cargo build --release --locked)
+fi
+
+# --- start sidecar -----------------------------------------------------------
+echo "==> starting sidecar on $SIDECAR_URL"
+start_sidecar
+echo "==> sidecar log:"
+grep -E 'starting nextcloud-dav|event outbox|listening on' "$STATE_DIR/sidecar.log" || true
+
+echo
+echo "setup complete."
+echo "  sidecar : $SIDECAR_URL"
+echo "  nextcloud: $NC_URL"
+echo "  evidence: run ./e2e.sh"

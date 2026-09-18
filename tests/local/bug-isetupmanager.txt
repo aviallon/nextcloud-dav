@@ -1,0 +1,45 @@
+Could not resolve OCP\Files\ISetupManager! Class "OCP\Files\ISetupManager" does not exist
+An unhandled exception has been thrown:
+OC\AppFramework\Utility\QueryNotFoundException: Could not resolve OCP\Files\ISetupManager! Class "OCP\Files\ISetupManager" does not exist in /var/www/html/lib/private/AppFramework/Utility/SimpleContainer.php:138
+Stack trace:
+#0 /var/www/html/lib/private/AppFramework/Utility/SimpleContainer.php(157): OC\AppFramework\Utility\SimpleContainer->resolve('OCP\\Files\\ISetu...', Array)
+#1 /var/www/html/lib/private/ServerContainer.php(155): OC\AppFramework\Utility\SimpleContainer->query('OCP\\Files\\ISetu...', true, Array)
+#2 /var/www/html/lib/private/AppFramework/DependencyInjection/DIContainer.php(326): OC\ServerContainer->query('OCP\\Files\\ISetu...', true, Array)
+#3 /var/www/html/lib/private/AppFramework/Utility/SimpleContainer.php(95): OC\AppFramework\DependencyInjection\DIContainer->query('OCP\\Files\\ISetu...', true, Array)
+#4 [internal function]: OC\AppFramework\Utility\SimpleContainer->{closure:OC\AppFramework\Utility\SimpleContainer::buildClassConstructorParameters():82}(Object(ReflectionParameter))
+#5 /var/www/html/lib/private/AppFramework/Utility/SimpleContainer.php(82): array_map(Object(Closure), Array)
+#6 /var/www/html/lib/private/AppFramework/Utility/SimpleContainer.php(71): OC\AppFramework\Utility\SimpleContainer->buildClassConstructorParameters(Object(ReflectionMethod), Array)
+#7 [internal function]: OC\AppFramework\Utility\SimpleContainer->{closure:OC\AppFramework\Utility\SimpleContainer::buildClass():69}(Object(OCA\NextcloudDav\Command\EventDispatch))
+#8 /var/www/html/lib/private/Log/ExceptionSerializer.php(254): get_object_vars(Object(OCA\NextcloudDav\Command\EventDispatch))
+#9 [internal function]: OC\Log\ExceptionSerializer->encodeArg(Object(OCA\NextcloudDav\Command\EventDispatch))
+#10 /var/www/html/lib/private/Log/ExceptionSerializer.php(237): array_map(Array, Array)
+#11 [internal function]: OC\Log\ExceptionSerializer->{closure:OC\Log\ExceptionSerializer::encodeTrace():235}(Array)
+#12 /var/www/html/lib/private/Log/ExceptionSerializer.php(235): array_map(Object(Closure), Array)
+#13 /var/www/html/lib/private/Log/ExceptionSerializer.php(286): OC\Log\ExceptionSerializer->encodeTrace(Array)
+#14 /var/www/html/lib/private/Log.php(347): OC\Log\ExceptionSerializer->serializeException(Object(OCP\AppFramework\QueryException))
+#15 /var/www/html/lib/private/Log/PsrLoggerAdapter.php(153): OC\Log->logException(Object(OCP\AppFramework\QueryException), Array)
+#16 /var/www/html/lib/private/Log/PsrLoggerAdapter.php(90): OC\Log\PsrLoggerAdapter->log(3, 'Could not resol...', Array)
+#17 /var/www/html/lib/private/Console/Application.php(104): OC\Log\PsrLoggerAdapter->error('Could not resol...', Array)
+#18 /var/www/html/console.php(86): OC\Console\Application->loadCommands(Object(Symfony\Component\Console\Input\ArgvInput), Object(Symfony\Component\Console\Output\ConsoleOutput))
+#19 /var/www/html/occ(33): require_once('/var/www/html/c...')
+#20 {main}
+
+Next OCP\AppFramework\QueryException: Could not resolve OCP\Files\ISetupManager! Class "OCP\Files\ISetupManager" does not exist in /var/www/html/lib/private/AppFramework/Utility/SimpleContainer.php:113
+Stack trace:
+#0 [internal function]: OC\AppFramework\Utility\SimpleContainer->{closure:OC\AppFramework\Utility\SimpleContainer::buildClassConstructorParameters():82}(Object(ReflectionParameter))
+#1 /var/www/html/lib/private/AppFramework/Utility/SimpleContainer.php(82): array_map(Object(Closure), Array)
+#2 /var/www/html/lib/private/AppFramework/Utility/SimpleContainer.php(71): OC\AppFramework\Utility\SimpleContainer->buildClassConstructorParameters(Object(ReflectionMethod), Array)
+#3 [internal function]: OC\AppFramework\Utility\SimpleContainer->{closure:OC\AppFramework\Utility\SimpleContainer::buildClass():69}(Object(OCA\NextcloudDav\Command\EventDispatch))
+#4 /var/www/html/lib/private/Log/ExceptionSerializer.php(254): get_object_vars(Object(OCA\NextcloudDav\Command\EventDispatch))
+#5 [internal function]: OC\Log\ExceptionSerializer->encodeArg(Object(OCA\NextcloudDav\Command\EventDispatch))
+#6 /var/www/html/lib/private/Log/ExceptionSerializer.php(237): array_map(Array, Array)
+#7 [internal function]: OC\Log\ExceptionSerializer->{closure:OC\Log\ExceptionSerializer::encodeTrace():235}(Array)
+#8 /var/www/html/lib/private/Log/ExceptionSerializer.php(235): array_map(Object(Closure), Array)
+#9 /var/www/html/lib/private/Log/ExceptionSerializer.php(286): OC\Log\ExceptionSerializer->encodeTrace(Array)
+#10 /var/www/html/lib/private/Log.php(347): OC\Log\ExceptionSerializer->serializeException(Object(OCP\AppFramework\QueryException))
+#11 /var/www/html/lib/private/Log/PsrLoggerAdapter.php(153): OC\Log->logException(Object(OCP\AppFramework\QueryException), Array)
+#12 /var/www/html/lib/private/Log/PsrLoggerAdapter.php(90): OC\Log\PsrLoggerAdapter->log(3, 'Could not resol...', Array)
+#13 /var/www/html/lib/private/Console/Application.php(104): OC\Log\PsrLoggerAdapter->error('Could not resol...', Array)
+#14 /var/www/html/console.php(86): OC\Console\Application->loadCommands(Object(Symfony\Component\Console\Input\ArgvInput), Object(Symfony\Component\Console\Output\ConsoleOutput))
+#15 /var/www/html/occ(33): require_once('/var/www/html/c...')
+#16 {main}

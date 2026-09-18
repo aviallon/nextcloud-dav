@@ -1,0 +1,131 @@
+
+===== 0. preconditions =====
+sidecar: ok
+RESULT|P0|PASS|activity app enabled|expected=yes actual=yes
+
+===== reset alice test state =====
+reset done (address book ids: 3)
+MKCOL crash -> 201
+contacts book id=3 crash book id=4
+
+===== 1. CREATE =====
+RESULT|C1.1|PASS|PUT create status|expected=201 actual=201
+RESULT|C1.2|PASS|PUT create ETag is quoted|expected=yes actual=yes
+RESULT|C1.3|PASS|etag == md5(carddata)|expected=t actual=t
+RESULT|C1.4|PASS|uid|expected=e2e-create-1 actual=e2e-create-1
+RESULT|C1.5|PASS|size == octet_length(carddata)|expected=443 actual=443
+RESULT|C1.6|PASS|PUT ETag == DB etag|expected="662f0263699aa8e82daa318d4d856954" actual="662f0263699aa8e82daa318d4d856954"
+RESULT|C1.7|PASS|synctoken incremented by 1|expected=2 actual=2
+RESULT|C1.8|PASS|change row operation,synctoken (pre-increment)|expected=1,1 actual=1,1
+RESULT|C1.9|PASS|FN/UID/BDAY properties|expected=yes actual=yes
+RESULT|C1.10|PASS|TYPE=PREF -> preferred=1|expected=yes actual=yes
+RESULT|C1.11|PASS|BDAY property|expected=yes actual=yes
+RESULT|C1.12|PASS|multibyte NOTE truncated to 254-byte boundary|expected=252,84 actual=252,84
+RESULT|C1.13|PASS|exactly one outbox row|expected=1 actual=1
+RESULT|C1.14|PASS|outbox state=0 event_type=1|expected=yes actual=yes
+RESULT|C1.15-activity_stream|PASS|effect activity_stream under php|expected=yes actual=yes
+RESULT|C1.15-activity_mail|PASS|effect activity_mail under php|expected=yes actual=yes
+RESULT|C1.15-notification_push|PASS|effect notification_push under php|expected=yes actual=yes
+RESULT|C1.15-birthday_calendar|PASS|effect birthday_calendar under php|expected=yes actual=yes
+RESULT|C1.15-calendar_reminders|PASS|effect calendar_reminders under php|expected=yes actual=yes
+RESULT|C1.15-photo_cache|PASS|effect photo_cache under php|expected=yes actual=yes
+RESULT|C1.15-redis_cloud_id|PASS|effect redis_cloud_id under php|expected=yes actual=yes
+RESULT|C1.16|PASS|rust effects empty|expected=yes actual=yes
+RESULT|C1.17-id|PASS|card_row has id|expected=yes actual=yes
+RESULT|C1.17-uri|PASS|card_row has uri|expected=yes actual=yes
+RESULT|C1.17-lastmodified|PASS|card_row has lastmodified|expected=yes actual=yes
+RESULT|C1.17-etag|PASS|card_row has etag|expected=yes actual=yes
+RESULT|C1.17-size|PASS|card_row has size|expected=yes actual=yes
+RESULT|C1.17-uid|PASS|card_row has uid|expected=yes actual=yes
+RESULT|C1.18|PASS|card_row etag is quoted|expected=yes actual=yes
+RESULT|C1.19|PASS|card_row uid matches|expected=yes actual=yes
+
+===== 2. DISPATCH (create) =====
+seeded photo cache rows=1 activity_before=0
+RESULT|C2.1|PASS|outbox row state=2 after dispatch|expected=2 actual=2
+RESULT|C2.2|PASS|processed_at set|expected=t actual=t
+RESULT|C2.3|PASS|alice contact_birthdays calendar exists|expected=yes actual=yes
+RESULT|C2.4|PASS|birthday VEVENT count for UID|expected=1 actual=1
+RESULT|C2.5|PASS|VEVENT DTSTART from BDAY|expected=yes actual=yes
+RESULT|C2.6|PASS|VEVENT SUMMARY|expected=yes actual=yes
+RESULT|C2.7|PASS|VEVENT VALARM from default PT9H|expected=yes actual=yes
+RESULT|C2.8|PASS|calendarchanges op=1 pre-increment token|expected=1,1 actual=1,1
+RESULT|C2.9|PASS|birthday calendar synctoken == 2|expected=2 actual=2
+RESULT|C2.10|PASS|birthday reminders indexed|expected=yes actual=yes
+RESULT|C2.11|PASS|exactly one new activity row (card_add_self)|expected=1 actual=1
+RESULT|C2.12|PASS|activity subject card_add_self|expected=1 actual=1
+RESULT|C2.13|PASS|photo cache NOT removed on create (listener only handles update/delete)|expected=1 actual=1
+
+===== 3. UPDATE =====
+RESULT|C3.1|PASS|PUT update status|expected=204 actual=204
+RESULT|C3.2|PASS|ETag changed|expected=no actual=no
+RESULT|C3.3|PASS|PUT ETag == new DB etag|expected="ed3ec51435d6797870c420573d128d91" actual="ed3ec51435d6797870c420573d128d91"
+RESULT|C3.4|PASS|change row operation=2 pre-increment token|expected=2,2 actual=2,2
+RESULT|C3.5|PASS|new outbox row event_type=2 state=0|expected=2,0 actual=2,0
+photo cache before update dispatch=1
+RESULT|C3.6|PASS|VEVENT count still 1 (updated, not duplicated)|expected=1 actual=1
+RESULT|C3.7|PASS|VEVENT DTSTART updated to 1991-05-20|expected=yes actual=yes
+RESULT|C3.8|PASS|photo cache removed on update|expected=0 actual=0
+RESULT|C3.9|PASS|photo cache physical dir gone|expected=no actual=no
+RESULT|C3.10|PASS|update activity row exists|expected=1 actual=1
+
+===== 4. DELETE =====
+RESULT|C4.1|PASS|DELETE status|expected=204 actual=204
+RESULT|C4.2|PASS|change row operation=3|expected=yes actual=yes
+RESULT|C4.3|PASS|card gone|expected=0 actual=0
+RESULT|C4.4|PASS|properties purged|expected=0 actual=0
+RESULT|C4.5|PASS|delete outbox row event_type=3 state=0|expected=yes actual=yes
+RESULT|C4.6|PASS|delete row card_data is pre-delete (old BDAY)|expected=yes actual=yes
+RESULT|C4.7|PASS|delete row card_row is pre-delete ETag|expected=yes actual=yes
+RESULT|C4.8|PASS|birthday VEVENT removed after delete dispatch|expected=0 actual=0
+RESULT|C4.9|PASS|photo cache removed on delete|expected=0 actual=0
+RESULT|C4.10|PASS|delete activity row exists|expected=1 actual=1
+
+===== 5. IDEMPOTENCY =====
+RESULT|C5.1|PASS|outbox rows unchanged (no reprocessing)|expected=1:2:1789724316,2:2:1789724317,3:2:1789724318 actual=1:2:1789724316,2:2:1789724317,3:2:1789724318
+RESULT|C5.2|PASS|activity count unchanged|expected=82 actual=82
+RESULT|C5.3|PASS|calendarobjects count unchanged|expected=2 actual=2
+RESULT|C5.4|PASS|photo cache count unchanged|expected=1 actual=1
+
+===== 6a. CRASH SAFETY - SIGKILL mid-batch =====
+RESULT|C6a.1|PASS|seeded 40 outbox rows|expected=40 actual=40
+killed worker after 6 rows reached state=2
+RESULT|C6a.2|PASS|worker killed while holding claims (state=1 rows exist)|expected=yes actual=yes
+state=1 stale claims: 31; state=2 committed: 9
+RESULT|C6a.3|PASS|every row eventually reaches done (nothing lost)|expected=0 actual=0
+RESULT|C6a.4|PASS|no duplicate birthday VEVENTs|expected=0 actual=0
+RESULT|C6a.4b|PASS|one birthday VEVENT per crash card|expected=40 actual=40
+RESULT|C6a.5|PASS|exactly one activity row per crash card|expected=40 actual=40
+RESULT|C6a.6|PASS|all crash rows state=2|expected=40 actual=40
+
+===== 6b. POLLING FALLBACK (row inserted with SQL, no pg_notify) =====
+RESULT|C6b.1|PASS|non-notified row picked up by polling|expected=2 actual=2
+RESULT|C6b.2|PASS|its birthday effect ran|expected=1 actual=1
+
+===== 6c. POISON ROW ISOLATION =====
+RESULT|C6c.1|PASS|healthy row before poison reaches done|expected=2 actual=2
+RESULT|C6c.2|PASS|healthy row after poison reaches done|expected=2 actual=2
+RESULT|C6c.3|PASS|poison row dead-letters (state=3)|expected=3 actual=3
+RESULT|C6c.4|PASS|poison row retried max_attempts times|expected=3 actual=3
+RESULT|C6c.5|PASS|poison last_error recorded|expected=yes actual=yes
+RESULT|C6c.6|PASS|missing-addressbook row completes (skipped)|expected=2 actual=2
+RESULT|C6c.7|PASS|healthy birthday effects present|expected=2 actual=2
+
+===== 6d. SIDECAR REFUSES NATIVE WRITES WITHOUT THE OUTBOX TABLE =====
+scratch db created
+RESULT|C6d.1|PASS|scratch db has no outbox table|expected=0 actual=0
+event outbox table is missing or has an unexpected shape (error returned from database: relation 
+RESULT|C6d.2|PASS|PUT returns 501 without the outbox table|expected=501 actual=501
+RESULT|C6d.3|PASS|sidecar restored, native writes work again|expected=201 actual=201
+RESULT|C6d.4|PASS|scratch DB dropped|expected=0 actual=0
+
+===== 7. MISSING OPTIONAL APPS =====
+activity enabled=0 notifications enabled=0
+pending=0 in_flight=0 dead=1 oldest_pending=0s processed_this_run=2
+RESULT|C7.1|PASS|row still reaches done without activity/notifications|expected=2 actual=2
+RESULT|C7.2|PASS|birthday effect still ran|expected=1 actual=1
+RESULT|C7.3|PASS|no activity row written (app disabled)|expected=0 actual=0
+
+===== SUMMARY =====
+PASS=91 FAIL=0
+TOTAL|PASS=91|FAIL=0

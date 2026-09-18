@@ -94,7 +94,9 @@ already holds `custom_apps/`):
 cp -a nextcloud-dav/app/nextcloud_dav /path/to/nextcloud/custom_apps/
 # inside the Nextcloud container / install root:
 php occ app:enable nextcloud_dav
-php occ migrations:status nextcloud_dav   # optional: confirms Version1000... ran
+# Optional: confirm the migration ran. `occ migrations:status` is not present in
+# every supported release, so check the table itself (prefix-aware):
+#   psql -c '\d oc_dav_event_outbox'
 ```
 
 `occ app:enable` runs the migration, creating `<prefix>dav_event_outbox`. The

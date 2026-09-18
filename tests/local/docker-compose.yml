@@ -1,0 +1,67 @@
+# Disposable local Nextcloud 33.0.5 (the production version) + PostgreSQL 18,
+# used to validate the nextcloud-dav native write path end to end.
+#
+# Everything is isolated under the compose project name `ncdav-e2e`
+# (see setup.sh). Nothing here touches the production cluster.
+#
+# Ports are bound to 127.0.0.1 only:
+#   55433 -> postgres (the sidecar on the host connects here)
+#   18081 -> Nextcloud Apache (MKCOL / PHP fallback)
+#
+# The Nextcloud config is kept in a named volume and copied to the host with
+# `docker cp` by setup.sh, so the host-side sidecar reads a snapshot of the
+# container's config.php. `nextcloud_dav.config.php` (created by setup.sh) is
+# Nextcloud's supported extra-config mechanism and is also loaded by the
+# sidecar via --glob-config.
+services:
+  db:
+    image: postgres:18-alpine
+    container_name: ncdav-e2e-db
+    environment:
+      POSTGRES_DB: nextcloud
+      POSTGRES_USER: nextcloud
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD is required}
+    ports:
+      - "127.0.0.1:55433:5432"
+    volumes:
+      # postgres:18 stores data under /var/lib/postgresql/<major>/docker and
+      # refuses a mount at /var/lib/postgresql/data.
+      - db-data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U nextcloud -d nextcloud"]
+      interval: 2s
+      timeout: 3s
+      retries: 40
+    networks: [ncdav]
+
+  app:
+    image: nextcloud:33.0.5-apache
+    container_name: ncdav-e2e-nc
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      POSTGRES_HOST: db
+      POSTGRES_DB: nextcloud
+      POSTGRES_USER: nextcloud
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD is required}
+      NEXTCLOUD_ADMIN_USER: admin
+      NEXTCLOUD_ADMIN_PASSWORD: ${ADMIN_PASSWORD:?ADMIN_PASSWORD is required}
+      NEXTCLOUD_TRUSTED_DOMAINS: "localhost 127.0.0.1"
+      OVERWRITECLIURL: "http://127.0.0.1:18081"
+      OVERWRITEHOST: "127.0.0.1:18081"
+      OVERWRITEPROTOCOL: "http"
+      PHP_MEMORY_LIMIT: "1G"
+    ports:
+      - "127.0.0.1:18081:80"
+    volumes:
+      - nc-data:/var/www/html
+    networks: [ncdav]
+
+volumes:
+  db-data:
+  nc-data:
+
+networks:
+  ncdav:
+    name: ncdav-e2e
