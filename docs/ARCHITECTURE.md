@@ -1,9 +1,11 @@
 # nextcloud-dav — architecture
 
-A read-only CardDAV sidecar for Nextcloud that serves
+A CardDAV sidecar for Nextcloud that serves
 `/remote.php/dav/addressbooks/users/<user>/**` directly from the Nextcloud
-database, bypassing the PHP stack for steady-state sync traffic. Writes and
-anything else fall back to PHP through nginx.
+database, bypassing the PHP stack for steady-state sync traffic. Reads are
+served from PostgreSQL; card `PUT`/`DELETE` are handled natively too, with the
+PHP event side effects dispatched asynchronously from a transactional outbox.
+Anything else still falls back to PHP through nginx.
 
 This document is the as-built design. The reasoning that led here (measurements,
 rejected alternatives) is in the sibling `../dav-bench/` documents; the API
@@ -60,6 +62,7 @@ flowchart TB
     NGX[nextcloud-nginx<br/>:80]
     NC[nextcloud<br/>php-fpm :9000]
     DAV[nextcloud-dav<br/>127.0.0.1:7868]
+    DISP[nextcloud-dav-dispatcher<br/>occ dav:event-dispatch]
     CRON[nextcloud-cron]
     NP[notify-push<br/>127.0.0.1:7867]
     PVC[(PVC<br/>config/ + custom_apps/)]
@@ -67,18 +70,26 @@ flowchart TB
     NGX -->|everything else| NC
     NGX -->|/push/| NP
     DAV -.->|reads config.php + binary| PVC
+    DISP -.->|reads config.php + app| PVC
     NC -.->|reads/writes| PVC
   end
 
   NC --> DB[(PostgreSQL<br/>oc_*)]
-  DAV -->|read-only SELECTs| DB
+  DAV -->|reads + card writes| DB
+  DISP -->|outbox + listener events| DB
   NC --> REDIS[(Redis)]
+  DISP -->|sessions/locks via listeners| REDIS
   DAV -->|optional: reach PHP for fallback| NGX
 ```
 
 The binary lives at `custom_apps/nextcloud_dav/bin/nextcloud-dav`. It is built
 by `Dockerfile` (multi-stage `rust:alpine` → static musl) and copied onto the
 PVC; see §12 for the deploy procedure and its pitfalls.
+
+The **dispatcher** (`nextcloud_dav-dispatcher`) is a separate container because
+the sidecar's `alpine` image has no PHP: it runs the companion app's worker
+against the same PVC and database, and is the only thing that runs PHP
+event listeners on the write path (§7.2).
 
 ---
 
@@ -97,7 +108,7 @@ flowchart TD
 
   RS --> S{sidecar status}
   S -- 2xx --> DONE[return to client]
-  S -- 501 write / ?photo / ?export --> FB[error_page 501 → @nextcloud_dav_php]
+  S -- 501 non-native write / ?photo / ?export --> FB[error_page 501 → @nextcloud_dav_php]
   S -- 502 / 504 sidecar down --> FB
   S -- 4xx/5xx other --> DONE
   FB --> PHP
@@ -172,8 +183,14 @@ Why the gates exist, mirrored from `PublicKeyTokenMapper` and
 | `last_check` ≤ 300 s | `checkTokenCredentials()` re-validates against the real backend every 5 min; the sidecar delegates rather than skips it, so the revocation window does not widen. |
 
 A deliberate, configurable deviation: `record_bruteforce_attempts` defaults to
-**false**, so the shipped sidecar is strictly read-only and the PHP fallback is
-what records failures. The delay/block *checks* always run.
+**false**, so the sidecar never records a failed login and the PHP fallback is
+what does. The delay/block *checks* always run.
+
+The database role therefore needs `SELECT` on the read path plus
+`INSERT`/`UPDATE`/`DELETE` on `oc_cards`, `oc_addressbookchanges`,
+`oc_addressbooks` (synctoken only), `oc_cards_properties` and
+`oc_dav_event_outbox` for the write path. It still never touches `oc_activity`,
+the calendar tables or Redis — those are the PHP worker's job (§7).
 
 ```mermaid
 sequenceDiagram
@@ -296,12 +313,67 @@ A `507` is emitted when a page is truncated, matching Sabre. A malformed
 
 ---
 
-## 7. Write path — the hybrid boundary
+## 7. Write path — native, with a transactional outbox
 
-v1 is read-only. Writes are answered `501` on purpose and repelled back to PHP
-by nginx. Because both sides share the same database, the sidecar sees PHP's
-writes immediately; this is the property that makes the hybrid safe, and it is
-tested end-to-end (see `../dav-bench/CARDDAV_LIVE.md`).
+Card `PUT` and `DELETE` are native (`src/db.rs::put_card` / `delete_card`).
+Everything else — `MKCOL`, `PROPPATCH`, `MOVE`, `COPY`, `POST`, and any write
+to a collection — still answers `501` so nginx replays it to PHP (§7.2).
+
+### 7.1 The write itself
+
+One transaction mirrors `CardDavBackend::createCard` / `updateCard` /
+`deleteCard`: `oc_cards`, an `oc_addressbookchanges` row carrying the
+**pre-increment** sync token, the `oc_addressbooks.synctoken` bump, and
+`oc_cards_properties` (`INDEXED_PROPERTIES`, `TYPE=PREF` → `preferred=1`,
+254-byte truncation on a UTF-8 boundary). `If-Match`/`If-None-Match` are
+honoured (412), the size limit is `card_size_limit` (403), a duplicate UID on
+create is 409, and create/update/delete answer 201/204/404 like Sabre.
+Validation is `calcard` plus a server-owned validator (VERSION whitelist, UID
+required, FN once, property-name charset, BEGIN/END pairing, control characters,
+UTF-8 normalisation, and hard caps on size, logical line length, property count
+and parameters). Clean cards are stored **verbatim** — never re-encoded.
+
+### 7.2 The side effects: a transactional outbox
+
+A Rust process cannot run Nextcloud's PHP listeners, so the same transaction
+writes one **outbox** row (`oc_dav_event_outbox`) and a transactional
+`pg_notify`. The row is the frozen contract with the companion `nextcloud_dav`
+app, whose resident worker (`occ dav:event-dispatch`) drains it and dispatches
+the real `CardCreatedEvent`/`CardUpdatedEvent`/`CardDeletedEvent` through
+Nextcloud's normal dispatcher — so activity, the birthday calendar, the photo
+cache, push notifications and the Redis `cloud_id_` DEL all still happen,
+**exactly once**, off the request path.
+
+Atomicity is the point: the event and the card commit or roll back together, so
+a crash can neither lose the event nor deliver it twice. The `effects` column
+freezes which backend owns each effect id, so an effect can later move to a
+Rust handler without any possibility of double dispatch.
+
+```mermaid
+sequenceDiagram
+  participant C as Client
+  participant N as nginx
+  participant D as sidecar
+  participant DB as PostgreSQL
+  participant W as nextcloud_dav worker (PHP)
+  C->>N: PUT card.vcf (If-Match)
+  N->>D: proxy (buffered body)
+  D->>D: validate (calcard + rules), preconditions
+  D->>DB: BEGIN
+  D->>DB: oc_cards + oc_addressbookchanges + synctoken + oc_cards_properties
+  D->>DB: INSERT oc_dav_event_outbox + pg_notify
+  D->>DB: COMMIT
+  D-->>N: 201/204 + ETag
+  N-->>C: 201/204
+  DB-->>W: NOTIFY (or the 250 ms safety-net poll)
+  W->>DB: claim (FOR UPDATE SKIP LOCKED), read the row
+  W->>W: dispatchTyped(CardCreatedEvent)
+  W->>DB: effects + state=2, in one transaction
+```
+
+Each row is dispatched in its **own** transaction, so one poison row (a missing
+optional app's listener throwing, a malformed `card_row`) retries and
+dead-letters alone instead of taking healthy rows with it.
 
 ```mermaid
 sequenceDiagram
@@ -309,19 +381,12 @@ sequenceDiagram
   participant N as nginx
   participant D as sidecar
   participant PHP as php-fpm
-  participant DB as PostgreSQL
-  C->>N: PUT card.vcf (If-Match)
-  N->>D: proxy (buffered body)
-  D-->>N: 501 (by design)
-  Note over N: error_page 501 → @nextcloud_dav_php<br/>body replayed from buffer
-  N->>PHP: fastcgi PUT /remote.php/dav/... (full body)
-  PHP->>DB: INSERT/UPDATE oc_cards + oc_addressbookchanges + bump synctoken
-  PHP-->>N: 201/204 + ETag
-  N-->>C: 201/204
-  Note over D,DB: the next read from the sidecar sees the change
-  C->>D: REPORT sync-collection
-  D->>DB: changes query
-  D-->>C: the new/changed card
+  C->>N: MKCOL / PROPPATCH / MOVE / COPY / POST
+  N->>D: proxy
+  D-->>N: 501
+  Note over N: error_page 501 → @nextcloud_dav_php<br/>body replayed from the buffer
+  N->>PHP: fastcgi (full body)
+  PHP-->>C: result
 ```
 
 ---
@@ -419,7 +484,7 @@ flowchart TD
   up -- yes --> auth{authenticated?}
   auth -- no --> r401[401/429/503 from auth layer]
   auth -- yes --> method{supported method?}
-  method -- write/photo/export --> r501[501 → PHP fallback]
+  method -- non-native write / photo / export --> r501[501 → PHP fallback]
   method -- read --> target{address book exists<br/>and belongs to caller?}
   target -- no --> r404[404, not 403]
   target -- yes --> ok[serve from DB]
@@ -434,10 +499,14 @@ are rejected before any query, and every query is scoped to
 
 ## 11. What the sidecar deliberately does not do
 
-- Writes (`PUT`, `DELETE`, `MKCOL`, `PROPPATCH`, `MOVE`, `COPY`, `POST`) → 501.
-- `?photo` (appdata + GD) and `?export` (concatenated vCard) → 501.
+- `MKCOL`, `PROPPATCH`, `MOVE`, `COPY`, `POST`, and any write to a collection →
+  `501` (nginx replays them to PHP). Card `PUT`/`DELETE` *are* native.
+- Dispatch the PHP event listeners itself: it queues them (§7.2).
+- `?photo` (appdata + GD) and `?export` (concatenated vCard) → `501`.
 - Shared / group / **system** address books, and the app-generated
   `contactsinteraction` book → served by PHP (and the home listing always is).
+- jCard (`[`-prefixed) bodies → `415` rather than being converted to vCard, so
+  the stored bytes stay byte-identical to what was uploaded.
 - vCard 3↔4 negotiation for `address-data`, conditional GET, `allprop`
   completeness → not implemented.
 - Brute-force attempt recording → off by default.

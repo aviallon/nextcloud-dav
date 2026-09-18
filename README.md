@@ -1,17 +1,21 @@
 # nextcloud-dav
 
-A read-only **CardDAV sidecar** for Nextcloud. It serves
+A **CardDAV sidecar** for Nextcloud. It serves
 `/remote.php/dav/addressbooks/users/<user>/...` straight from the Nextcloud
-database, bypassing the PHP stack for the steady-state sync traffic.
+database, bypassing the PHP stack for the steady-state sync traffic — reads
+*and* card writes.
 
-It is the v1 implementation of `../dav-bench/CARDDAV_DESIGN.md`: personal
-address books, read-only, with the app-password fast path, the PHP fallback and
-brute-force throttling parity.
+It implements `../dav-bench/CARDDAV_DESIGN.md`: personal address books, with the
+app-password fast path, the PHP fallback and brute-force throttling parity.
+Reads are served from PostgreSQL. Card `PUT`/`DELETE` are native, and the PHP
+event side effects they trigger (activity, birthday calendar, photo cache, push)
+are dispatched asynchronously from a transactional outbox by the companion
+[`nextcloud_dav` app](app/nextcloud_dav).
 
-> **Status: v1 (read-only).** `PUT`, `DELETE`, `MKCOL`, `PROPPATCH`, `MOVE`,
-> `COPY` and `POST` answer `501 Not Implemented` on purpose so nginx can hand
-> them back to PHP. Shared/group/system address books are not served and must
-> stay routed to PHP.
+> **Status: reads + card writes.** `MKCOL`, `PROPPATCH`, `MOVE`, `COPY`, `POST`,
+> `?photo`/`?export`, and any write to a collection answer `501 Not Implemented`
+> on purpose so nginx can hand them back to PHP. Shared/group/system address
+> books are not served yet and must stay routed to PHP.
 
 See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the as-built design:
 deployment topology, the nginx split and its failure mode, the app-password
@@ -27,6 +31,9 @@ fast path, the sync-token scheme, the data model, and the operational traps.
 | `REPORT addressbook-query` | RFC 6352 §10.5 filters evaluated in Rust, `limit` honoured |
 | `REPORT sync-collection` | exact `oc_addressbooks.synctoken` / `http://sabre.io/ns/sync/<n>` scheme, `init_<lastID>_<tok>` paging, `507` on truncation |
 | `OPTIONS` | `DAV: 1, 2, 3, addressbook` + `Allow` |
+| `PUT` a card | create/update, `If-Match`/`If-None-Match`, `409` on a duplicate UID, `403` past `card_size_limit`, quoted `ETag` |
+| `DELETE` a card | `204`, change logged, search columns purged |
+| Event outbox | one `oc_dav_event_outbox` row + `pg_notify` in the card transaction; the companion app's worker dispatches the real `Card*Event`s |
 | Auth fast path | `hex(sha512(app_password + secret))` against `oc_authtoken` |
 | Auth fallback | credentialed `PROPFIND /remote.php/dav/` Depth 0 → `current-user-principal` |
 | Brute force | `sleepDelayOrThrowOnMax` parity (`0.1·2^n` s, 25 s cap, 12 h/30 min hard block) |
