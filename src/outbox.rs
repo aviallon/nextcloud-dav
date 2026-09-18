@@ -44,6 +44,44 @@ pub const KNOWN_EFFECTS: &[&str] = &[
     "redis_cloud_id",
 ];
 
+/// The effects that a given operation actually triggers.
+///
+/// Not every listener is registered for every event: `ClearPhotoCacheListener`
+/// handles update and delete only, and `CloudIdManager` handles update only
+/// (`apps/dav/lib/AppInfo/Application.php`, `lib/private/Federation/CloudIdManager.php`).
+/// Recording only the applicable effects keeps the ownership map honest, so a
+/// later selective dispatcher can never be asked to run an effect that the
+/// event would not have produced.
+pub fn effects_for(event_type: i16) -> &'static [&'static str] {
+    match event_type {
+        EVENT_CREATE => &[
+            "activity_stream",
+            "activity_mail",
+            "notification_push",
+            "birthday_calendar",
+            "calendar_reminders",
+        ],
+        EVENT_UPDATE => &[
+            "activity_stream",
+            "activity_mail",
+            "notification_push",
+            "birthday_calendar",
+            "calendar_reminders",
+            "photo_cache",
+            "redis_cloud_id",
+        ],
+        EVENT_DELETE => &[
+            "activity_stream",
+            "activity_mail",
+            "notification_push",
+            "birthday_calendar",
+            "calendar_reminders",
+            "photo_cache",
+        ],
+        _ => &[],
+    }
+}
+
 /// The table columns the producer relies on. Used by the startup probe.
 pub const OUTBOX_COLUMNS: &[&str] = &[
     "seq",
@@ -97,12 +135,17 @@ impl EffectRegistry {
         Self { owners }
     }
 
-    /// The `effects` JSON frozen into the outbox row:
-    /// `{"php":[...],"rust":[...]}`.
-    pub fn effects_json(&self) -> String {
+    /// The `effects` JSON frozen into an outbox row for `event_type`:
+    /// `{"php":[...],"rust":[...]}`, restricted to the effects that event
+    /// actually triggers ([`effects_for`]).
+    pub fn effects_json_for(&self, event_type: i16) -> String {
+        let applicable = effects_for(event_type);
         let mut php: Vec<&str> = Vec::new();
         let mut rust: Vec<&str> = Vec::new();
         for (effect, backend) in &self.owners {
+            if !applicable.contains(&effect.as_str()) {
+                continue;
+            }
             if backend == "rust" {
                 rust.push(effect);
             } else {
@@ -163,10 +206,37 @@ mod tests {
     fn phase_one_registry_is_all_php() {
         let registry = EffectRegistry::default();
         assert_eq!(
-            registry.effects_json(),
+            registry.effects_json_for(EVENT_CREATE),
+            r#"{"php":["activity_stream","activity_mail","notification_push","birthday_calendar","calendar_reminders"],"rust":[]}"#
+        );
+        assert_eq!(
+            registry.effects_json_for(EVENT_UPDATE),
             r#"{"php":["activity_stream","activity_mail","notification_push","birthday_calendar","calendar_reminders","photo_cache","redis_cloud_id"],"rust":[]}"#
         );
+        assert_eq!(
+            registry.effects_json_for(EVENT_DELETE),
+            r#"{"php":["activity_stream","activity_mail","notification_push","birthday_calendar","calendar_reminders","photo_cache"],"rust":[]}"#
+        );
         assert!(registry.rust_effects().is_empty());
+    }
+
+    /// The per-event sets must match which listeners Nextcloud actually
+    /// registers, or a later selective dispatcher would run an effect the event
+    /// never had.
+    #[test]
+    fn effect_sets_match_the_registered_listeners() {
+        assert!(!effects_for(EVENT_CREATE).contains(&"photo_cache"));
+        assert!(!effects_for(EVENT_CREATE).contains(&"redis_cloud_id"));
+        assert!(effects_for(EVENT_UPDATE).contains(&"photo_cache"));
+        assert!(effects_for(EVENT_UPDATE).contains(&"redis_cloud_id"));
+        assert!(effects_for(EVENT_DELETE).contains(&"photo_cache"));
+        assert!(!effects_for(EVENT_DELETE).contains(&"redis_cloud_id"));
+        // Every applicable effect must be a known one.
+        for event_type in [EVENT_CREATE, EVENT_UPDATE, EVENT_DELETE] {
+            for effect in effects_for(event_type) {
+                assert!(KNOWN_EFFECTS.contains(effect), "unknown effect {effect}");
+            }
+        }
     }
 
     #[test]
@@ -178,11 +248,12 @@ mod tests {
         config.handlers.insert("bogus".into(), "rust".into());
         let registry = EffectRegistry::from_config(&config);
         assert_eq!(registry.rust_effects(), vec!["redis_cloud_id"]);
-        let parsed: Value = serde_json::from_str(&registry.effects_json()).unwrap();
+        // redis_cloud_id only applies to an update, so use that event here.
+        let parsed: Value = serde_json::from_str(&registry.effects_json_for(EVENT_UPDATE)).unwrap();
         let php = parsed["php"].as_array().unwrap();
         let rust = parsed["rust"].as_array().unwrap();
         assert_eq!(rust.len(), 1);
-        assert_eq!(php.len(), KNOWN_EFFECTS.len() - 1);
+        assert_eq!(php.len(), effects_for(EVENT_UPDATE).len() - 1);
         assert!(!php.iter().any(|v| v == "redis_cloud_id"));
     }
 }

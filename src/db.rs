@@ -717,7 +717,7 @@ impl Db {
         now: i64,
     ) -> Result<()> {
         let card_row = crate::outbox::card_row_json(card, uid).to_string();
-        let effects = registry.effects_json();
+        let effects = registry.effects_json_for(event_type);
         let sql = self.render(&format!(
             "INSERT INTO {}dav_event_outbox \
              (created_at, event_type, addressbookid, card_uri, card_row, card_data, effects) \

@@ -249,7 +249,10 @@ async fn create_card_201_etag_rows_properties_and_outbox() {
     assert_eq!(card_data, body.as_bytes());
     assert_eq!(
         effects,
-        r#"{"php":["activity_stream","activity_mail","notification_push","birthday_calendar","calendar_reminders","photo_cache","redis_cloud_id"],"rust":[]}"#
+        // A create only triggers the listeners registered for
+        // CardCreatedEvent: photo_cache is update/delete-only and
+        // redis_cloud_id is update-only.
+        r#"{"php":["activity_stream","activity_mail","notification_push","birthday_calendar","calendar_reminders"],"rust":[]}"#
     );
 }
 

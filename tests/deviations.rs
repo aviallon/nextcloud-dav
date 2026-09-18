@@ -385,11 +385,17 @@ async fn assert_deviation(id: &str, f: &Fixture) -> Result<(), String> {
         }
         "effect-ownership-registry" => {
             let registry = EffectRegistry::default();
+            let create = registry.effects_json_for(1);
             ensure!(
-                registry.effects_json()
+                create
+                    == r#"{"php":["activity_stream","activity_mail","notification_push","birthday_calendar","calendar_reminders"],"rust":[]}"#,
+                "phase-1 create registry differs: {create}"
+            );
+            let update = registry.effects_json_for(2);
+            ensure!(
+                update
                     == r#"{"php":["activity_stream","activity_mail","notification_push","birthday_calendar","calendar_reminders","photo_cache","redis_cloud_id"],"rust":[]}"#,
-                "phase-1 registry differs: {}",
-                registry.effects_json()
+                "phase-1 update registry differs: {update}"
             );
             ensure!(
                 registry.rust_effects().is_empty(),
