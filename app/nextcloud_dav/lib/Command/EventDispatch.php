@@ -77,7 +77,6 @@ class EventDispatch extends Command {
 		private readonly IConfig $config,
 		private readonly IDBConnection $db,
 		private readonly IAppManager $appManager,
-		private readonly ISetupManager $setupManager,
 		private readonly ITempManager $tempManager,
 		private readonly LoggerInterface $logger,
 	) {
@@ -225,7 +224,7 @@ class EventDispatch extends Command {
 			}
 
 			// Per-batch hygiene, cf. core/Command/Background/JobWorker.php.
-			$this->setupManager->tearDown();
+			$this->tearDownFilesystem();
 			$this->tempManager->clean();
 			gc_collect_cycles();
 
@@ -436,6 +435,32 @@ class EventDispatch extends Command {
 		}
 
 		return true;
+	}
+
+	/**
+	 * Per-batch filesystem teardown.
+	 *
+	 * The setup manager only became public as `OCP\Files\ISetupManager` in a
+	 * later release; on Nextcloud 33 only the private `OC\Files\SetupManager`
+	 * exists. It is therefore resolved by name at runtime and never type-hinted
+	 * in the constructor: a constructor parameter whose class does not exist
+	 * makes the DI container fail to build this command, which breaks **every**
+	 * `occ` invocation, not just this one.
+	 */
+	private function tearDownFilesystem(): void {
+		$class = class_exists(ISetupManager::class)
+			? ISetupManager::class
+			: \OC\Files\SetupManager::class;
+
+		try {
+			$manager = Server::get($class);
+			if (method_exists($manager, 'tearDown')) {
+				$manager->tearDown();
+			}
+		} catch (Throwable $e) {
+			// Best-effort hygiene between batches; never fail a batch over it.
+			$this->logger->debug('nextcloud_dav: filesystem teardown unavailable: ' . $e->getMessage());
+		}
 	}
 
 	private function installSignalHandlers(): void {
