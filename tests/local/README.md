@@ -35,7 +35,8 @@ toolchain (the sidecar is built with
 | `e2e.sh` | the acceptance checks; writes `state/evidence/e2e.txt` |
 | `files_parity.sh` | seeds a large `files/ParityBig` directory and diffs the sidecar's files PROPFIND against PHP's (canonicalised XML); writes `state/evidence/files-parity.txt` |
 | `discovery_parity.sh` | diffs the sidecar's DAV-root and own-principal discovery PROPFIND against PHP's (canonicalised XML), for the explicit property set and allprop; writes `state/evidence/discovery-parity.txt` |
-| `canonicalize_propfind.py` | canonicaliser used by `files_parity.sh` |
+| `caldav_parity.sh` | diffs the sidecar's CalDAV calendar-home (`Depth 0`/`1`) and per-calendar (`Depth 0`) PROPFIND, plus the `sync-collection` and `calendar-multiget` REPORTs, against PHP's (canonicalised XML), asserting sidecar attribution per case, a PHP create/modify/delete incremental-sync round trip, and 501 delegation for objects/trashbin/GET/`calendar-query`; writes `state/evidence/caldav-parity.txt` |
+| `canonicalize_propfind.py` | canonicaliser used by `files_parity.sh`, `discovery_parity.sh` and `caldav_parity.sh` |
 | `teardown.sh` | `compose down -v` + remove `state/` |
 | `state/` (git-ignored) | generated secrets, copied `config.php`, sidecar/worker logs, evidence |
 

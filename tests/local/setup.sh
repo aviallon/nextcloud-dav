@@ -274,6 +274,13 @@ q "SELECT count(*) FROM oc_mounts WHERE user_id='alice'" | sed 's/^/oc_mounts ro
 echo "==> copying container config.php to host"
 docker cp "$NC:/var/www/html/config/config.php" "$CONFIG_DIR/config.php"
 chmod 600 "$CONFIG_DIR/config.php"
+# The sidecar resolves the `dav` app's l10n files from the server root derived
+# from config_path (`<root>/apps/dav/l10n`). Copy the real tree so the
+# localized calendar displaynames can be reproduced on the host.
+echo "==> copying dav l10n tree to host"
+rm -rf "$STATE_DIR/apps/dav/l10n"
+mkdir -p "$STATE_DIR/apps/dav"
+docker cp "$NC:/var/www/html/apps/dav/l10n" "$STATE_DIR/apps/dav/" >/dev/null
 printf '%s\n' "$DISPATCH_CONFIG" >"$CONFIG_DIR/nextcloud_dav.config.php"
 printf '<?php\n$CONFIG = ["dbhost" => "127.0.0.1", "dbport" => %s];\n' "$PG_PORT" \
 	>"$CONFIG_DIR/sidecar-db.config.php"

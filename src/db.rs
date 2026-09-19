@@ -15,7 +15,10 @@
 //! `CASE WHEN ... THEN '1' ELSE '0' END`.
 
 use crate::error::{Error, Result};
-use crate::model::{AddressBook, AuthToken, Card, CardIdUri, ChangeRow, FileCacheRow, ShareRow, VisibleBook};
+use crate::model::{
+    AddressBook, AuthToken, Calendar, CalendarChange, CalendarObject, Card, CardIdUri, ChangeRow,
+    FileCacheRow, ShareRow, VisibleBook, VisibleCalendar,
+};
 use crate::vcard;
 use md5::{Digest, Md5};
 use serde_json::Value;
@@ -293,6 +296,370 @@ impl Db {
     }
 
     // ------------------------------------------------------------------
+    // Calendars (`CalDavBackend::getCalendarsForUser`)
+    // ------------------------------------------------------------------
+
+    /// Every calendar the caller can see: owned calendars (in `calendarorder`)
+    /// plus the de-duplicated `oc_dav_shares` calendars, exactly like
+    /// `CalDavBackend::getCalendarsForUser()`.
+    ///
+    /// The shared branch is the CalDAV twin of [`Db::visible_books`]: PHP
+    /// excludes the tombstone by `resourceid` (not `s.id`), which this mirrors.
+    pub async fn visible_calendars(
+        &self,
+        principal: &str,
+        group_principals: &[String],
+    ) -> Result<Vec<VisibleCalendar>> {
+        let owned_sql = self.render(&format!(
+            "SELECT id, uri, displayname, principaluri, description, timezone, \
+                    calendarorder, calendarcolor, components, transparent, synctoken, deleted_at \
+             FROM {}calendars WHERE principaluri = ? ORDER BY calendarorder ASC",
+            self.prefix
+        ));
+        let rows = sqlx::query(sqlx::AssertSqlSafe(owned_sql))
+            .bind(principal)
+            .fetch_all(&self.pool)
+            .await?;
+        let mut calendars: Vec<VisibleCalendar> = rows
+            .iter()
+            .map(calendar_from_row)
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .map(VisibleCalendar::owned)
+            .collect();
+        let mut index: std::collections::HashMap<i64, usize> = calendars
+            .iter()
+            .enumerate()
+            .map(|(position, calendar)| (calendar.calendar.id, position))
+            .collect();
+
+        // The principals are bound twice (share rows + tombstone subquery).
+        let mut principals: Vec<String> = Vec::with_capacity(group_principals.len() + 1);
+        principals.push(principal.to_string());
+        principals.extend(group_principals.iter().cloned());
+        let access_ph = self.ph(1);
+        let mut in_list = String::new();
+        let mut tombstone_list = String::new();
+        for i in 0..principals.len() {
+            if i > 0 {
+                in_list.push_str(", ");
+                tombstone_list.push_str(", ");
+            }
+            in_list.push_str(&self.ph(i + 2));
+            tombstone_list.push_str(&self.ph(principals.len() + i + 2));
+        }
+        // PHP has no ORDER BY; `a.id` makes the output deterministic (declared
+        // as `calendars-shared-listing-order`).
+        let sql = format!(
+            "SELECT a.id, a.uri, a.displayname, a.principaluri, a.description, a.timezone, \
+                    a.calendarorder, a.calendarcolor, a.components, a.transparent, a.synctoken, \
+                    a.deleted_at, s.access, s.principaluri AS share_principal \
+             FROM {p}dav_shares s JOIN {p}calendars a ON s.resourceid = a.id \
+             WHERE s.type = 'calendar' AND s.principaluri IN ({in_list}) \
+               AND NOT EXISTS (SELECT 1 FROM {p}dav_shares d \
+                   WHERE d.access = {access_ph} AND d.resourceid = s.resourceid \
+                     AND d.principaluri IN ({tombstone_list})) \
+             ORDER BY a.id",
+            p = self.prefix,
+        );
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql)).bind(ACCESS_UNSHARED);
+        for principal in &principals {
+            query = query.bind(principal.as_str());
+        }
+        for principal in &principals {
+            query = query.bind(principal.as_str());
+        }
+        let rows = query.fetch_all(&self.pool).await?;
+
+        for row in &rows {
+            let owner_principal = row
+                .try_get::<Option<String>, _>("principaluri")?
+                .unwrap_or_default();
+            // The owner also reaching their own calendar through a group share
+            // is dropped: the owned entry wins.
+            if owner_principal == principal {
+                continue;
+            }
+            let id: i64 = row.try_get("id")?;
+            let access: i16 = row.try_get("access")?;
+            let read_only = access == ACCESS_READ;
+            if let Some(&position) = index.get(&id) {
+                if read_only || !calendars[position].read_only {
+                    continue;
+                }
+            }
+
+            let uri = row.try_get::<Option<String>, _>("uri")?.unwrap_or_default();
+            let displayname: Option<String> = row.try_get("displayname")?;
+            let owner_name = owner_principal
+                .rsplit('/')
+                .next()
+                .unwrap_or_default()
+                .to_string();
+            let owner_displayname = self
+                .user_display_name(&owner_name)
+                .await?
+                .unwrap_or_else(|| owner_name.clone());
+            let visible = VisibleCalendar {
+                calendar: Calendar {
+                    id,
+                    uri: uri.clone(),
+                    displayname: displayname.clone(),
+                    principaluri: owner_principal.clone(),
+                    description: row.try_get("description")?,
+                    timezone: row.try_get("timezone")?,
+                    calendarorder: row.try_get("calendarorder")?,
+                    calendarcolor: row.try_get("calendarcolor")?,
+                    components: row.try_get("components")?,
+                    transparent: row.try_get::<i16, _>("transparent")? != 0,
+                    synctoken: row.try_get("synctoken")?,
+                    deleted_at: row.try_get("deleted_at")?,
+                },
+                wire_uri: format!("{uri}_shared_by_{owner_name}"),
+                wire_displayname: Some(format!(
+                    "{} ({owner_displayname})",
+                    displayname.clone().unwrap_or_default()
+                )),
+                owner_displayname: owner_displayname.clone(),
+                share_principal: row
+                    .try_get::<Option<String>, _>("share_principal")
+                    .ok()
+                    .flatten(),
+                owner_principal: Some(owner_principal),
+                read_only,
+                // A shared calendar's transparency is hard-coded transparent.
+                transparent: true,
+            };
+            match index.get(&id) {
+                Some(&position) => calendars[position] = visible,
+                None => {
+                    index.insert(id, calendars.len());
+                    calendars.push(visible);
+                }
+            }
+        }
+        Ok(calendars)
+    }
+
+    /// The visible calendar served under `wire_uri`, or `None`.
+    pub async fn visible_calendar_by_uri(
+        &self,
+        principal: &str,
+        group_principals: &[String],
+        wire_uri: &str,
+    ) -> Result<Option<VisibleCalendar>> {
+        Ok(self
+            .visible_calendars(principal, group_principals)
+            .await?
+            .into_iter()
+            .find(|calendar| calendar.wire_uri == wire_uri))
+    }
+
+    /// True when the caller can see a calendar in the trashbin (owned or
+    /// shared). PHP's listing returns those with a `deleted-calendar`
+    /// resourcetype, which the subset model does not reproduce, so the caller
+    /// delegates the whole listing.
+    pub async fn has_trashed_calendars(
+        &self,
+        principal: &str,
+        group_principals: &[String],
+    ) -> Result<bool> {
+        let mut principals: Vec<String> = Vec::with_capacity(group_principals.len() + 1);
+        principals.push(principal.to_string());
+        principals.extend(group_principals.iter().cloned());
+        let mut in_list = String::new();
+        for i in 0..principals.len() {
+            if i > 0 {
+                in_list.push_str(", ");
+            }
+            in_list.push_str(&self.ph(i + 2));
+        }
+        let sql = format!(
+            "SELECT 1 FROM {p}calendars c WHERE c.deleted_at IS NOT NULL AND (\
+                 c.principaluri = {p1} OR c.id IN (\
+                     SELECT s.resourceid FROM {p}dav_shares s \
+                     WHERE s.type = 'calendar' AND s.principaluri IN ({in_list}))) \
+             LIMIT 1",
+            p = self.prefix,
+            p1 = self.ph(1),
+        );
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql)).bind(principal);
+        for principal in &principals {
+            query = query.bind(principal.as_str());
+        }
+        Ok(query.fetch_optional(&self.pool).await?.is_some())
+    }
+
+    /// True when the principal has a calendar subscription
+    /// (`oc_calendarsubscriptions`), which is a child the sidecar does not
+    /// model. Missing table (older instance) is `false`.
+    pub async fn has_calendar_subscriptions(&self, principal: &str) -> Result<bool> {
+        if !self.table_exists("calendarsubscriptions").await? {
+            return Ok(false);
+        }
+        let sql = self.render(&format!(
+            "SELECT 1 FROM {}calendarsubscriptions WHERE principaluri = ? LIMIT 1",
+            self.prefix
+        ));
+        Ok(sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(principal)
+            .fetch_optional(&self.pool)
+            .await?
+            .is_some())
+    }
+
+    /// True when the principal has an accepted federated calendar
+    /// (`oc_calendars_federated`), which is a child the sidecar does not model.
+    /// Missing table is `false`; the `state` column only exists on 36-dev, so
+    /// the query deliberately omits it (any row delegates, which is safe).
+    pub async fn has_federated_calendars(&self, principal: &str) -> Result<bool> {
+        if !self.table_exists("calendars_federated").await? {
+            return Ok(false);
+        }
+        let sql = self.render(&format!(
+            "SELECT 1 FROM {}calendars_federated WHERE principaluri = ? LIMIT 1",
+            self.prefix
+        ));
+        Ok(sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(principal)
+            .fetch_optional(&self.pool)
+            .await?
+            .is_some())
+    }
+
+    /// True when the principal owns at least one calendar that has an outgoing
+    /// share (`oc_dav_shares`, `type='calendar'`, not unshared). `{oc}invite`
+    /// is non-empty for those, so the request is delegated.
+    pub async fn calendar_has_outgoing_shares(&self, principal: &str) -> Result<bool> {
+        let sql = self.render(&format!(
+            "SELECT 1 FROM {p}dav_shares s JOIN {p}calendars c ON c.id = s.resourceid \
+             WHERE c.principaluri = ? AND s.type = 'calendar' AND s.access <> ? \
+             LIMIT 1",
+            p = self.prefix
+        ));
+        Ok(sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(principal)
+            .bind(ACCESS_UNSHARED)
+            .fetch_optional(&self.pool)
+            .await?
+            .is_some())
+    }
+
+    /// True when the calendar has an outgoing share (`oc_dav_shares`,
+    /// `type='calendar'`, not unshared). `{oc}invite` is non-empty for those, so
+    /// the request is delegated.
+    pub async fn calendar_id_has_outgoing_shares(&self, calendar_id: i64) -> Result<bool> {
+        let sql = self.render(&format!(
+            "SELECT 1 FROM {p}dav_shares WHERE resourceid = ? AND type = 'calendar' AND access <> ? LIMIT 1",
+            p = self.prefix
+        ));
+        Ok(sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(calendar_id)
+            .bind(ACCESS_UNSHARED)
+            .fetch_optional(&self.pool)
+            .await?
+            .is_some())
+    }
+
+    /// The user's `oc_properties` rows for a set of paths, keyed by path then
+    /// property name. Mirrors `CustomPropertiesBackend::getUserProperties()`
+    /// (the `userid` filter) with the paths precomputed by the caller.
+    pub async fn user_properties_for_paths(
+        &self,
+        userid: &str,
+        paths: &[String],
+    ) -> Result<HashMap<String, HashMap<String, String>>> {
+        self.properties_for_paths(Some(userid), paths, None).await
+    }
+
+    /// The *published* `oc_properties` rows for a set of paths, without the
+    /// `userid` filter (`CustomPropertiesBackend::getPublishedProperties()`),
+    /// restricted to the given property names.
+    pub async fn published_properties_for_paths(
+        &self,
+        paths: &[String],
+        names: &[&str],
+    ) -> Result<HashMap<String, HashMap<String, String>>> {
+        self.properties_for_paths(None, paths, Some(names)).await
+    }
+
+    async fn properties_for_paths(
+        &self,
+        userid: Option<&str>,
+        paths: &[String],
+        names: Option<&[&str]>,
+    ) -> Result<HashMap<String, HashMap<String, String>>> {
+        let mut result: HashMap<String, HashMap<String, String>> = HashMap::new();
+        if paths.is_empty() {
+            return Ok(result);
+        }
+        for chunk in paths.chunks(200) {
+            let mut sql = format!(
+                "SELECT propertypath, propertyname, propertyvalue FROM {p}properties WHERE propertypath IN (",
+                p = self.prefix
+            );
+            let mut index = 1usize;
+            for i in 0..chunk.len() {
+                if i > 0 {
+                    sql.push_str(", ");
+                }
+                sql.push_str(&self.ph(index));
+                index += 1;
+            }
+            sql.push(')');
+            if userid.is_some() {
+                sql.push_str(&format!(" AND userid = {}", self.ph(index)));
+                index += 1;
+            }
+            if let Some(names) = names {
+                if !names.is_empty() {
+                    sql.push_str(" AND propertyname IN (");
+                    for i in 0..names.len() {
+                        if i > 0 {
+                            sql.push_str(", ");
+                        }
+                        sql.push_str(&self.ph(index));
+                        index += 1;
+                    }
+                    sql.push(')');
+                }
+            }
+            let mut query = sqlx::query(sqlx::AssertSqlSafe(sql));
+            for path in chunk {
+                query = query.bind(path.as_str());
+            }
+            if let Some(userid) = userid {
+                query = query.bind(userid);
+            }
+            if let Some(names) = names {
+                for name in names {
+                    query = query.bind(*name);
+                }
+            }
+            let rows = query.fetch_all(&self.pool).await?;
+            for row in &rows {
+                let path: String = row.try_get("propertypath")?;
+                let name: String = row.try_get("propertyname")?;
+                let value: Option<String> = row.try_get("propertyvalue")?;
+                if let Some(value) = value {
+                    result.entry(path).or_default().insert(name, value);
+                }
+            }
+        }
+        Ok(result)
+    }
+
+    /// `CustomPropertiesBackend::formatPath()`: a path longer than 250 bytes is
+    /// stored under its sha1 hex digest.
+    pub fn property_path(path: &str) -> String {
+        if path.len() > 250 {
+            sha1_hex(path.as_bytes())
+        } else {
+            path.to_string()
+        }
+    }
+
+    // ------------------------------------------------------------------
     // Cards
     // ------------------------------------------------------------------
 
@@ -412,6 +779,167 @@ impl Db {
                 })
             })
             .collect()
+    }
+
+    // ------------------------------------------------------------------
+    // Calendar objects (CalDAV REPORTs)
+    // ------------------------------------------------------------------
+
+    /// The live object URIs of a calendar, for a `sync-collection` initial
+    /// sync (`CalDavBackend::getChangesForCalendar()` initial branch).
+    ///
+    /// `limit` is `Some` only when PHP would apply one: a non-empty,
+    /// non-numeric token carries a limit through the backend's
+    /// `setMaxResults()`. An empty token with a limit is rejected before this
+    /// point (`UnsupportedLimitOnInitialSyncException`).
+    pub async fn calendar_objects_for_sync(
+        &self,
+        calendar_id: i64,
+        limit: Option<i64>,
+    ) -> Result<Vec<CardIdUri>> {
+        let mut sql = format!(
+            "SELECT id, uri FROM {}calendarobjects \
+             WHERE calendarid = ? AND calendartype = 0 AND deleted_at IS NULL \
+             ORDER BY id",
+            self.prefix
+        );
+        if limit.is_some() {
+            sql.push_str(&format!(" LIMIT {}", self.ph(2)));
+        }
+        let sql = self.render(&sql);
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql)).bind(calendar_id);
+        if let Some(limit) = limit {
+            query = query.bind(limit);
+        }
+        let rows = query.fetch_all(&self.pool).await?;
+        rows.iter()
+            .map(|row| {
+                Ok(CardIdUri {
+                    id: row.try_get("id")?,
+                    uri: row.try_get::<Option<String>, _>("uri")?.unwrap_or_default(),
+                })
+            })
+            .collect()
+    }
+
+    /// The `MAX(operation)`-per-URI change set for an incremental
+    /// `sync-collection` (`CalDavBackend::getChangesForCalendar()`).
+    ///
+    /// `MAX(operation)` means a URI touched add→delete inside one token window
+    /// is reported as a delete (3 > 1). The order is not semantically
+    /// meaningful; `ORDER BY uri` makes the truncated subset deterministic.
+    pub async fn calendar_changes(
+        &self,
+        calendar_id: i64,
+        from_token: i64,
+        current_token: i64,
+        limit: Option<i64>,
+    ) -> Result<Vec<CalendarChange>> {
+        let mut sql = format!(
+            "SELECT uri, MAX(operation) AS operation FROM {}calendarchanges \
+             WHERE calendarid = ? AND calendartype = 0 AND synctoken >= ? AND synctoken < ? \
+             GROUP BY uri ORDER BY uri",
+            self.prefix
+        );
+        if limit.is_some() {
+            sql.push_str(&format!(" LIMIT {}", self.ph(4)));
+        }
+        let sql = self.render(&sql);
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(calendar_id)
+            .bind(from_token)
+            .bind(current_token);
+        if let Some(limit) = limit {
+            query = query.bind(limit);
+        }
+        let rows = query.fetch_all(&self.pool).await?;
+        rows.iter()
+            .map(|row| {
+                Ok(CalendarChange {
+                    uri: row.try_get::<Option<String>, _>("uri")?.unwrap_or_default(),
+                    operation: row.try_get("operation")?,
+                })
+            })
+            .collect()
+    }
+
+    /// The incremental change set for a token PHP's `is_numeric()` accepted but
+    /// that is not an exact integer (`1.5`, `1e3`, whitespace-padded, ...).
+    ///
+    /// PHP binds the raw string against the `int` column, so PostgreSQL's input
+    /// function decides: `' 7'` is accepted as `7`, while `'1.5'` raises
+    /// `invalid input syntax for type integer`. The explicit
+    /// `CAST(CAST(? AS text) AS integer)` keeps the same parsing (and the same
+    /// error) while letting the parameter be bound as text.
+    pub async fn calendar_changes_raw(
+        &self,
+        calendar_id: i64,
+        from_token: &str,
+        current_token: i64,
+        limit: Option<i64>,
+    ) -> Result<Vec<CalendarChange>> {
+        let mut sql = format!(
+            "SELECT uri, MAX(operation) AS operation FROM {}calendarchanges \
+             WHERE calendarid = ? AND calendartype = 0 \
+               AND synctoken >= CAST(CAST(? AS text) AS integer) AND synctoken < ? \
+             GROUP BY uri ORDER BY uri",
+            self.prefix
+        );
+        if limit.is_some() {
+            sql.push_str(&format!(" LIMIT {}", self.ph(4)));
+        }
+        let sql = self.render(&sql);
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(calendar_id)
+            .bind(from_token)
+            .bind(current_token);
+        if let Some(limit) = limit {
+            query = query.bind(limit);
+        }
+        let rows = query.fetch_all(&self.pool).await?;
+        rows.iter()
+            .map(|row| {
+                Ok(CalendarChange {
+                    uri: row.try_get::<Option<String>, _>("uri")?.unwrap_or_default(),
+                    operation: row.try_get("operation")?,
+                })
+            })
+            .collect()
+    }
+
+    /// Fetches several calendar objects by URI, chunked by **100** exactly like
+    /// `CalDavBackend::getMultipleCalendarObjects()`. The chunk order (request
+    /// order) and the per-chunk row order (database order) match PHP's.
+    pub async fn calendar_objects_by_uris(
+        &self,
+        calendar_id: i64,
+        uris: &[String],
+    ) -> Result<Vec<CalendarObject>> {
+        let mut objects = Vec::new();
+        for chunk in uris.chunks(100) {
+            let mut sql = format!(
+                "SELECT id, uri, lastmodified, etag, size, calendardata, componenttype, classification \
+                 FROM {}calendarobjects WHERE calendarid = {} AND uri IN (",
+                self.prefix,
+                self.ph(1)
+            );
+            for i in 0..chunk.len() {
+                if i > 0 {
+                    sql.push_str(", ");
+                }
+                sql.push_str(&self.ph(i + 2));
+            }
+            sql.push_str(") AND calendartype = 0 AND deleted_at IS NULL ORDER BY id");
+            let mut query = sqlx::query(sqlx::AssertSqlSafe(sql)).bind(calendar_id);
+            for uri in chunk {
+                query = query.bind(uri.as_str());
+            }
+            let rows = query.fetch_all(&self.pool).await?;
+            for row in &rows {
+                objects.push(calendar_object_from_row(row)?);
+            }
+        }
+        Ok(objects)
     }
 
     // ------------------------------------------------------------------
@@ -1650,6 +2178,58 @@ pub fn md5_hex(data: &[u8]) -> String {
     hex::encode(Md5::digest(data))
 }
 
+/// `sha1($path)` as lower-case hex, used by
+/// `CustomPropertiesBackend::formatPath()` for paths longer than 250 bytes.
+fn sha1_hex(data: &[u8]) -> String {
+    let mut h: [u32; 5] = [0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0];
+    let bit_len = (data.len() as u64).wrapping_mul(8);
+    let mut msg = data.to_vec();
+    msg.push(0x80);
+    while msg.len() % 64 != 56 {
+        msg.push(0);
+    }
+    msg.extend_from_slice(&bit_len.to_be_bytes());
+    for chunk in msg.chunks(64) {
+        let mut w = [0u32; 80];
+        for (i, word) in chunk.chunks(4).enumerate() {
+            w[i] = u32::from_be_bytes([word[0], word[1], word[2], word[3]]);
+        }
+        for i in 16..80 {
+            w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
+        }
+        let (mut a, mut b, mut c, mut d, mut e) = (h[0], h[1], h[2], h[3], h[4]);
+        for (i, &wi) in w.iter().enumerate() {
+            let (f, k) = match i {
+                0..=19 => ((b & c) | (!b & d), 0x5A827999),
+                20..=39 => (b ^ c ^ d, 0x6ED9EBA1),
+                40..=59 => ((b & c) | (b & d) | (c & d), 0x8F1BBCDC),
+                _ => (b ^ c ^ d, 0xCA62C1D6),
+            };
+            let temp = a
+                .rotate_left(5)
+                .wrapping_add(f)
+                .wrapping_add(e)
+                .wrapping_add(k)
+                .wrapping_add(wi);
+            e = d;
+            d = c;
+            c = b.rotate_left(30);
+            b = a;
+            a = temp;
+        }
+        h[0] = h[0].wrapping_add(a);
+        h[1] = h[1].wrapping_add(b);
+        h[2] = h[2].wrapping_add(c);
+        h[3] = h[3].wrapping_add(d);
+        h[4] = h[4].wrapping_add(e);
+    }
+    let mut out = String::with_capacity(40);
+    for word in h {
+        out.push_str(&format!("{word:08x}"));
+    }
+    out
+}
+
 /// `mb_strcut($value, 0, 254)`: truncate to at most `max` bytes without
 /// splitting a UTF-8 code point.
 pub fn truncate_utf8(value: &str, max: usize) -> &str {
@@ -1673,6 +2253,44 @@ fn address_book_from_row(row: &AnyRow) -> Result<AddressBook> {
             .unwrap_or_default(),
         description: row.try_get("description")?,
         synctoken: row.try_get("synctoken")?,
+    })
+}
+
+fn calendar_from_row(row: &AnyRow) -> Result<Calendar> {
+    Ok(Calendar {
+        id: row.try_get("id")?,
+        uri: row.try_get::<Option<String>, _>("uri")?.unwrap_or_default(),
+        displayname: row.try_get("displayname")?,
+        principaluri: row
+            .try_get::<Option<String>, _>("principaluri")?
+            .unwrap_or_default(),
+        description: row.try_get("description")?,
+        timezone: row.try_get("timezone")?,
+        calendarorder: row.try_get::<Option<i64>, _>("calendarorder")?.unwrap_or(0),
+        calendarcolor: row.try_get("calendarcolor")?,
+        components: row.try_get("components")?,
+        transparent: row.try_get::<Option<i16>, _>("transparent")?.unwrap_or(0) != 0,
+        synctoken: row.try_get("synctoken")?,
+        deleted_at: row.try_get("deleted_at")?,
+    })
+}
+
+fn calendar_object_from_row(row: &AnyRow) -> Result<CalendarObject> {
+    Ok(CalendarObject {
+        id: row.try_get("id")?,
+        uri: row.try_get::<Option<String>, _>("uri")?.unwrap_or_default(),
+        etag: row
+            .try_get::<Option<String>, _>("etag")?
+            .unwrap_or_default(),
+        size: row.try_get::<Option<i64>, _>("size")?.unwrap_or_default(),
+        lastmodified: row.try_get("lastmodified")?,
+        componenttype: row.try_get("componenttype")?,
+        classification: row
+            .try_get::<Option<i16>, _>("classification")?
+            .unwrap_or(0) as i64,
+        calendardata: row
+            .try_get::<Option<Vec<u8>>, _>("calendardata")?
+            .unwrap_or_default(),
     })
 }
 

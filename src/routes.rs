@@ -82,6 +82,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route("/remote.php/dav/addressbooks", any(dispatch))
         .route("/remote.php/dav/addressbooks/{*rest}", any(dispatch))
+        .route("/remote.php/dav/calendars", any(dispatch_calendars))
+        .route("/remote.php/dav/calendars/{*rest}", any(dispatch_calendars))
         .route("/remote.php/dav/files", any(dispatch_files))
         .route("/remote.php/dav/files/{*rest}", any(dispatch_files))
         .with_state(state)
@@ -212,6 +214,87 @@ async fn dispatch_discovery(State(state): State<Arc<AppState>>, request: Request
     match handle_discovery(state, request).await {
         Ok(response) => response,
         Err(error) => error.into_response(),
+    }
+}
+
+/// CalDAV dispatch: `PROPFIND` on the caller's own calendar home and on one of
+/// their calendars, plus the `sync-collection` and `calendar-multiget` REPORTs
+/// on one of their calendars. Everything else delegates with 501. See
+/// `src/calendars.rs`.
+async fn dispatch_calendars(State(state): State<Arc<AppState>>, request: Request) -> Response {
+    match handle_calendars(state, request).await {
+        Ok(response) => response,
+        Err(error) => error.into_response(),
+    }
+}
+
+async fn handle_calendars(state: Arc<AppState>, request: Request) -> Result<Response> {
+    // Every other method (OPTIONS included) is delegated: PHP owns the
+    // capability headers, the object GETs and the whole write path.
+    let method = request.method().as_str().to_string();
+    if method != "PROPFIND" && method != "REPORT" {
+        return Ok(not_implemented());
+    }
+
+    let path = request.uri().path().to_string();
+    let headers = request.headers().clone();
+    let parsed = crate::calendars::parse_calendars_path(&path);
+    match parsed.target {
+        crate::calendars::CalendarsTarget::NotFound => {
+            return Ok(Error::NotFound.into_response())
+        }
+        crate::calendars::CalendarsTarget::Delegated => return Ok(not_implemented()),
+        _ => {}
+    }
+
+    let Some((username, password)) = parse_basic_auth(headers.get(header::AUTHORIZATION)) else {
+        return Ok(unauthorized());
+    };
+    let client_ip = client_ip(&headers);
+    let user = match state.auth.authenticate(&username, &password, client_ip).await {
+        Ok(user) => user,
+        Err(error) => return Ok(auth_error_response(error)),
+    };
+
+    let body = read_body(request).await?;
+    if method == "REPORT" {
+        return match crate::calendars::handle_report(&state.db, &user.uid, &parsed, &body).await? {
+            crate::calendars::ReportOutcome::Multistatus(multistatus) => {
+                Ok(xml_response(StatusCode::MULTI_STATUS, multistatus.to_xml_caldav()))
+            }
+            crate::calendars::ReportOutcome::Delegated => Ok(not_implemented()),
+            crate::calendars::ReportOutcome::InvalidSyncToken => {
+                Ok(dav_error::invalid_sync_token())
+            }
+            crate::calendars::ReportOutcome::UnsupportedInitialLimit => {
+                Ok(dav_error::unsupported_limit_on_initial_sync())
+            }
+            crate::calendars::ReportOutcome::BadRequest(message) => {
+                Ok(dav_error::bad_request(&message))
+            }
+        };
+    }
+
+    let depth = parse_depth(&headers);
+    let accept_language = headers
+        .get(header::ACCEPT_LANGUAGE)
+        .and_then(|value| value.to_str().ok());
+    match crate::calendars::handle_propfind(
+        &state.db,
+        &state.config,
+        &user.uid,
+        &parsed,
+        depth,
+        accept_language,
+        &body,
+    )
+    .await?
+    {
+        Some(multistatus) => Ok(xml_response(
+            StatusCode::MULTI_STATUS,
+            multistatus.to_xml_caldav(),
+        )),
+        None => Ok(not_implemented()),
     }
 }
 

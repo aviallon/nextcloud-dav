@@ -322,6 +322,56 @@ sequenceDiagram
   end
 ```
 
+### 5.5 CalDAV calendars
+
+The CalDAV path shape has **no `users/` segment**
+(`/remote.php/dav/calendars/<uid>/<cal>/`), so it gets its own parser and
+nginx location. Served natively:
+
+- the caller's **calendar home** (`Depth: 0`/`1`) from `oc_calendars` +
+  `oc_dav_shares` + `oc_properties`;
+- one owned, live **calendar** (`Depth: 0`) with the full property set;
+- `sync-collection` and `calendar-multiget` REPORTs on that calendar.
+
+Everything else delegates with **501**: objects (`GET`/`PROPFIND`), `trashbin/`,
+`inbox`/`outbox`, subscriptions, federated/app-generated calendars, every other
+principal, `calendar-query`, `<cal:expand>`, `application/calendar+json`,
+free-busy, `?export`, and all writes. A REPORT on a **shared** or trashed
+calendar also delegates, because the shared object post-processing
+(`VALARM` stripping, `CONFIDENTIAL` masking, size suppression) is a
+parse-and-re-serialise path the sidecar does not reproduce.
+
+The property gate applies per node type: an explicit request whose qname is
+outside the implemented/known-404 set delegates, never answers 404. The calendar
+`getctag` is the sabre-sync URL (`http://sabre.io/ns/sync/<token>`), while the
+CardDAV `getctag` is the raw integer.
+
+```mermaid
+sequenceDiagram
+  participant C as client
+  participant D as sidecar
+  participant DB as PostgreSQL
+  C->>D: PROPFIND Depth 1 /calendars/<uid>/
+  D->>DB: visible_calendars (owned + shares) + oc_properties overrides
+  D-->>C: 207 home + calendars + inbox/outbox/trashbin
+  C->>D: PROPFIND Depth 0 /calendars/<uid>/<cal>/
+  D->>DB: visible_calendar_by_uri + oc_properties overrides
+  D-->>C: 207 one calendar
+  C->>D: REPORT sync-collection (owned calendar)
+  D->>DB: oc_calendarchanges MAX(operation) GROUP BY uri
+  D-->>C: 207 added/modified + 404 deleted + sync-token
+  C->>D: REPORT calendar-multiget
+  D->>DB: oc_calendarobjects WHERE uri IN (...) (100-URI chunks)
+  D-->>C: 207 getetag/calendar-data (missing hrefs dropped)
+```
+
+`calendar-data` is the stored blob with every `\r` removed, exactly like
+`Sabre\CalDAV\Plugin::propFind()` ("Taking out \r to not screw up the xml
+output"), while `{DAV:}getetag` stays `"<stored md5>"` — i.e. the hash is over
+the stored CRLF bytes, not the emitted body. `calendar-multiget` drops hrefs
+that do not resolve (Sabre's `Tree::getMultipleNodes()`), unlike CardDAV's
+synthetic 404 propstats.
+
 ## 6. Sync tokens (RFC 6578)
 
 Nextcloud's token scheme is unusual and the sidecar reproduces it exactly:
@@ -373,6 +423,42 @@ sequenceDiagram
 
 A `507` is emitted when a page is truncated, matching Sabre. A malformed
 (token missing the prefix) yields `400`.
+
+### 6.1 CalDAV `sync-collection`
+
+The CalDAV token scheme is the same pre-increment one, but
+`CalDavBackend::getChangesForCalendar()` differs from its CardDAV twin in ways
+the sidecar reproduces exactly:
+
+- the change query is `SELECT uri, MAX(operation) … GROUP BY uri`, so a URI
+  touched add→delete inside one window is reported as a **delete** (3 > 1);
+- there is **no `init_` paging** — a non-numeric token (including `init_…`) is
+  treated as an initial sync, not an error, and applies the limit;
+- the result is **never truncated**: the token is always the calendar's current
+  token and no `507` marker is emitted;
+- an empty token **with** a `<d:limit>` is `UnsupportedLimitOnInitialSyncException`
+  (`507` + `<d:number-of-matches-within-limits/>`);
+- Sabre's `SyncCollectionReport` **requires** `<d:sync-token>` and `<d:prop>`,
+  so a report missing either is a `400` with a specific message;
+- a token missing the prefix is `403` + `<d:valid-sync-token/>`.
+
+```mermaid
+sequenceDiagram
+  participant C as Client
+  participant D as sidecar
+  participant DB as PostgreSQL
+  C->>D: REPORT sync-collection, sync-token = ""
+  alt <d:limit> present
+    D-->>C: 507 number-of-matches-within-limits
+  else no limit
+    D->>DB: SELECT id, uri FROM oc_calendarobjects<br/>WHERE calendarid=? AND calendartype=0 AND deleted_at IS NULL
+    D-->>C: 207 all objects + sync-token http://sabre.io/ns/sync/<cur>
+  end
+  Note over C,D: later, incremental
+  C->>D: REPORT sync-collection, token = <old>
+  D->>DB: SELECT uri, MAX(operation) FROM oc_calendarchanges<br/>WHERE synctoken >= old AND synctoken < cur GROUP BY uri
+  D-->>C: 207 added/modified + 404 deleted + current token
+```
 
 ---
 

@@ -330,6 +330,211 @@ impl TestEnv {
             .unwrap();
     }
 
+    /// Inserts an `oc_calendars` row and returns its id.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn seed_calendar(
+        &self,
+        principaluri: &str,
+        uri: &str,
+        displayname: Option<&str>,
+        calendarorder: i64,
+        calendarcolor: Option<&str>,
+        components: Option<&str>,
+        transparent: bool,
+        synctoken: i64,
+    ) -> i64 {
+        let sql = format!(
+            "INSERT INTO {}calendars \
+             (principaluri, uri, displayname, calendarorder, calendarcolor, components, transparent, synctoken) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+            self.prefix
+        );
+        sqlx::query(safe(sql))
+            .bind(principaluri)
+            .bind(uri)
+            .bind(displayname)
+            .bind(calendarorder)
+            .bind(calendarcolor)
+            .bind(components)
+            .bind(i16::from(transparent))
+            .bind(synctoken)
+            .fetch_one(self.pool())
+            .await
+            .unwrap()
+            .get("id")
+    }
+
+    /// A `type = 'calendar'` `oc_dav_shares` row.
+    pub async fn seed_calendar_share(&self, principaluri: &str, access: i64, resourceid: i64) {
+        self.seed_share_typed(principaluri, "calendar", access, resourceid)
+            .await;
+    }
+
+    /// An `oc_properties` row (the sharee override layer).
+    pub async fn seed_calendar_property(
+        &self,
+        userid: &str,
+        path: &str,
+        name: &str,
+        value: &str,
+    ) {
+        let sql = format!(
+            "INSERT INTO {}properties (userid, propertypath, propertyname, propertyvalue, valuetype) \
+             VALUES (?, ?, ?, ?, 1)",
+            self.prefix
+        );
+        sqlx::query(safe(sql))
+            .bind(userid)
+            .bind(path)
+            .bind(name)
+            .bind(value)
+            .execute(self.pool())
+            .await
+            .unwrap();
+    }
+
+    pub async fn seed_calendar_subscription(&self, principaluri: &str, uri: &str) {
+        let sql = format!(
+            "INSERT INTO {}calendarsubscriptions (principaluri, uri, displayname, synctoken) \
+             VALUES (?, ?, 'Sub', 1)",
+            self.prefix
+        );
+        sqlx::query(safe(sql))
+            .bind(principaluri)
+            .bind(uri)
+            .execute(self.pool())
+            .await
+            .unwrap();
+    }
+
+    /// Inserts an `oc_calendarobjects` row exactly as PHP's
+    /// `createCalendarObject()` would (md5 etag, byte length), then logs the
+    /// add-change and bumps the calendar's sync token.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn seed_calendar_object(
+        &self,
+        calendar_id: i64,
+        uri: &str,
+        calendardata: &[u8],
+        componenttype: &str,
+        classification: i64,
+    ) -> i64 {
+        let id = self
+            .insert_calendar_object_raw(calendar_id, uri, calendardata, componenttype, classification)
+            .await;
+        self.add_calendar_change(calendar_id, uri, 1).await;
+        id
+    }
+
+    /// Inserts an `oc_calendarobjects` row without a change log.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn insert_calendar_object_raw(
+        &self,
+        calendar_id: i64,
+        uri: &str,
+        calendardata: &[u8],
+        componenttype: &str,
+        classification: i64,
+    ) -> i64 {
+        let etag = md5_hex(calendardata);
+        let sql = format!(
+            "INSERT INTO {}calendarobjects \
+             (calendarid, calendardata, uri, lastmodified, etag, size, componenttype, classification, calendartype) \
+             VALUES (?, ?, ?, 1_700_000_000, ?, ?, ?, ?, 0) RETURNING id",
+            self.prefix
+        );
+        sqlx::query(safe(sql))
+            .bind(calendar_id)
+            .bind(calendardata.to_vec())
+            .bind(uri)
+            .bind(&etag)
+            .bind(calendardata.len() as i64)
+            .bind(componenttype)
+            .bind(classification as i16)
+            .fetch_one(self.pool())
+            .await
+            .unwrap()
+            .get("id")
+    }
+
+    /// Mirrors `CalDavBackend::addChanges()`: insert a change row carrying the
+    /// *pre-increment* token, then bump the calendar's synctoken by one.
+    pub async fn add_calendar_change(&self, calendar_id: i64, uri: &str, operation: i64) {
+        let select = format!(
+            "SELECT synctoken FROM {}calendars WHERE id = ?",
+            self.prefix
+        );
+        let token: i32 = sqlx::query(safe(select))
+            .bind(calendar_id)
+            .fetch_one(self.pool())
+            .await
+            .unwrap()
+            .get("synctoken");
+        let insert = format!(
+            "INSERT INTO {}calendarchanges (uri, synctoken, calendarid, operation, calendartype, created_at) \
+             VALUES (?, ?, ?, ?, 0, 1_700_000_000)",
+            self.prefix
+        );
+        sqlx::query(safe(insert))
+            .bind(uri)
+            .bind(token)
+            .bind(calendar_id)
+            .bind(operation as i16)
+            .execute(self.pool())
+            .await
+            .unwrap();
+        let update = format!(
+            "UPDATE {}calendars SET synctoken = ? WHERE id = ?",
+            self.prefix
+        );
+        sqlx::query(safe(update))
+            .bind(token + 1)
+            .bind(calendar_id)
+            .execute(self.pool())
+            .await
+            .unwrap();
+    }
+
+    pub async fn set_calendar_synctoken(&self, calendar_id: i64, token: i64) {
+        let sql = format!(
+            "UPDATE {}calendars SET synctoken = ? WHERE id = ?",
+            self.prefix
+        );
+        sqlx::query(safe(sql))
+            .bind(token)
+            .bind(calendar_id)
+            .execute(self.pool())
+            .await
+            .unwrap();
+    }
+
+    pub async fn seed_federated_calendar(&self, principaluri: &str, uri: &str) {
+        let sql = format!(
+            "INSERT INTO {}calendars_federated (principaluri, uri, display_name, state) \
+             VALUES (?, ?, 'Fed', 1)",
+            self.prefix
+        );
+        sqlx::query(safe(sql))
+            .bind(principaluri)
+            .bind(uri)
+            .execute(self.pool())
+            .await
+            .unwrap();
+    }
+
+    pub async fn trash_calendar(&self, calendar_id: i64, deleted_at: i64) {
+        let sql = format!(
+            "UPDATE {}calendars SET deleted_at = ? WHERE id = ?",
+            self.prefix
+        );
+        sqlx::query(safe(sql))
+            .bind(deleted_at as i32)
+            .bind(calendar_id)
+            .execute(self.pool())
+            .await
+            .unwrap();
+    }
+
     /// Inserts a card exactly as PHP's `createCard()` would (md5 etag,
     /// byte length), then logs the add-change and bumps the sync token.
     pub async fn seed_card(&self, addressbook_id: i64, uri: &str, carddata: &[u8]) -> i64 {
@@ -1040,6 +1245,8 @@ impl TestEnv {
             e2e_encryption: false,
             sharing_exclude_groups: false,
             force_language: None,
+            default_language: None,
+            l10n_dir: None,
         };
         router(Arc::new(AppState {
             db,
@@ -1055,7 +1262,7 @@ impl TestEnv {
 
     /// A router that shares this env's pool instead of opening a new one.
     pub fn app_shared(&self) -> Router {
-        self.app_shared_blocking("testinst", false, None, false, false, None)
+        self.app_shared_blocking("testinst", false, None, false, false, None, None)
     }
 
     /// Like [`TestEnv::app_shared`] but with explicit files flags, for the
@@ -1073,19 +1280,20 @@ impl TestEnv {
             false,
             false,
             None,
+            None,
         )
     }
 
     /// Like [`TestEnv::app_shared`] but with a primary object store configured,
     /// for the `oc:downloadURL` delegation deviation.
     pub fn app_shared_objectstore(&self) -> Router {
-        self.app_shared_blocking("testinst", false, None, true, false, None)
+        self.app_shared_blocking("testinst", false, None, true, false, None, None)
     }
 
     /// Like [`TestEnv::app_shared`] but with `end_to_end_encryption` enabled, for
     /// the `nc:is-encrypted` delegation deviation.
     pub fn app_shared_e2ee(&self) -> Router {
-        self.app_shared_blocking("testinst", false, None, false, true, None)
+        self.app_shared_blocking("testinst", false, None, false, true, None, None)
     }
 
     /// Like [`TestEnv::app_shared`] but with `force_language` set, for the DAV
@@ -1098,9 +1306,17 @@ impl TestEnv {
             false,
             false,
             Some(language.to_string()),
+            None,
         )
     }
 
+    /// Like [`TestEnv::app_shared`] but with an explicit `dav` l10n directory,
+    /// for the localized calendar-displayname deviation.
+    pub fn app_shared_l10n_dir(&self, dir: std::path::PathBuf) -> Router {
+        self.app_shared_blocking("testinst", false, None, false, false, None, Some(dir))
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn app_shared_blocking(
         &self,
         instance_id: &str,
@@ -1109,6 +1325,7 @@ impl TestEnv {
         objectstore: bool,
         e2e_encryption: bool,
         force_language: Option<String>,
+        l10n_dir: Option<std::path::PathBuf>,
     ) -> Router {
         let php = PhpClient::new("http://127.0.0.1:1/", Duration::from_millis(500), false).unwrap();
         let auth = Authenticator::new(
@@ -1139,6 +1356,8 @@ impl TestEnv {
             e2e_encryption,
             sharing_exclude_groups,
             force_language,
+            default_language: None,
+            l10n_dir,
         };
         router(Arc::new(AppState {
             db: self.db.clone(),
@@ -1653,6 +1872,87 @@ CREATE TABLE oc_accounts (
     data text NULL
 );
 CREATE INDEX accounts_uid_index ON oc_accounts (uid);
+
+CREATE TABLE oc_calendars (
+    id bigint GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+    principaluri varchar(255) NULL,
+    displayname varchar(255) NULL,
+    uri varchar(255) NULL,
+    synctoken integer NOT NULL DEFAULT 1,
+    description varchar(255) NULL,
+    calendarorder integer NOT NULL DEFAULT 0,
+    calendarcolor varchar(255) NULL,
+    timezone text NULL,
+    components varchar(64) NULL,
+    transparent smallint NOT NULL DEFAULT 0,
+    deleted_at integer NULL
+);
+CREATE UNIQUE INDEX calendars_index ON oc_calendars (principaluri, uri);
+CREATE TABLE oc_calendarobjects (
+    id bigint GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+    calendardata bytea NULL,
+    uri varchar(255) NULL,
+    calendarid bigint NOT NULL DEFAULT 0,
+    lastmodified bigint NULL,
+    etag varchar(32) NULL,
+    size bigint NOT NULL DEFAULT 0,
+    componenttype varchar(8) NULL,
+    firstoccurence bigint NULL,
+    lastoccurence bigint NULL,
+    uid varchar(255) NULL,
+    classification smallint NULL DEFAULT 0,
+    calendartype integer NOT NULL DEFAULT 0,
+    deleted_at integer NULL
+);
+CREATE UNIQUE INDEX calobjects_index ON oc_calendarobjects (calendarid, calendartype, uri);
+CREATE TABLE oc_calendarchanges (
+    id bigint GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+    uri varchar(255) NULL,
+    synctoken integer NOT NULL DEFAULT 1,
+    calendarid bigint NOT NULL,
+    operation smallint NOT NULL,
+    calendartype integer NOT NULL DEFAULT 0,
+    created_at integer NOT NULL DEFAULT 0
+);
+CREATE TABLE oc_calendarsubscriptions (
+    id bigint GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+    uri varchar(255) NULL,
+    principaluri varchar(255) NULL,
+    displayname varchar(255) NULL,
+    refreshrate varchar(64) NULL,
+    calendarorder integer NOT NULL DEFAULT 0,
+    calendarcolor varchar(255) NULL,
+    striptodos smallint NOT NULL DEFAULT 0,
+    stripalarms smallint NOT NULL DEFAULT 0,
+    stripattachments smallint NOT NULL DEFAULT 0,
+    lastmodified integer NULL,
+    synctoken integer NOT NULL DEFAULT 1,
+    source text NULL
+);
+CREATE TABLE oc_calendars_federated (
+    id bigint GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+    principaluri varchar(255) NOT NULL DEFAULT '',
+    uri varchar(255) NOT NULL DEFAULT '',
+    display_name varchar(255) NOT NULL DEFAULT '',
+    color varchar(255) NULL,
+    permissions integer NOT NULL DEFAULT 0,
+    sync_token integer NOT NULL DEFAULT 0,
+    remote_url varchar(255) NOT NULL DEFAULT '',
+    token varchar(255) NOT NULL DEFAULT '',
+    last_sync integer NULL,
+    shared_by varchar(255) NOT NULL DEFAULT '',
+    shared_by_display_name varchar(255) NOT NULL DEFAULT '',
+    components varchar(255) NOT NULL DEFAULT '',
+    state integer NOT NULL DEFAULT 0
+);
+CREATE TABLE oc_properties (
+    id bigint GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+    userid varchar(64) NULL,
+    propertypath varchar(255) NULL,
+    propertyname varchar(255) NULL,
+    propertyvalue text NULL,
+    valuetype integer NOT NULL DEFAULT 1
+);
 "#;
     for statement in ddl.split(';') {
         let statement = statement.trim();

@@ -227,6 +227,19 @@ in `src/files.rs`; the recon is `recon/files-propfind-model.md`.
 | `discovery-non-propfind-501` | delegation | intentional | every non-PROPFIND discovery method (including OPTIONS) → 501 |
 | `discovery-group-membership-backends` | propfind | intentional | `group-membership` expands database groups only; LDAP/circles invisible |
 | `discovery-language-request-fallback` | propfind | intentional | `nc:language` delegates when no `force_language`/`core/lang` is set |
+| `calendars-property-gate-501` | propfind | intentional | an explicit calendars PROPFIND for an unimplemented-but-served qname (`cs:publish-url`, ...) → 501, never 404; known-404 qnames stay 404 |
+| `calendars-special-children-acl-delegated` | delegation | intentional | home `Depth:1` requesting `{DAV:}acl`/`current-user-privilege-set` → 501 (the special children's ACLs are not modelled) |
+| `calendars-trashed-subscriptions-federated-delegated` | delegation | intentional | a caller with a trashed calendar, subscription or federated calendar → home listing 501 |
+| `calendars-own-home-only` | delegation | intentional | another principal's calendar home/calendar → 501 |
+| `calendars-shared-listing-order` | routing | intentional | shared calendars ordered by `a.id`; PHP has no `ORDER BY` |
+| `calendars-personal-displayname-localized` | propfind | resolved | `personal`/`contact_birthdays` displayname localized from the `dav` app l10n; a missing l10n source delegates (501) instead of serving English |
+| `calendars-sync-nresults-zero` | report | resolved | `<d:nresults>0</d:nresults>` means zero rows (and no initial-sync 507), like `setMaxResults(0)` |
+| `calendars-sync-float-token` | report | resolved | a `is_numeric()` token that is not an integer (`1.5`, `1e3`) is incremental and rejected by the database, like PHP |
+| `calendars-group-share-acl-delegated` | delegation | intentional | a group-shared calendar's `{DAV:}acl` → 501 |
+| `calendars-objects-and-query-delegated` | delegation | intentional | objects, trashbin, inbox/outbox, `calendar-query`, `?export` and all writes → 501 |
+| `calendars-report-shared-delegated` | delegation | intentional | a REPORT on a shared or trashed calendar (or a subscription) → 501 |
+| `calendars-report-expand-json-delegated` | delegation | intentional | `<cal:expand>` and `application/calendar+json` in a REPORT → 501 |
+| `calendars-report-property-gate-501` | report | intentional | an unimplemented REPORT property → 501, never 404; known-404 qnames stay 404 |
 
 **The property gate** is the safety rule that makes the whole thing honest: an
 explicit property list is only served when *every* requested qname is in the
@@ -367,3 +380,69 @@ credentialed `PROPFIND /remote.php/dav/` through the public URL. Once the root
 is served natively that would recurse, so the probe carries
 `X-Nextcloud-Dav-Fallback: 1`; the discovery handler answers 501 for it and
 nginx replays it to PHP. A client that sends the header is simply delegated.
+
+## CalDAV `PROPFIND` and REPORTs
+
+The sidecar serves `PROPFIND` on `/remote.php/dav/calendars/<user>/` (Depth 0
+and 1) and `/remote.php/dav/calendars/<user>/<cal>/` (Depth 0), from
+`oc_calendars` + `oc_dav_shares` + `oc_properties`. The property set, the child
+set and the values were captured from a live Nextcloud 33.0.5 and matched
+canonically by `tests/local/caldav_parity.sh`.
+
+**The property gate.** An explicit request whose list contains any qname outside
+the implemented set or the known-404 set answers 501, never 404. The known-404
+set is the exact live 404 set (`{DAV:}quota-*`, `{DAV:}share-access`,
+`{DAV:}getlastmodified`, `{cal}min-date-time`, ...). `{cs}publish-url` (200 iff
+published), `{DAV:}invite` on a calendar with outgoing shares, and
+`allowed-sharing-modes` under `limitAddressBookAndCalendarSharingToOwner=yes`
+are not modelled and therefore delegate.
+
+**The override layer.** `displayname`, `calendar-description`,
+`calendar-timezone`, `calendar-order`, `calendar-color`,
+`schedule-calendar-transp`, `disable-alarm-notifications`, `calendar-enabled`
+and `enabled` are read from `oc_properties`, keyed by
+`calendars/<requesting-user>/<wire-uri>`, and overwrite the `oc_calendars`
+value — this is how a sharee's `PROPPATCH` survives.
+
+**The ctag quirk.** Unlike CardDAV (a raw integer), CalDAV's
+`{cs}getctag` is `http://sabre.io/ns/sync/<synctoken ?: '0'>`;
+`{sabredav}sync-token` is the raw token and `{DAV:}sync-token` the prefixed one.
+
+**Owned `Depth:0` has no `owner-principal`.** `CalendarHome::getChild()` uses
+`getCalendarByUri()`, which does not set `{oc}owner-principal`; a shared
+calendar falls back to `getCalendarsForUser()` and does. The sidecar reproduces
+both (live-verified).
+
+**Delegated.** Objects (`GET`/`PROPFIND`/`PUT`/`DELETE`), `trashbin/`,
+`inbox`/`outbox`, subscriptions, federated and app-generated calendars,
+`calendar-query`, `<cal:expand>`, `application/calendar+json`, free-busy,
+`?export` and every write answer 501. A home Depth 1 that requests
+`{DAV:}acl`/`current-user-privilege-set` delegates because the special
+children's ACLs are not modelled; a Depth 0 on a calendar serves both for owned
+and direct-user-shared calendars.
+
+**REPORTs (`sync-collection`, `calendar-multiget`).** On an owned, live calendar
+the sidecar serves both. `calendar-multiget` fetches the objects by URI in
+100-URI chunks (`getMultipleCalendarObjects`) and drops hrefs that do not
+resolve, exactly like Sabre's `Tree::getMultipleNodes()`. `calendar-data` is
+the stored blob with every `\r` removed (Sabre's `CalDAV\Plugin::propFind()`
+does `str_replace("\r", '', $val)`), while `{DAV:}getetag` is the quoted stored
+`md5` — over the stored CRLF bytes, not the emitted body. `sync-collection`
+uses the pre-increment token and `MAX(operation)` per URI; a non-numeric token
+is an initial sync (there is no `init_` paging), an empty token with a limit is
+`507` + `<d:number-of-matches-within-limits/>`, and a token missing the prefix
+is `403` + `<d:valid-sync-token/>`. A REPORT on a **shared** or trashed calendar
+delegates, because the shared object post-processing (`VALARM` stripping,
+`CONFIDENTIAL` masking, size suppression) is a parse-and-re-serialise path the
+sidecar does not reproduce. An unimplemented property in a REPORT request
+delegates (501), never a 404; the known-404 object set
+(`{caldav}schedule-tag`, `{oc}size`, `{DAV:}quota-*`, `{nc}deleted-at`, ...)
+stays 404.
+
+**Trashed / subscription / federated.** A caller who can see a trashed calendar,
+a subscription or a federated calendar gets a 501 for the home listing, because
+PHP's child set cannot be reproduced by the subset model.
+
+**Localization.** `Calendar::__construct()` localizes the `personal` and
+`contact_birthdays` displayname through the `dav` app's l10n; the sidecar serves
+the stored string.

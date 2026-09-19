@@ -8,12 +8,14 @@
 //! scoped to read-only personal address books in v1; see `README.md`.
 
 pub mod auth;
+pub mod calendars;
 pub mod config;
 pub mod dav_error;
 pub mod db;
 pub mod discovery;
 pub mod error;
 pub mod files;
+pub mod l10n;
 pub mod model;
 pub mod mounts;
 pub mod outbox;

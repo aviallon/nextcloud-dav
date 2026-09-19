@@ -52,12 +52,19 @@ def main() -> int:
     source = sys.argv[1]
     tree = ET.parse(sys.stdin if source == "-" else source)
     lines = []
+    response_count = 0
     for child in tree.getroot():
         if child.tag == DAV + "response":
             lines.append(canonical_response(child))
+            response_count += 1
+        elif child.tag == DAV + "sync-token":
+            # The `sync-collection` reply carries the new token at the
+            # multistatus level; keep it in the canonical output so a REPORT
+            # diff does not silently ignore it.
+            lines.append(f"SYNC-TOKEN\t{(child.text or '').strip()}")
     for line in sorted(lines):
         print(line)
-    print(f"# responses={len(lines)}", file=sys.stderr)
+    print(f"# responses={response_count}", file=sys.stderr)
     return 0
 
 

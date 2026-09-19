@@ -32,6 +32,9 @@ fast path, the sync-token scheme, the data model, and the operational traps.
 | `REPORT addressbook-multiget` | hrefs resolved, missing hrefs get a 404 propstat |
 | `REPORT addressbook-query` | RFC 6352 §10.5 filters evaluated in Rust, `limit` honoured |
 | `REPORT sync-collection` | exact `oc_addressbooks.synctoken` / `http://sabre.io/ns/sync/<n>` scheme, `init_<lastID>_<tok>` paging, `507` on truncation |
+| CalDAV `PROPFIND` | the calendar home (`Depth 0`/`1`) and one owned calendar (`Depth 0`) from `oc_calendars` + `oc_dav_shares` + the `oc_properties` override layer |
+| CalDAV `REPORT calendar-multiget` | 100-URI chunks (`getMultipleCalendarObjects`), stored `calendar-data` (every `\r` stripped), missing hrefs dropped |
+| CalDAV `REPORT sync-collection` | `MAX(operation)` per URI, no `init_` paging, `507` on an initial sync with a limit, `403` + `valid-sync-token` on a bad token |
 | `OPTIONS` | `DAV: 1, 2, 3, addressbook` + `Allow` |
 | `PUT` a card | create/update, `If-Match`/`If-None-Match`, `409` on a duplicate UID, `403` past `card_size_limit`, quoted `ETag` |
 | `DELETE` a card | `204`, change logged, search columns purged |
@@ -130,6 +133,26 @@ location @nextcloud_dav_php {
     fastcgi_param REQUEST_URI        $request_uri;
     fastcgi_param HTTP_AUTHORIZATION $http_authorization;
     fastcgi_pass php-fpm;            # your existing PHP upstream/socket
+}
+
+# CalDAV fast path: the calendar home and per-calendar PROPFIND plus the
+# `sync-collection`/`calendar-multiget` REPORTs on an owned calendar. The path
+# shape has no `users/` segment. The regex requires at least one segment after
+# `calendars/<u>/`, so the home (`/calendars/<u>/`) reaches the sidecar while
+# `/calendars/<u>` (no trailing slash) stays on PHP; the 501 fallback replays
+# objects, `calendar-query` and writes.
+location ~ ^/remote\.php/dav/calendars/[^/]+/. {
+    proxy_pass http://127.0.0.1:7868;
+    proxy_http_version 1.1;
+    proxy_set_header Host              $host;
+    proxy_set_header X-Real-IP         $remote_addr;
+    proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header Authorization     $http_authorization;
+    client_max_body_size 10m;
+    proxy_read_timeout 300s;
+    proxy_intercept_errors on;
+    error_page 501 502 504 = @nextcloud_dav_php;
 }
 
 # Discovery, principals, the system book and everything else stay on PHP.

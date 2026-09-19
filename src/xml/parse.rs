@@ -10,7 +10,7 @@
 
 use crate::error::{Error, Result};
 use crate::xml::filter::{AddressBookFilter, Test};
-use crate::xml::write::{PropQName, NS_CARDDAV, NS_DAV};
+use crate::xml::write::{PropQName, NS_CALDAV, NS_CARDDAV, NS_DAV};
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::name::{Namespace, ResolveResult};
 use quick_xml::reader::NsReader;
@@ -214,9 +214,33 @@ pub struct MultiGetRequest {
     pub address_data: AddressDataRequest,
 }
 
+/// The `{urn:ietf:params:xml:ns:caldav}calendar-data` request options of a
+/// CalDAV REPORT (`Sabre\CalDAV\Xml\Filter\CalendarData`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CalendarDataRequest {
+    pub content_type: Option<String>,
+    pub version: Option<String>,
+    /// Whether an `{urn:…}expand` child is present. The sidecar delegates
+    /// `expand` (and `application/calendar+json`) rather than re-serialising.
+    pub expand: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CalendarMultiGetRequest {
+    pub props: Vec<PropQName>,
+    pub hrefs: Vec<String>,
+    pub calendar_data: CalendarDataRequest,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyncCollectionRequest {
     pub sync_token: Option<String>,
+    /// Whether a `{DAV:}sync-token` element was present at all. Sabre's
+    /// `SyncCollectionReport` **requires** it (and `{DAV:}prop`); CalDAV
+    /// reproduces the 400 when either is missing.
+    pub has_sync_token: bool,
+    /// Whether a `{DAV:}prop` element was present at all.
+    pub has_prop: bool,
     pub limit: Option<i64>,
     pub props: Vec<PropQName>,
 }
@@ -265,16 +289,46 @@ pub fn parse_multiget(xml: &[u8]) -> Result<MultiGetRequest> {
     })
 }
 
+pub fn parse_calendar_multiget(xml: &[u8]) -> Result<CalendarMultiGetRequest> {
+    let root = parse_document(xml)?;
+    let mut props = Vec::new();
+    let mut calendar_data = CalendarDataRequest::default();
+    if let Some(prop) = root.child(NS_DAV, "prop") {
+        for child in &prop.children {
+            if child.ns == NS_CALDAV && child.local == "calendar-data" {
+                calendar_data.content_type = child.attr("content-type").map(str::to_string);
+                calendar_data.version = child.attr("version").map(str::to_string);
+                calendar_data.expand = child.child(NS_CALDAV, "expand").is_some();
+            }
+            props.push(child.qname());
+        }
+    }
+    let hrefs = root
+        .children_of(NS_DAV, "href")
+        .map(|n| n.text.trim().to_string())
+        .filter(|h| !h.is_empty())
+        .collect();
+    Ok(CalendarMultiGetRequest {
+        props,
+        hrefs,
+        calendar_data,
+    })
+}
+
 pub fn parse_sync_collection(xml: &[u8]) -> Result<SyncCollectionRequest> {
     let root = parse_document(xml)?;
+    let has_sync_token = root.child(NS_DAV, "sync-token").is_some();
     let sync_token = root
         .child(NS_DAV, "sync-token")
         .map(|n| n.text.trim().to_string())
         .filter(|t| !t.is_empty());
-    let limit = root.child(NS_DAV, "limit").and_then(nresults);
+    let limit = root.child(NS_DAV, "limit").and_then(nresults_sync);
+    let has_prop = root.child(NS_DAV, "prop").is_some();
     let (props, _) = prop_and_address_data(&root);
     Ok(SyncCollectionRequest {
         sync_token,
+        has_sync_token,
+        has_prop,
         limit,
         props,
     })
@@ -327,6 +381,21 @@ fn nresults(limit: &XNode) -> Option<i64> {
         .next()
         .and_then(|n| n.text.trim().parse::<i64>().ok())
         .filter(|n| *n > 0)
+}
+
+/// `{DAV:}nresults` for `sync-collection`.
+///
+/// `SyncCollectionReport::xmlDeserialize()` stores `(int) $value` and
+/// `getChangesForCalendar()` applies it whenever `is_numeric($limit)`, so a
+/// literal `0` means `setMaxResults(0)` — **zero rows** — not "no limit".
+/// (For `addressbook-query`, Sabre instead tests `if ($report->limit)`, where
+/// `0` is falsy, so the shared [`nresults`] keeps dropping it.)
+fn nresults_sync(limit: &XNode) -> Option<i64> {
+    limit
+        .children_of(NS_DAV, "nresults")
+        .next()
+        .and_then(|n| n.text.trim().parse::<i64>().ok())
+        .filter(|n| *n >= 0)
 }
 
 #[cfg(test)]

@@ -174,6 +174,12 @@ pub struct Config {
     /// returns it before the user's `core/lang` preference, so the discovery
     /// `nc:language` property must too.
     pub force_language: Option<String>,
+    /// `$CONFIG['default_language']` when set. `L10N\Factory::findLanguage()`
+    /// falls back to it after the request's `Accept-Language`.
+    pub default_language: Option<String>,
+    /// Directory holding the `dav` app's l10n JSON files. When unset it is
+    /// derived from `config_path` as `<server-root>/apps/dav/l10n`.
+    pub l10n_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Default)]
@@ -384,6 +390,14 @@ impl Config {
                 .get_str("force_language")
                 .filter(|value| !value.is_empty())
                 .map(str::to_string),
+            default_language: raw
+                .get_str("default_language")
+                .filter(|value| !value.is_empty())
+                .map(str::to_string),
+            l10n_dir: app
+                .and_then(|a| a.get_str_at("l10n_dir"))
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from),
         })
     }
 

@@ -53,6 +53,79 @@ impl VisibleBook {
     }
 }
 
+/// A row of `oc_calendars` (the owner's row; shared rows live in
+/// `oc_dav_shares`).
+///
+/// The columns mirror `CalDavBackend::getCalendarsForUser()`'s select list
+/// (the 33.0.5 `propertyMap` plus the fixed columns).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Calendar {
+    pub id: i64,
+    pub uri: String,
+    pub displayname: Option<String>,
+    pub principaluri: String,
+    pub description: Option<String>,
+    pub timezone: Option<String>,
+    pub calendarorder: i64,
+    pub calendarcolor: Option<String>,
+    /// CSV from `oc_calendars.components`, e.g. `VEVENT` or `VEVENT,VTODO`.
+    pub components: Option<String>,
+    /// `oc_calendars.transparent`: 1 = transparent, 0 = opaque.
+    pub transparent: bool,
+    pub synctoken: i64,
+    /// Non-null when the calendar is in the trashbin. A caller that has any of
+    /// these is delegated, so a served calendar always has `None`.
+    pub deleted_at: Option<i64>,
+}
+
+/// A calendar a user can see: an owned calendar, or a calendar shared with
+/// them through `oc_dav_shares` (`CalDavBackend::getCalendarsForUser()`).
+///
+/// `calendar` is always the owner's `oc_calendars` row; the wire-facing name
+/// and the sharing facts live next to it. An owned calendar has
+/// `owner_principal == None`, `read_only == false` and `wire_uri == uri`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VisibleCalendar {
+    /// The owner's `oc_calendars` row.
+    pub calendar: Calendar,
+    /// The name the calendar is served under: the owned `uri`, or
+    /// `<uri>_shared_by_<owner-name>` for a shared calendar.
+    pub wire_uri: String,
+    /// The `{DAV:}displayname` sent on the wire. Shared calendars carry
+    /// `<displayname> (<owner display name>)`.
+    pub wire_displayname: Option<String>,
+    /// `Some(owner principal)` for a shared calendar; `None` for an owned one.
+    /// Also the switch for `{oc}owner-principal` / `{oc}read-only`.
+    pub owner_principal: Option<String>,
+    /// The owner's display name (`{nc}owner-displayname`).
+    pub owner_displayname: String,
+    /// The `oc_dav_shares.principaluri` the calendar was shared through. For a
+    /// direct user share this is the caller's principal; a group/circle
+    /// principal means the sidecar's ACL model does not apply.
+    pub share_principal: Option<String>,
+    /// `true` for a read-only share (`oc_dav_shares.access == 3`).
+    pub read_only: bool,
+    /// `true` when `schedule-calendar-transp` must be `transparent`. Shared
+    /// calendars force it; owned ones use the stored column.
+    pub transparent: bool,
+}
+
+impl VisibleCalendar {
+    /// An owned calendar, with the wire fields derived from the row.
+    pub fn owned(calendar: Calendar) -> Self {
+        Self {
+            wire_uri: calendar.uri.clone(),
+            wire_displayname: calendar.displayname.clone(),
+            owner_principal: None,
+            owner_displayname: String::new(),
+            share_principal: None,
+            read_only: false,
+            transparent: calendar.transparent,
+            calendar,
+        }
+    }
+}
+
 /// A row of `oc_cards`, after `readBlob()` filtering has been applied.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Card {
@@ -93,6 +166,43 @@ pub struct ChangeRow {
     pub uri: String,
     pub operation: i64,
     pub synctoken: i64,
+}
+
+/// A row of `oc_calendarobjects` on the CalDAV read path.
+///
+/// `calendardata` is the raw stored blob (CRLF); the XML writer normalises the
+/// line endings on the wire exactly like Sabre's `XMLWriter`, so the bytes must
+/// not be re-serialised here. `etag` is the stored, **unquoted**
+/// `md5(calendardata)`; the wire form adds the quotes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CalendarObject {
+    pub id: i64,
+    pub uri: String,
+    pub etag: String,
+    pub size: i64,
+    pub lastmodified: Option<i64>,
+    /// `oc_calendarobjects.componenttype` (mixed case in the database; PHP
+    /// lowercases it for `{DAV:}getcontenttype`).
+    pub componenttype: Option<String>,
+    /// 0 PUBLIC, 1 PRIVATE, 2 CONFIDENTIAL.
+    pub classification: i64,
+    /// The raw stored `calendardata` bytes.
+    pub calendardata: Vec<u8>,
+}
+
+impl CalendarObject {
+    /// The ETag as sent on the wire (quoted).
+    pub fn quoted_etag(&self) -> String {
+        format!("\"{}\"", self.etag)
+    }
+}
+
+/// One `oc_calendarchanges` entry, already aggregated to `MAX(operation)` per
+/// URI (`CalDavBackend::getChangesForCalendar()`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CalendarChange {
+    pub uri: String,
+    pub operation: i64,
 }
 
 /// `(id, uri)` pair for `oc_cards`, used by the initial-sync paging.

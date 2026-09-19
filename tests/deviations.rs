@@ -73,6 +73,19 @@ const DECLARED_IDS: &[&str] = &[
     "discovery-non-propfind-501",
     "discovery-group-membership-backends",
     "discovery-language-request-fallback",
+    "calendars-property-gate-501",
+    "calendars-special-children-acl-delegated",
+    "calendars-trashed-subscriptions-federated-delegated",
+    "calendars-own-home-only",
+    "calendars-shared-listing-order",
+    "calendars-personal-displayname-localized",
+    "calendars-sync-nresults-zero",
+    "calendars-sync-float-token",
+    "calendars-group-share-acl-delegated",
+    "calendars-objects-and-query-delegated",
+    "calendars-report-shared-delegated",
+    "calendars-report-expand-json-delegated",
+    "calendars-report-property-gate-501",
 ];
 
 fn toml_ids() -> Vec<String> {
@@ -150,6 +163,21 @@ fn prop_of<'a>(resp: &'a XNode, ns: &str, local: &str) -> Option<&'a XNode> {
 
 fn prop_text(resp: &XNode, ns: &str, local: &str) -> Option<String> {
     prop_of(resp, ns, local).map(|n| n.text.clone())
+}
+
+/// True when `{ns}local` is present in a 404 propstat.
+fn propstat_404(resp: &XNode, ns: &str, local: &str) -> bool {
+    resp.children
+        .iter()
+        .filter(|c| c.ns == NS_DAV && c.local == "propstat")
+        .filter(|ps| {
+            ps.child(NS_DAV, "status")
+                .map(|s| s.text.contains("404"))
+                .unwrap_or(false)
+        })
+        .filter_map(|ps| ps.child(NS_DAV, "prop"))
+        .flat_map(|prop| prop.children.iter())
+        .any(|c| c.ns == ns && c.local == local)
 }
 
 /// Sends a PUT with a raw body and Basic auth.
@@ -1626,6 +1654,415 @@ async fn assert_deviation(id: &str, f: &Fixture) -> Result<(), String> {
                 prop_text(r, "http://nextcloud.com/ns", "language").as_deref() == Some("fr"),
                 "language is wrong"
             );
+        }
+        "calendars-property-gate-501" => {
+            let env = match TestEnv::new().await {
+                Some(env) => env,
+                None => return Ok(()),
+            };
+            env.seed_user(USER, Some("Alice A")).await;
+            env.seed_calendar(
+                "principals/users/alice",
+                "work",
+                Some("Work"),
+                0,
+                None,
+                Some("VEVENT"),
+                false,
+                1,
+            )
+            .await;
+            env.seed_token(USER, USER, PASSWORD, 1, 2).await;
+            let app = env.app_shared();
+            let path = "/remote.php/dav/calendars/alice/work/";
+            // A property PHP serves but the sidecar does not model delegates.
+            let body = r#"<d:propfind xmlns:d="DAV:" xmlns:cs="http://calendarserver.org/ns/"><d:prop><cs:publish-url/></d:prop></d:propfind>"#;
+            let resp = propfind(&app, path, USER, PASSWORD, "0", body).await;
+            ensure!(
+                resp.status == 501,
+                "publish-url must delegate, got {}",
+                resp.status
+            );
+            // A property PHP 404s stays a 404 propstat, not a 501.
+            let body = r#"<d:propfind xmlns:d="DAV:"><d:prop><d:quota-used-bytes/></d:prop></d:propfind>"#;
+            let resp = propfind(&app, path, USER, PASSWORD, "0", body).await;
+            ensure!(resp.status == 207, "quota-used-bytes got {}", resp.status);
+            let d = doc(&resp.body);
+            let r = response(&d, path).unwrap();
+            ensure!(
+                propstat_404(r, NS_DAV, "quota-used-bytes"),
+                "quota-used-bytes must be a 404 propstat"
+            );
+        }
+        "calendars-special-children-acl-delegated" => {
+            let env = match TestEnv::new().await {
+                Some(env) => env,
+                None => return Ok(()),
+            };
+            env.seed_user(USER, Some("Alice A")).await;
+            env.seed_token(USER, USER, PASSWORD, 1, 2).await;
+            let app = env.app_shared();
+            let body = r#"<d:propfind xmlns:d="DAV:"><d:prop><d:acl/></d:prop></d:propfind>"#;
+            let resp = propfind(&app, "/remote.php/dav/calendars/alice/", USER, PASSWORD, "1", body).await;
+            ensure!(
+                resp.status == 501,
+                "home Depth:1 with acl must delegate, got {}",
+                resp.status
+            );
+        }
+        "calendars-trashed-subscriptions-federated-delegated" => {
+            let body = r#"<d:propfind xmlns:d="DAV:"><d:prop><d:resourcetype/></d:prop></d:propfind>"#;
+            let env = match TestEnv::new().await {
+                Some(env) => env,
+                None => return Ok(()),
+            };
+            env.seed_user(USER, Some("Alice A")).await;
+            let cal = env
+                .seed_calendar("principals/users/alice", "personal", Some("Personal"), 0, None, Some("VEVENT"), false, 1)
+                .await;
+            env.trash_calendar(cal, 1_700_000_000).await;
+            env.seed_token(USER, USER, PASSWORD, 1, 2).await;
+            let app = env.app_shared();
+            let resp = propfind(&app, "/remote.php/dav/calendars/alice/", USER, PASSWORD, "1", body).await;
+            ensure!(
+                resp.status == 501,
+                "a trashed calendar must delegate the listing, got {}",
+                resp.status
+            );
+
+            let env = match TestEnv::new().await {
+                Some(env) => env,
+                None => return Ok(()),
+            };
+            env.seed_user(USER, Some("Alice A")).await;
+            env.seed_calendar_subscription("principals/users/alice", "webcal").await;
+            env.seed_token(USER, USER, PASSWORD, 1, 2).await;
+            let app = env.app_shared();
+            let resp = propfind(&app, "/remote.php/dav/calendars/alice/", USER, PASSWORD, "1", body).await;
+            ensure!(
+                resp.status == 501,
+                "a subscription must delegate the listing, got {}",
+                resp.status
+            );
+
+            let env = match TestEnv::new().await {
+                Some(env) => env,
+                None => return Ok(()),
+            };
+            env.seed_user(USER, Some("Alice A")).await;
+            env.seed_federated_calendar("principals/users/alice", "fed").await;
+            env.seed_token(USER, USER, PASSWORD, 1, 2).await;
+            let app = env.app_shared();
+            let resp = propfind(&app, "/remote.php/dav/calendars/alice/", USER, PASSWORD, "1", body).await;
+            ensure!(
+                resp.status == 501,
+                "a federated calendar must delegate the listing, got {}",
+                resp.status
+            );
+        }
+        "calendars-own-home-only" => {
+            let env = match TestEnv::new().await {
+                Some(env) => env,
+                None => return Ok(()),
+            };
+            env.seed_user(USER, Some("Alice A")).await;
+            env.seed_user("bob", Some("Bob B")).await;
+            env.seed_token(USER, USER, PASSWORD, 1, 2).await;
+            let app = env.app_shared();
+            let body = r#"<d:propfind xmlns:d="DAV:"><d:prop><d:resourcetype/></d:prop></d:propfind>"#;
+            let resp = propfind(&app, "/remote.php/dav/calendars/bob/", USER, PASSWORD, "1", body).await;
+            ensure!(
+                resp.status == 501,
+                "another principal's home must delegate, got {}",
+                resp.status
+            );
+        }
+        "calendars-shared-listing-order" => {
+            let env = match TestEnv::new().await {
+                Some(env) => env,
+                None => return Ok(()),
+            };
+            env.seed_user(USER, Some("Alice A")).await;
+            env.seed_user("bob", Some("Bob B")).await;
+            // Insert a high-id calendar first and a low-id one second.
+            let first = env
+                .seed_calendar("principals/users/bob", "first", Some("First"), 0, None, Some("VEVENT"), false, 1)
+                .await;
+            let second = env
+                .seed_calendar("principals/users/bob", "second", Some("Second"), 0, None, Some("VEVENT"), false, 1)
+                .await;
+            env.seed_calendar_share("principals/users/alice", 3, first).await;
+            env.seed_calendar_share("principals/users/alice", 3, second).await;
+            let groups = env.db.group_principals(USER).await.unwrap();
+            let calendars = env
+                .db
+                .visible_calendars("principals/users/alice", &groups)
+                .await
+                .unwrap();
+            let uris: Vec<&str> = calendars.iter().map(|c| c.wire_uri.as_str()).collect();
+            ensure!(
+                uris == vec!["first_shared_by_bob", "second_shared_by_bob"],
+                "shared calendars must be ordered by a.id, got {uris:?}"
+            );
+        }
+        "calendars-personal-displayname-localized" => {
+            let env = match TestEnv::new().await {
+                Some(env) => env,
+                None => return Ok(()),
+            };
+            env.seed_user(USER, Some("Alice A")).await;
+            env.seed_calendar("principals/users/alice", "personal", Some("Personal"), 0, None, Some("VEVENT"), false, 1)
+                .await;
+            env.seed_calendar("principals/users/alice", "contact_birthdays", Some("Contact birthdays"), 1, None, Some("VEVENT"), false, 1)
+                .await;
+            env.seed_calendar("principals/users/alice", "other", Some("Personal"), 2, None, Some("VEVENT"), false, 1)
+                .await;
+            env.seed_preference(USER, "core", "lang", "fr").await;
+            env.seed_token(USER, USER, PASSWORD, 1, 2).await;
+
+            // A throwaway `dav` l10n tree carrying the real French strings.
+            let dir = std::env::temp_dir().join(format!("ncdav-l10n-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("fr.json"),
+                r#"{"translations":{"Personal":"Personnel","Contact birthdays":"Anniversaires des contacts"},"pluralForm":"nplurals=2; plural=(n > 1);"}"#,
+            )
+            .unwrap();
+            let app = env.app_shared_l10n_dir(dir);
+
+            let body = r#"<d:propfind xmlns:d="DAV:"><d:prop><d:displayname/></d:prop></d:propfind>"#;
+            for (path, expected) in [
+                (
+                    "/remote.php/dav/calendars/alice/personal/",
+                    "Personnel",
+                ),
+                (
+                    "/remote.php/dav/calendars/alice/contact_birthdays/",
+                    "Anniversaires des contacts",
+                ),
+                // The rewrite is keyed on the *uri*; another calendar whose
+                // stored name happens to be `Personal` is untouched.
+                ("/remote.php/dav/calendars/alice/other/", "Personal"),
+            ] {
+                let resp = propfind(&app, path, USER, PASSWORD, "0", body).await;
+                let d = doc(&resp.body);
+                let r = response(&d, path).unwrap();
+                ensure!(
+                    prop_text(r, NS_DAV, "displayname").as_deref() == Some(expected),
+                    "{path} must serve {expected:?}, got {:?}",
+                    prop_text(r, NS_DAV, "displayname")
+                );
+            }
+        }
+        "calendars-group-share-acl-delegated" => {
+            let env = match TestEnv::new().await {
+                Some(env) => env,
+                None => return Ok(()),
+            };
+            env.seed_user(USER, Some("Alice A")).await;
+            env.seed_user("bob", Some("Bob B")).await;
+            env.seed_group("team").await;
+            env.seed_group_member("team", USER).await;
+            let cal = env
+                .seed_calendar("principals/users/bob", "teamcal", Some("Team"), 0, None, Some("VEVENT"), false, 1)
+                .await;
+            env.seed_calendar_share("principals/groups/team", 2, cal).await;
+            env.seed_token(USER, USER, PASSWORD, 1, 2).await;
+            let app = env.app_shared();
+            let path = "/remote.php/dav/calendars/alice/teamcal_shared_by_bob/";
+            let body = r#"<d:propfind xmlns:d="DAV:"><d:prop><d:acl/></d:prop></d:propfind>"#;
+            let resp = propfind(&app, path, USER, PASSWORD, "0", body).await;
+            ensure!(
+                resp.status == 501,
+                "a group-share ACL must delegate, got {}",
+                resp.status
+            );
+        }
+        "calendars-objects-and-query-delegated" => {
+            let env = match TestEnv::new().await {
+                Some(env) => env,
+                None => return Ok(()),
+            };
+            env.seed_user(USER, Some("Alice A")).await;
+            env.seed_calendar("principals/users/alice", "work", Some("Work"), 0, None, Some("VEVENT"), false, 1)
+                .await;
+            env.seed_token(USER, USER, PASSWORD, 1, 2).await;
+            let app = env.app_shared();
+            let body = r#"<d:propfind xmlns:d="DAV:"><d:prop><d:resourcetype/></d:prop></d:propfind>"#;
+            for path in [
+                "/remote.php/dav/calendars/alice/work/x.ics",
+                "/remote.php/dav/calendars/alice/trashbin/",
+                "/remote.php/dav/calendars/alice/inbox/",
+            ] {
+                let resp = propfind(&app, path, USER, PASSWORD, "0", body).await;
+                ensure!(resp.status == 501, "{path} must delegate, got {}", resp.status);
+            }
+            // The object GET and `calendar-query` still delegate.
+            let resp = get(&app, "/remote.php/dav/calendars/alice/work/x.ics", USER, PASSWORD).await;
+            ensure!(resp.status == 501, "object GET must delegate, got {}", resp.status);
+            let query = r#"<cal:calendar-query xmlns:d="DAV:" xmlns:cal="urn:ietf:params:xml:ns:caldav"><d:prop><d:getetag/></d:prop><cal:filter><cal:comp-filter name="VCALENDAR"/></cal:filter></cal:calendar-query>"#;
+            let resp = report(&app, "/remote.php/dav/calendars/alice/work/", USER, PASSWORD, query).await;
+            ensure!(resp.status == 501, "calendar-query must delegate, got {}", resp.status);
+        }
+        "calendars-report-shared-delegated" => {
+            let env = match TestEnv::new().await {
+                Some(env) => env,
+                None => return Ok(()),
+            };
+            env.seed_user(USER, Some("Alice A")).await;
+            env.seed_user("bob", Some("Bob B")).await;
+            let cal = env
+                .seed_calendar("principals/users/bob", "bobcal", Some("Bob Cal"), 0, None, Some("VEVENT"), false, 1)
+                .await;
+            env.seed_calendar_share("principals/users/alice", 3, cal).await;
+            env.seed_token(USER, USER, PASSWORD, 1, 2).await;
+            let app = env.app_shared();
+            let body = r#"<d:sync-collection xmlns:d="DAV:"><d:sync-token/><d:prop><d:getetag/></d:prop></d:sync-collection>"#;
+            let resp = report(
+                &app,
+                "/remote.php/dav/calendars/alice/bobcal_shared_by_bob/",
+                USER,
+                PASSWORD,
+                body,
+            )
+            .await;
+            ensure!(resp.status == 501, "a shared REPORT must delegate, got {}", resp.status);
+
+            // A trashed calendar, too.
+            let env = match TestEnv::new().await {
+                Some(env) => env,
+                None => return Ok(()),
+            };
+            env.seed_user(USER, Some("Alice A")).await;
+            let cal = env
+                .seed_calendar("principals/users/alice", "personal", Some("Personal"), 0, None, Some("VEVENT"), false, 1)
+                .await;
+            env.trash_calendar(cal, 1_700_000_000).await;
+            env.seed_token(USER, USER, PASSWORD, 1, 2).await;
+            let app = env.app_shared();
+            let resp = report(
+                &app,
+                "/remote.php/dav/calendars/alice/personal/",
+                USER,
+                PASSWORD,
+                body,
+            )
+            .await;
+            ensure!(resp.status == 501, "a trashed REPORT must delegate, got {}", resp.status);
+        }
+        "calendars-report-expand-json-delegated" => {
+            let env = match TestEnv::new().await {
+                Some(env) => env,
+                None => return Ok(()),
+            };
+            env.seed_user(USER, Some("Alice A")).await;
+            let cal = env
+                .seed_calendar("principals/users/alice", "work", Some("Work"), 0, None, Some("VEVENT"), false, 1)
+                .await;
+            env.seed_calendar_object(cal, "e.ics", b"BEGIN:VCALENDAR\r\nEND:VCALENDAR\r\n", "VEVENT", 0)
+                .await;
+            env.seed_token(USER, USER, PASSWORD, 1, 2).await;
+            let app = env.app_shared();
+            let path = "/remote.php/dav/calendars/alice/work/";
+            let expand = r#"<cal:calendar-multiget xmlns:d="DAV:" xmlns:cal="urn:ietf:params:xml:ns:caldav"><d:prop><d:getetag/><cal:calendar-data><cal:expand start="20260101T000000Z" end="20270101T000000Z"/></cal:calendar-data></d:prop><d:href>/remote.php/dav/calendars/alice/work/e.ics</d:href></cal:calendar-multiget>"#;
+            let resp = report(&app, path, USER, PASSWORD, expand).await;
+            ensure!(resp.status == 501, "expand must delegate, got {}", resp.status);
+            let json = r#"<cal:calendar-multiget xmlns:d="DAV:" xmlns:cal="urn:ietf:params:xml:ns:caldav"><d:prop><d:getetag/><cal:calendar-data content-type="application/calendar+json"/></d:prop><d:href>/remote.php/dav/calendars/alice/work/e.ics</d:href></cal:calendar-multiget>"#;
+            let resp = report(&app, path, USER, PASSWORD, json).await;
+            ensure!(resp.status == 501, "calendar+json must delegate, got {}", resp.status);
+        }
+        "calendars-report-property-gate-501" => {
+            let env = match TestEnv::new().await {
+                Some(env) => env,
+                None => return Ok(()),
+            };
+            env.seed_user(USER, Some("Alice A")).await;
+            let cal = env
+                .seed_calendar("principals/users/alice", "work", Some("Work"), 0, None, Some("VEVENT"), false, 1)
+                .await;
+            env.seed_calendar_object(cal, "e.ics", b"BEGIN:VCALENDAR\r\nEND:VCALENDAR\r\n", "VEVENT", 0)
+                .await;
+            env.seed_token(USER, USER, PASSWORD, 1, 2).await;
+            let app = env.app_shared();
+            let path = "/remote.php/dav/calendars/alice/work/";
+            // An unimplemented property delegates.
+            let body = r#"<cal:calendar-multiget xmlns:d="DAV:" xmlns:cal="urn:ietf:params:xml:ns:caldav" xmlns:x="http://example.com/ns"><d:prop><d:getetag/><x:whatever/></d:prop><d:href>/remote.php/dav/calendars/alice/work/e.ics</d:href></cal:calendar-multiget>"#;
+            let resp = report(&app, path, USER, PASSWORD, body).await;
+            ensure!(resp.status == 501, "an unknown REPORT prop must delegate, got {}", resp.status);
+            // A known-404 property stays a 404 propstat, not a 501.
+            let body = r#"<cal:calendar-multiget xmlns:d="DAV:" xmlns:cal="urn:ietf:params:xml:ns:caldav"><d:prop><d:getetag/><cal:schedule-tag/></d:prop><d:href>/remote.php/dav/calendars/alice/work/e.ics</d:href></cal:calendar-multiget>"#;
+            let resp = report(&app, path, USER, PASSWORD, body).await;
+            ensure!(resp.status == 207, "schedule-tag must be served, got {}", resp.status);
+            let d = doc(&resp.body);
+            let r = response(&d, "/remote.php/dav/calendars/alice/work/e.ics").unwrap();
+            ensure!(
+                propstat_404(r, "urn:ietf:params:xml:ns:caldav", "schedule-tag"),
+                "schedule-tag must be a 404 propstat"
+            );
+        }
+        "calendars-sync-nresults-zero" => {
+            let env = match TestEnv::new().await {
+                Some(env) => env,
+                None => return Ok(()),
+            };
+            env.seed_user(USER, Some("Alice A")).await;
+            let cal = env
+                .seed_calendar("principals/users/alice", "work", Some("Work"), 0, None, Some("VEVENT"), false, 1)
+                .await;
+            env.seed_calendar_object(cal, "a.ics", b"BEGIN:VCALENDAR\r\nEND:VCALENDAR\r\n", "VEVENT", 0)
+                .await;
+            env.seed_calendar_object(cal, "b.ics", b"BEGIN:VCALENDAR\r\nEND:VCALENDAR\r\n", "VEVENT", 0)
+                .await;
+            env.seed_token(USER, USER, PASSWORD, 1, 2).await;
+            let app = env.app_shared();
+            let path = "/remote.php/dav/calendars/alice/work/";
+            // `setMaxResults(0)` => zero rows, and because `$limit` is falsy the
+            // initial-sync 507 must NOT fire.
+            for token in ["", "http://sabre.io/ns/sync/1"] {
+                let body = format!(
+                    r#"<d:sync-collection xmlns:d="DAV:"><d:sync-token>{token}</d:sync-token><d:limit><d:nresults>0</d:nresults></d:limit><d:prop><d:getetag/></d:prop></d:sync-collection>"#
+                );
+                let resp = report(&app, path, USER, PASSWORD, &body).await;
+                ensure!(
+                    resp.status == 207,
+                    "nresults=0 with token {token:?} must be 207, got {}",
+                    resp.status
+                );
+                let d = doc(&resp.body);
+                ensure!(
+                    responses(&d).is_empty(),
+                    "nresults=0 with token {token:?} must return zero responses, got {}",
+                    responses(&d).len()
+                );
+            }
+        }
+        "calendars-sync-float-token" => {
+            let env = match TestEnv::new().await {
+                Some(env) => env,
+                None => return Ok(()),
+            };
+            env.seed_user(USER, Some("Alice A")).await;
+            let cal = env
+                .seed_calendar("principals/users/alice", "work", Some("Work"), 0, None, Some("VEVENT"), false, 1)
+                .await;
+            env.seed_calendar_object(cal, "a.ics", b"BEGIN:VCALENDAR\r\nEND:VCALENDAR\r\n", "VEVENT", 0)
+                .await;
+            env.seed_token(USER, USER, PASSWORD, 1, 2).await;
+            let app = env.app_shared();
+            let path = "/remote.php/dav/calendars/alice/work/";
+            // `is_numeric('1.5')`/`is_numeric('1e3')` are true, so PHP treats
+            // them as *incremental* and its own query rejects the raw token.
+            for token in ["1.5", "1e3"] {
+                let body = format!(
+                    r#"<d:sync-collection xmlns:d="DAV:"><d:sync-token>http://sabre.io/ns/sync/{token}</d:sync-token><d:prop><d:getetag/></d:prop></d:sync-collection>"#
+                );
+                let resp = report(&app, path, USER, PASSWORD, &body).await;
+                ensure!(
+                    resp.status == 500,
+                    "token {token:?} must be incremental and fail like PHP (500), got {}",
+                    resp.status
+                );
+            }
         }
         other => {
             return Err(format!(

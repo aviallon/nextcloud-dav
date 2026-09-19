@@ -15,6 +15,9 @@ pub const NS_CALENDARSERVER: &str = "http://calendarserver.org/ns/";
 pub const NS_SABREDAV: &str = "http://sabredav.org/ns";
 pub const NS_OWNCLOUD: &str = "http://owncloud.org/ns";
 pub const NS_NEXTCLOUD: &str = "http://nextcloud.com/ns";
+/// The iCal namespace (`http://apple.com/ns/ical/`), bound to the `apple`
+/// prefix in a CalDAV multistatus.
+pub const NS_APPLE: &str = "http://apple.com/ns/ical/";
 /// The **files** `nc` namespace (`FilesPlugin::NS_NEXTCLOUD`). It differs from
 /// the CardDAV/CalDAV sharing one (`NS_NEXTCLOUD`) and is bound to the `nc`
 /// prefix in a files multistatus, exactly like Nextcloud.
@@ -48,6 +51,7 @@ impl PropQName {
             NS_SABREDAV => Some("s"),
             NS_OWNCLOUD => Some("oc"),
             NS_NEXTCLOUD | NS_NEXTCLOUD_FILES => Some("nc"),
+            NS_APPLE => Some("apple"),
             NS_OCS => Some("ocs"),
             _ => None,
         }
@@ -217,12 +221,28 @@ impl MultiStatus {
         ("nc", NS_NEXTCLOUD),
     ];
 
+    /// The CalDAV namespace map (`d`, `s`, `cal`, `cs`, `oc`, `nc`, `apple`),
+    /// matching a Nextcloud CalDAV `PROPFIND` response.
+    pub const CALDAV_NAMESPACES: &'static [(&'static str, &'static str)] = &[
+        ("d", NS_DAV),
+        ("s", NS_SABREDAV),
+        ("cal", NS_CALDAV),
+        ("cs", NS_CALENDARSERVER),
+        ("oc", NS_OWNCLOUD),
+        ("nc", NS_NEXTCLOUD),
+        ("apple", NS_APPLE),
+    ];
+
     pub fn to_xml(&self) -> String {
         self.to_xml_with(Self::CARDDAV_NAMESPACES)
     }
 
     pub fn to_xml_files(&self) -> String {
         self.to_xml_with(Self::FILES_NAMESPACES)
+    }
+
+    pub fn to_xml_caldav(&self) -> String {
+        self.to_xml_with(Self::CALDAV_NAMESPACES)
     }
 
     pub fn to_xml_with(&self, namespaces: &[(&str, &str)]) -> String {

@@ -61,6 +61,98 @@ pub fn parse_sync_token(raw: Option<&str>) -> Result<SyncToken> {
         .map_err(|_| Error::InvalidSyncToken)
 }
 
+/// A parsed CalDAV `{DAV:}sync-token`.
+///
+/// CalDAV differs from CardDAV in two ways that matter here:
+/// * there is **no** `init_` paging (`CalDavBackend::getChangesForCalendar()`
+///   has no `init_` branch);
+/// * the numeric/initial decision is PHP's `is_numeric()`, which accepts
+///   whitespace-padded, float and scientific strings (` 7`, `1.5`, `1e3`);
+///   anything else is an initial sync, with the limit applied rather than
+///   rejected.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CalendarSyncToken {
+    /// No token element value at all, or an empty one (`!$syncToken`).
+    EmptyInitial,
+    /// A non-empty, non-numeric token (e.g. `abc`, `init_5_7`).
+    NonNumericInitial,
+    /// An integer token (after trimming PHP-legal whitespace).
+    Changes(i64),
+    /// `is_numeric()` true but not an exact integer (`1.5`, `1e3`). PHP sends
+    /// the raw string to the database, which then rejects it; the sidecar does
+    /// the same via [`crate::db::Db::calendar_changes_raw`].
+    NumericRaw(String),
+}
+
+/// PHP's `is_numeric()` (8.x): optional leading/trailing ASCII whitespace, an
+/// optional sign, then a decimal/float/exponent form; hexadecimal and binary
+/// prefixes are **not** numeric.
+pub fn php_is_numeric(raw: &str) -> bool {
+    let value = raw.trim_matches(|c: char| c.is_ascii_whitespace());
+    let bytes = value.as_bytes();
+    if bytes.is_empty() {
+        return false;
+    }
+    let mut index = 0;
+    if matches!(bytes[index], b'+' | b'-') {
+        index += 1;
+    }
+    let mut integer_digits = 0;
+    while index < bytes.len() && bytes[index].is_ascii_digit() {
+        index += 1;
+        integer_digits += 1;
+    }
+    let mut fraction_digits = 0;
+    if index < bytes.len() && bytes[index] == b'.' {
+        index += 1;
+        while index < bytes.len() && bytes[index].is_ascii_digit() {
+            index += 1;
+            fraction_digits += 1;
+        }
+    }
+    if integer_digits == 0 && fraction_digits == 0 {
+        return false;
+    }
+    if index < bytes.len() && matches!(bytes[index], b'e' | b'E') {
+        index += 1;
+        if index < bytes.len() && matches!(bytes[index], b'+' | b'-') {
+            index += 1;
+        }
+        let mut exponent_digits = 0;
+        while index < bytes.len() && bytes[index].is_ascii_digit() {
+            index += 1;
+            exponent_digits += 1;
+        }
+        if exponent_digits == 0 {
+            return false;
+        }
+    }
+    index == bytes.len()
+}
+
+/// Parses a CalDAV request token, applying the Sabre prefix check.
+///
+/// An absent/empty value is an initial sync; a value without the Sabre prefix
+/// is `InvalidSyncToken` (403 + `<d:valid-sync-token/>`).
+pub fn parse_calendar_sync_token(raw: Option<&str>) -> Result<CalendarSyncToken> {
+    let Some(raw) = raw else {
+        return Ok(CalendarSyncToken::EmptyInitial);
+    };
+    let Some(rest) = raw.strip_prefix(SYNCTOKEN_PREFIX) else {
+        return Err(Error::InvalidSyncToken);
+    };
+    if rest.is_empty() {
+        return Ok(CalendarSyncToken::EmptyInitial);
+    }
+    if !php_is_numeric(rest) {
+        return Ok(CalendarSyncToken::NonNumericInitial);
+    }
+    match rest.trim_matches(|c: char| c.is_ascii_whitespace()).parse::<i64>() {
+        Ok(token) => Ok(CalendarSyncToken::Changes(token)),
+        Err(_) => Ok(CalendarSyncToken::NumericRaw(rest.to_string())),
+    }
+}
+
 /// A page of sync results, before it is turned into a `{DAV:}multistatus`.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct SyncPage {
@@ -208,6 +300,89 @@ mod tests {
                 token: 7
             }
         );
+    }
+
+    #[test]
+    fn calendar_token_absent_or_empty_is_initial() {
+        assert_eq!(
+            parse_calendar_sync_token(None).unwrap(),
+            CalendarSyncToken::EmptyInitial
+        );
+        assert_eq!(
+            parse_calendar_sync_token(Some("http://sabre.io/ns/sync/")).unwrap(),
+            CalendarSyncToken::EmptyInitial
+        );
+    }
+
+    #[test]
+    fn calendar_token_without_prefix_is_invalid() {
+        assert!(parse_calendar_sync_token(Some("42")).is_err());
+        assert!(parse_calendar_sync_token(Some("bogus")).is_err());
+    }
+
+    #[test]
+    fn calendar_numeric_token_is_incremental() {
+        assert_eq!(
+            parse_calendar_sync_token(Some("http://sabre.io/ns/sync/42")).unwrap(),
+            CalendarSyncToken::Changes(42)
+        );
+        assert_eq!(
+            parse_calendar_sync_token(Some("http://sabre.io/ns/sync/0")).unwrap(),
+            CalendarSyncToken::Changes(0)
+        );
+    }
+
+    #[test]
+    fn calendar_non_numeric_token_is_initial_not_invalid() {
+        // PHP's `!is_numeric()` sends `abc` and `init_5_7` down the initial
+        // branch; only a missing prefix is an error.
+        assert_eq!(
+            parse_calendar_sync_token(Some("http://sabre.io/ns/sync/abc")).unwrap(),
+            CalendarSyncToken::NonNumericInitial
+        );
+        assert_eq!(
+            parse_calendar_sync_token(Some("http://sabre.io/ns/sync/init_5_7")).unwrap(),
+            CalendarSyncToken::NonNumericInitial
+        );
+        // Hexadecimal is not numeric in PHP either.
+        assert_eq!(
+            parse_calendar_sync_token(Some("http://sabre.io/ns/sync/0x10")).unwrap(),
+            CalendarSyncToken::NonNumericInitial
+        );
+    }
+
+    #[test]
+    fn calendar_numeric_but_non_integer_token_is_incremental() {
+        // PHP's `is_numeric()` accepts these, so they are *incremental*: the
+        // raw string goes to the database, which rejects `1.5`/`1e3` exactly
+        // like PHP's own `setMaxResults()` query does.
+        assert_eq!(
+            parse_calendar_sync_token(Some("http://sabre.io/ns/sync/1.5")).unwrap(),
+            CalendarSyncToken::NumericRaw("1.5".to_string())
+        );
+        assert_eq!(
+            parse_calendar_sync_token(Some("http://sabre.io/ns/sync/1e3")).unwrap(),
+            CalendarSyncToken::NumericRaw("1e3".to_string())
+        );
+        // PHP-legal whitespace and a sign are still integers.
+        assert_eq!(
+            parse_calendar_sync_token(Some("http://sabre.io/ns/sync/ 7 ")).unwrap(),
+            CalendarSyncToken::Changes(7)
+        );
+        assert_eq!(
+            parse_calendar_sync_token(Some("http://sabre.io/ns/sync/+7")).unwrap(),
+            CalendarSyncToken::Changes(7)
+        );
+    }
+
+    #[test]
+    fn php_is_numeric_matches_php() {
+        for value in ["1", "-1", "+1", "1.5", ".5", "5.", "1e3", "1.5E-2", " 7", "7 "] {
+            assert!(php_is_numeric(value), "{value:?} must be numeric");
+        }
+        for value in ["", " ", "abc", "0x10", "0b1", "1_0", "1,5", "nan", "inf", "1e"] {
+            assert!(!php_is_numeric(value), "{value:?} must not be numeric");
+        }
     }
 
     #[test]

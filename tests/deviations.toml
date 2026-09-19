@@ -509,3 +509,133 @@ sidecar = "nc:language is served from force_language or core/lang. When neither 
 why = "Delegating an underivable value is always safe; the reference instance's users have core/lang, so the property is served natively there."
 test = "tests/deviations.rs::every_declared_deviation_holds (id=discovery-language-request-fallback)"
 evidence = "src/discovery.rs:handle_propfind; lib/private/L10N/Factory.php:getUserLanguage"
+
+[[deviation]]
+id = "calendars-property-gate-501"
+area = "propfind"
+status = "intentional"
+nextcloud = "A CalDAV PROPFIND for a property Nextcloud serves returns it; for a property it does not know it returns a 404 propstat. `{cs}publish-url` is 200 for a published calendar and 404 otherwise."
+sidecar = "An explicit calendars PROPFIND whose property list contains any qname outside the implemented/known-404 set is answered 501 (delegated to PHP), never 404. Publish state, `{DAV:}invite` for an owned calendar with outgoing shares, and `limitAddressBookAndCalendarSharingToOwner=yes` are not modelled, so `{cs}publish-url`, `{DAV:}invite` and those sharing modes delegate. Properties PHP 404s (`{DAV:}quota-*`, `{DAV:}share-access`, `{DAV:}getlastmodified`, ...) are still answered 404, not 501."
+why = "A 404 would claim a property PHP serves is absent, which silently breaks clients. The implemented set is the exact live 200 set captured from Nextcloud 33.0.5."
+test = "tests/deviations.rs::every_declared_deviation_holds (id=calendars-property-gate-501)"
+evidence = "src/calendars.rs:gate_ok; src/calendars.rs:is_known_404_calendar"
+
+[[deviation]]
+id = "calendars-special-children-acl-delegated"
+area = "delegation"
+status = "intentional"
+nextcloud = "The calendar-home Depth:1 listing includes `inbox`, `outbox` and `trashbin`, and each carries `{DAV:}acl` and `{DAV:}current-user-privilege-set` (schedule-deliver/... for the inbox, schedule-send/... for the outbox, `{DAV:}all` for the trashbin)."
+sidecar = "A home Depth:1 PROPFIND that requests `{DAV:}acl` or `{DAV:}current-user-privilege-set` is answered 501 (delegated), because the special children's ACLs are not modelled. The calendar and home nodes' own ACL/privilege sets are served natively at Depth 0."
+why = "Emitting a 404 for a property PHP serves on a special child would be wrong; delegating the whole listing is safe. The primary clients' home listing does not request those two properties."
+test = "tests/deviations.rs::every_declared_deviation_holds (id=calendars-special-children-acl-delegated)"
+evidence = "src/calendars.rs:handle_home"
+
+[[deviation]]
+id = "calendars-trashed-subscriptions-federated-delegated"
+area = "delegation"
+status = "intentional"
+nextcloud = "getCalendarsForUser() returns trashed calendars (with a `{nc}deleted-calendar` resourcetype) and the home also lists subscriptions (oc_calendarsubscriptions) and accepted federated calendars (oc_calendars_federated)."
+sidecar = "A home Depth:1 PROPFIND by a caller that owns a trashed calendar, a subscription or an accepted federated calendar is answered 501 (delegated). A clean listing with no such rows is served natively."
+why = "The subset model cannot reproduce those children; a clean 501 is preferred over an approximate listing."
+test = "tests/deviations.rs::every_declared_deviation_holds (id=calendars-trashed-subscriptions-federated-delegated)"
+evidence = "src/db.rs:has_trashed_calendars; src/db.rs:has_calendar_subscriptions; src/db.rs:has_federated_calendars"
+
+[[deviation]]
+id = "calendars-own-home-only"
+area = "delegation"
+status = "intentional"
+nextcloud = "Any authenticated user can PROPFIND another user's calendar home or calendar; the response mixes the target's children with caller-scoped properties."
+sidecar = "Only the authenticated user's own home and calendars are served. Another principal's `/calendars/<other>/` answers 501 so nginx replays it to PHP."
+why = "The response is caller-scoped; reproducing it from the target uid alone would be inventing an answer. Delegation is safe and clients only ever list their own home."
+test = "tests/deviations.rs::every_declared_deviation_holds (id=calendars-own-home-only)"
+evidence = "src/calendars.rs:handle_propfind"
+
+[[deviation]]
+id = "calendars-shared-listing-order"
+area = "routing"
+status = "intentional"
+nextcloud = "The shared-calendar query in getCalendarsForUser() adds no ORDER BY, so shared rows come back in database order."
+sidecar = "visible_calendars() returns owned calendars first (in calendarorder) and then shared rows ORDER BY a.id."
+why = "Deterministic output is friendlier to clients and diffing; owned-first is also required for the wire-name collision rule (Sabre returns the first matching child). The set is identical."
+test = "tests/deviations.rs::every_declared_deviation_holds (id=calendars-shared-listing-order)"
+evidence = "src/db.rs:visible_calendars"
+
+[[deviation]]
+id = "calendars-personal-displayname-localized"
+area = "propfind"
+status = "resolved"
+nextcloud = "Calendar::__construct() localizes the displayname of the `personal` calendar (when the uri is `personal` and the stored name is exactly `Personal`) and of `contact_birthdays` (when the uri is `contact_birthdays` and the stored name equals `Contact birthdays` case-insensitively) through the `dav` app's l10n for the user's language."
+sidecar = "Reproduces both rewrites: the `dav` app's `<server-root>/apps/dav/l10n/<lang>.json` is loaded (and cached) for the language `L10N\Factory::findLanguage('dav')` resolves (force_language, core/lang, Accept-Language, default_language, en) and applied to the wire displayname. A key absent from a readable file leaves the stored string (the identity is then the correct translation). If the l10n source cannot be read at all (the directory or the resolved `<lang>.json` is missing/malformed) and a displayname *would* be translated, the request is answered 501 so nginx replays it to PHP rather than serving the untranslated English name. A displayname that is not one of the two special cases is served regardless of the l10n tree."
+why = "Previously the stored English string was served, so a non-English user saw the wrong name for the two most common calendars. The l10n tree is read from the server root derived from config_path, so the sidecar must share the Nextcloud tree (it does in production). When it does not, a silent English answer is the one failure mode the sidecar must not have; the 501 is the standard fallback and PHP then supplies the correct translation, so the client-visible behaviour still matches PHP."
+test = "tests/deviations.rs::every_declared_deviation_holds (id=calendars-personal-displayname-localized)"
+evidence = "src/l10n.rs; src/calendars.rs:handle_home; apps/dav/lib/CalDAV/Calendar.php:53-58; lib/private/L10N/Factory.php:findLanguage"
+
+[[deviation]]
+id = "calendars-sync-nresults-zero"
+area = "report"
+status = "resolved"
+nextcloud = "A `<d:limit><d:nresults>0</d:nresults></d:limit>` in `sync-collection` reaches `setMaxResults(0)`, i.e. zero rows. `Calendar::getChanges()` only throws `UnsupportedLimitOnInitialSyncException` when `$limit` is truthy, so an initial sync with `0` is a 207 with no responses, not a 507."
+sidecar = "`parse_sync_collection()` preserves `nresults = 0`; the initial and incremental queries apply `LIMIT 0` and the 507 is only raised for a non-zero limit. (For `addressbook-query` Sabre tests `if ($report->limit)`, where `0` is falsy, so that path still drops it.)"
+why = "The shared `nresults` parser dropped `0`, so the sidecar treated it as 'no limit' and returned every object where PHP returns none."
+test = "tests/deviations.rs::every_declared_deviation_holds (id=calendars-sync-nresults-zero)"
+evidence = "src/xml/parse.rs:nresults_sync; src/calendars.rs:handle_calendar_sync; apps/dav/lib/CalDAV/Calendar.php:getChanges"
+
+[[deviation]]
+id = "calendars-sync-float-token"
+area = "report"
+status = "resolved"
+nextcloud = "`is_numeric('1.5')` and `is_numeric('1e3')` are true, so `getChangesForCalendar()` takes the incremental branch and binds the raw token against the `int` `synctoken` column; PostgreSQL then raises `invalid input syntax for type integer` and the request is a 500."
+sidecar = "`parse_calendar_sync_token()` uses a PHP-equivalent `is_numeric()`; a numeric token that is not an exact integer is `NumericRaw` and is bound as text through `CAST(CAST(? AS text) AS integer)`, so PostgreSQL rejects it with the same error and the request is a 500 (rather than an initial sync)."
+why = "The sidecar previously fell back to the initial-sync branch and returned every object. PHP-legal whitespace (` 7`, `7 `) and a sign (`+7`) are still parsed as integers."
+test = "tests/deviations.rs::every_declared_deviation_holds (id=calendars-sync-float-token)"
+evidence = "src/sync.rs:php_is_numeric; src/db.rs:calendar_changes_raw; apps/dav/lib/CalDAV/CalDavBackend.php:getChangesForCalendar"
+
+[[deviation]]
+id = "calendars-group-share-acl-delegated"
+area = "delegation"
+status = "intentional"
+nextcloud = "A calendar shared through a group or circle principal appears in the home listing and its ACL carries the group sharee ACEs added by applyShareAcl()."
+sidecar = "The home listing includes group-shared calendars natively, but a Depth:0 PROPFIND on such a calendar that requests `{DAV:}acl` is answered 501 (delegated); the direct-user share ACL is reproduced exactly."
+why = "Only the direct-user share ACL was captured and modelled. Delegating the group-share ACL avoids emitting a wrong ACE list."
+test = "tests/deviations.rs::every_declared_deviation_holds (id=calendars-group-share-acl-delegated)"
+evidence = "src/calendars.rs:handle_calendar"
+
+[[deviation]]
+id = "calendars-objects-and-query-delegated"
+area = "delegation"
+status = "intentional"
+nextcloud = "Objects (`GET`/`PROPFIND`/`PUT`/`DELETE`), `trashbin/`, `inbox`/`outbox`, subscriptions, `calendar-query`, `<cal:expand>`, `application/calendar+json`, free-busy, `?export` and all writes are served by Sabre/PHP."
+sidecar = "Every one of those paths/methods answers 501 so nginx replays the request to PHP. The sidecar serves the calendar home/calendar PROPFIND and the `sync-collection`/`calendar-multiget` REPORTs on an owned calendar."
+why = "`calendar-query` needs recurrence-aware iCalendar evaluation and `expand` re-serialises; the object GET/PROPFIND and the write paths are not modelled. Delegation is safe and is what nginx already does for unmodelled CalDAV traffic."
+test = "tests/deviations.rs::every_declared_deviation_holds (id=calendars-objects-and-query-delegated)"
+evidence = "src/calendars.rs:handle_report; src/routes.rs:handle_calendars"
+
+[[deviation]]
+id = "calendars-report-shared-delegated"
+area = "delegation"
+status = "intentional"
+nextcloud = "A REPORT (`sync-collection`/`calendar-multiget`) on a calendar shared with the caller is served; the CalDAV plugin post-processes each object (`VALARM` stripping on a read-only share, `CONFIDENTIAL` masking) and suppresses `{DAV:}getcontentlength`."
+sidecar = "A REPORT on a shared calendar, a trashed calendar or a subscription answers 501 so nginx replays it to PHP. Only owned, live calendars are served natively."
+why = "The shared object post-processing is a parse-and-re-serialise path that would not be byte-faithful to the stored blob; answering from a subset would silently drop `VALARM`s or leak confidential details. Delegation is the safe choice."
+test = "tests/deviations.rs::every_declared_deviation_holds (id=calendars-report-shared-delegated)"
+evidence = "src/calendars.rs:handle_report"
+
+[[deviation]]
+id = "calendars-report-expand-json-delegated"
+area = "delegation"
+status = "intentional"
+nextcloud = "`<cal:expand start end>` inside `calendar-data` expands recurrences and re-serialises (the ETag no longer matches the body); `content-type=\"application/calendar+json\"` returns `VObject::jsonSerialize()`."
+sidecar = "A `calendar-multiget` whose `calendar-data` carries `<cal:expand>` or `content-type=\"application/calendar+json\"` answers 501 so nginx replays it to PHP."
+why = "Both need a full iCalendar engine (`VCalendar::expand` / `jsonSerialize`); the sidecar deliberately does not re-serialise iCalendar. The two `limit-*` options are not implemented by Sabre at all, so they are ignored like PHP does."
+test = "tests/deviations.rs::every_declared_deviation_holds (id=calendars-report-expand-json-delegated)"
+evidence = "src/calendars.rs:handle_calendar_multiget"
+
+[[deviation]]
+id = "calendars-report-property-gate-501"
+area = "report"
+status = "intentional"
+nextcloud = "A REPORT whose `<d:prop>` asks for an unknown property returns a 404 `propstat` for that property on each object."
+sidecar = "A REPORT whose property list contains any qname outside the implemented/known-404 object set answers 501 (delegated), never a 404. Properties PHP 404s on a calendar object (`{caldav}schedule-tag`, `{oc}size`, `{DAV:}quota-*`, `{nc}deleted-at`, ...) are still answered 404."
+why = "A 404 would claim a property PHP serves is absent, which silently breaks clients. The implemented set is the live 200 set captured from Nextcloud 33.0.5."
+test = "tests/deviations.rs::every_declared_deviation_holds (id=calendars-report-property-gate-501)"
+evidence = "src/calendars.rs:object_gate_ok; src/calendars.rs:is_known_404_object"

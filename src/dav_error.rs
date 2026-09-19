@@ -49,6 +49,12 @@ pub fn dav_error(status: StatusCode, exception: &str, message: &str, extra: &str
         header::CONTENT_TYPE,
         HeaderValue::from_static("application/xml; charset=utf-8"),
     );
+    // Every `dav_error` is a body the sidecar produced itself (never a
+    // delegated 501), so it carries the attribution header.
+    response.headers_mut().insert(
+        crate::routes::SIDECAR_HEADER,
+        HeaderValue::from_static(crate::routes::SIDECAR_VALUE),
+    );
     response
 }
 
@@ -59,6 +65,18 @@ pub fn invalid_sync_token() -> Response {
         "Sabre\\DAV\\Exception\\InvalidSyncToken",
         "Invalid or unknown sync token",
         "<d:valid-sync-token/>",
+    )
+}
+
+/// `OCA\DAV\Exception\UnsupportedLimitOnInitialSyncException` (507 +
+/// `<d:number-of-matches-within-limits/>`), thrown by `Calendar::getChanges()`
+/// when an initial `sync-collection` carries a `<d:limit>`.
+pub fn unsupported_limit_on_initial_sync() -> Response {
+    dav_error(
+        StatusCode::INSUFFICIENT_STORAGE,
+        "OCA\\DAV\\Exception\\UnsupportedLimitOnInitialSyncException",
+        "",
+        "<d:number-of-matches-within-limits/>",
     )
 }
 
