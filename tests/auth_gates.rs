@@ -8,7 +8,7 @@
 
 use nextcloud_dav::auth::throttle::{calculate_delay, normalized_subnet, MAX_DELAY_MS};
 use nextcloud_dav::auth::token::{hash_token, hash_token_without_secret, login_name_matches};
-use nextcloud_dav::auth::{classify_token_state, now_unix, TokenDecision};
+use nextcloud_dav::auth::{classify_session_token_state, classify_token_state, now_unix, TokenDecision};
 use nextcloud_dav::model::AuthToken;
 use std::net::IpAddr;
 use std::str::FromStr;
@@ -22,6 +22,7 @@ fn token(token_type: i64, uid: &str, login_name: &str, last_check: i64) -> AuthT
         token_type,
         expires: None,
         password_invalid: false,
+        password_is_null: false,
         last_check,
         last_activity: last_check,
     }
@@ -151,6 +152,44 @@ fn stale_last_check_delegates_at_300s_boundary() {
         classify_token_state(&stale, "alice", NOW, true, false),
         TokenDecision::Fallback
     );
+}
+
+#[test]
+fn session_passwordless_temporary_token_is_accepted_in_and_beyond_the_window() {
+    let mut row = token(0, "alice", "alice", NOW);
+    row.password_is_null = true;
+    // Within the 300 s window.
+    assert!(matches!(
+        classify_session_token_state(&row, "alice", NOW, false),
+        TokenDecision::Accept(_)
+    ));
+    // Beyond it: passwordless still validates.
+    assert!(matches!(
+        classify_session_token_state(&row, "alice", NOW + 1, false),
+        TokenDecision::Accept(_)
+    ));
+    assert!(matches!(
+        classify_session_token_state(&row, "alice", NOW + 3600, false),
+        TokenDecision::Accept(_)
+    ));
+}
+
+#[test]
+fn session_stale_password_bearing_token_delegates() {
+    // An app-password token with a password and a stale last_check: the
+    // sidecar cannot re-run checkPassword, so it delegates.
+    let row = token(1, "alice", "alice", NOW - 301);
+    assert_eq!(
+        classify_session_token_state(&row, "alice", NOW, false),
+        TokenDecision::Fallback
+    );
+    // A passwordless token with the same stale check is accepted.
+    let mut passwordless = token(1, "alice", "alice", NOW - 301);
+    passwordless.password_is_null = true;
+    assert!(matches!(
+        classify_session_token_state(&passwordless, "alice", NOW, false),
+        TokenDecision::Accept(_)
+    ));
 }
 
 #[test]

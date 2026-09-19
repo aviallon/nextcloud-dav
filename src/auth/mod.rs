@@ -4,6 +4,8 @@
 //! Authentication: the app-password fast path, the PHP fallback and the
 //! brute-force throttle in front of both.
 
+pub mod session;
+pub mod session_redis;
 pub mod throttle;
 pub mod token;
 
@@ -11,6 +13,7 @@ use crate::config::{BruteforceConfig, TOKEN_RECHECK_INTERVAL};
 use crate::db::Db;
 use crate::model::AuthToken;
 use crate::php::{PhpAuth, PhpClient};
+use axum::http::HeaderMap;
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -20,6 +23,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 pub enum AuthMethod {
     /// Validated against `oc_authtoken` without PHP.
     FastPath,
+    /// Validated from a Nextcloud session cookie and its Redis payload.
+    Session,
     /// Delegated to `PROPFIND /remote.php/dav/`.
     PhpFallback,
 }
@@ -105,20 +110,89 @@ pub fn classify_token_state(
     TokenDecision::Accept(row.uid.clone())
 }
 
+/// Evaluates the token gate for the **session-cookie** path, which follows
+/// `OC\User\Session::checkTokenCredentials()` rather than the app-password fast
+/// path.
+///
+/// The session token is `session['app_password']` when present, else the
+/// session id. `OC\Authentication\Token\PublicKeyTokenProvider::getToken()`
+/// rejects an expired token and a `WIPE_TOKEN` (type 2), so those delegate.
+/// Every other type, including a browser session's `TEMPORARY_TOKEN` (0), is
+/// valid - type is not a rejection criterion here. Then
+/// `checkTokenCredentials()` accepts when the token was checked within the last
+/// 300 s, or when it is passwordless (`password IS NULL`). An app-password
+/// token that carries a password and a stale `last_check` needs
+/// `checkPassword()`, which the sidecar cannot reproduce, so it delegates.
+/// The enabled-user check is already enforced by the caller (`user_disabled`).
+pub fn classify_session_token_state(
+    row: &AuthToken,
+    session_uid: &str,
+    now: i64,
+    user_disabled: bool,
+) -> TokenDecision {
+    // `getToken()` throws `WipeTokenException`; never authenticate a marker.
+    if row.token_type == 2 {
+        return TokenDecision::Reject;
+    }
+    // `getToken()` throws `ExpiredTokenException`; delegate for the same audit
+    // trail as the fast path (a non-zero `expires` in the past).
+    if let Some(expires) = row.expires {
+        if expires < now {
+            return TokenDecision::Fallback;
+        }
+    }
+    if row.password_invalid {
+        return TokenDecision::Reject;
+    }
+    if row.uid.is_empty() || row.uid != session_uid {
+        return TokenDecision::Reject;
+    }
+    if user_disabled {
+        return TokenDecision::Reject;
+    }
+    // `checkTokenCredentials()`: `$lastCheck > ($now - 300)` returns true.
+    if row.last_check > now - TOKEN_RECHECK_INTERVAL {
+        return TokenDecision::Accept(row.uid.clone());
+    }
+    // `getPassword()` throws `PasswordlessTokenException`: valid with no
+    // password, so `checkTokenCredentials()` returns true without re-checking
+    // the login credentials.
+    if row.password_is_null {
+        return TokenDecision::Accept(row.uid.clone());
+    }
+    // Password-bearing token with a stale check: the sidecar cannot run
+    // `checkPassword()`, so delegate.
+    TokenDecision::Fallback
+}
+
 pub struct Authenticator {
     db: Arc<Db>,
     php: PhpClient,
     secret: String,
     bruteforce: BruteforceConfig,
+    /// `session.save_path` for the Redis session store. `None` keeps session
+    /// auth delegated to PHP.
+    session_redis: Option<session_redis::RedisConfig>,
+    /// `$CONFIG['instanceid']`, part of the session cookie name.
+    instance_id: String,
 }
 
 impl Authenticator {
-    pub fn new(db: Arc<Db>, php: PhpClient, secret: String, bruteforce: BruteforceConfig) -> Self {
+    pub fn new(
+        db: Arc<Db>,
+        php: PhpClient,
+        secret: String,
+        bruteforce: BruteforceConfig,
+        session_redis: Option<session_redis::RedisConfig>,
+        instance_id: String,
+    ) -> Self {
         Self {
             db,
             php,
             secret,
             bruteforce,
+            session_redis,
+            instance_id,
         }
     }
 
@@ -177,6 +251,103 @@ impl Authenticator {
         }
 
         self.php_fallback(username, password, ip).await
+    }
+
+    /// Attempts the Nextcloud **session-cookie** path. Returns `None` on any
+    /// uncertainty; the caller must then delegate (501).
+    ///
+    /// The order is design doc §6: cookies -> Redis -> crypto -> JSON ->
+    /// user_id -> user exists/enabled -> token revalidation -> 2FA -> the two
+    /// acceptance branches with PHP's CSRF rule.
+    pub async fn authenticate_session(
+        &self,
+        headers: &HeaderMap,
+        method: &str,
+        query: Option<&str>,
+    ) -> Option<AuthenticatedUser> {
+        let redis = self.session_redis.as_ref()?;
+        if self.instance_id.is_empty() {
+            return None;
+        }
+
+        // Step 1: both cookies must be present.
+        let session_id =
+            session::cookie_value(headers, &session::session_cookie_name(&self.instance_id))?;
+        let passphrase = session::cookie_value(headers, "oc_sessionPassphrase")?;
+        if session_id.is_empty() || passphrase.is_empty() {
+            return None;
+        }
+
+        // Step 2: the session must exist in Redis.
+        let key = format!("PHPREDIS_SESSION:{session_id}");
+        let raw = match session_redis::get(redis, &key).await {
+            Ok(Some(raw)) => raw,
+            Ok(None) => {
+                log::debug!("session cookie references a missing session");
+                return None;
+            }
+            Err(error) => {
+                log::warn!("session store unavailable; delegating DAV request: {error}");
+                return None;
+            }
+        };
+
+        // Step 3: extract, verify and decrypt the envelope.
+        let json = session::extract_and_decrypt(&raw, &passphrase)?;
+        let payload = session::SessionPayload::parse(&json)?;
+
+        // Step 4: user_id.
+        let uid = payload.user_id.clone();
+
+        // Step 5: the user must be a native, enabled account.
+        let native = self.db.native_user_exists(&uid).await.ok()?;
+        if !native {
+            return None;
+        }
+        let disabled = self.db.user_is_disabled(&uid).await.ok()?;
+        if disabled {
+            return None;
+        }
+
+        // Step 6: token revalidation (`Session::validateSession()`). An
+        // app-password session validates the app password; a browser session
+        // validates its session-id token. A browser session's token is a
+        // passwordless `TEMPORARY_TOKEN` (type 0), so the app-password type
+        // gate must not apply here - `classify_session_token_state` follows
+        // `Session::checkTokenCredentials()` instead. Anything it cannot prove
+        // is a `Fallback`/`Reject`, which delegates.
+        let token = match payload.app_password.as_deref() {
+            Some(app_password) => app_password,
+            None => session_id.as_str(),
+        };
+        if token.is_empty() {
+            return None;
+        }
+        let hash = token::hash_token(token, &self.secret);
+        let row = self.db.authtoken_by_hash(&hash).await.ok()??;
+        match classify_session_token_state(&row, &uid, now_unix(), disabled) {
+            TokenDecision::Accept(token_uid) if token_uid == uid => {}
+            _ => {
+                log::debug!("session token failed revalidation; delegating");
+                return None;
+            }
+        }
+
+        // Steps 7-9: 2FA and the acceptance branches, including PHP's CSRF rule.
+        let requesttoken_param = session::query_param(query, "requesttoken");
+        let facts = session::RequestFacts {
+            method,
+            requesttoken_header: headers.get("requesttoken").and_then(|v| v.to_str().ok()),
+            requesttoken_param: requesttoken_param.as_deref(),
+            strict_cookie: session::same_site_cookie(headers, "nc_sameSiteCookiestrict"),
+            lax_cookie: session::same_site_cookie(headers, "nc_sameSiteCookielax"),
+        };
+        let uid = session::decision_after_token(&payload, &facts)?;
+        log::debug!("authenticated {uid} via Nextcloud session cookie");
+        Some(AuthenticatedUser {
+            uid,
+            method: AuthMethod::Session,
+        })
     }
 
     /// Returns `Ok(Some(user))` on a fast-path success, `Ok(None)` to delegate
@@ -309,9 +480,73 @@ mod tests {
             token_type,
             expires: None,
             password_invalid: false,
+            password_is_null: false,
             last_check,
             last_activity: last_check,
         }
+    }
+
+    #[test]
+    fn session_accepts_a_passwordless_temporary_token() {
+        // A plain browser session: TEMPORARY_TOKEN (0), no password. Within the
+        // 300 s window and beyond it, both are valid (`getPassword` throws
+        // PasswordlessTokenException -> no password re-check).
+        let mut row = token_row(0, "alice", "alice", 1_000);
+        row.password_is_null = true;
+        assert_eq!(
+            classify_session_token_state(&row, "alice", 1_100, false),
+            TokenDecision::Accept("alice".to_string())
+        );
+        // Stale last_check: still accepted because it is passwordless.
+        assert_eq!(
+            classify_session_token_state(&row, "alice", 1_301, false),
+            TokenDecision::Accept("alice".to_string())
+        );
+        // Exactly at the boundary: the fresh check is false, but passwordless
+        // makes it valid anyway.
+        assert_eq!(
+            classify_session_token_state(&row, "alice", 1_300, false),
+            TokenDecision::Accept("alice".to_string())
+        );
+        // One second before the boundary the fresh check alone accepts.
+        assert!(matches!(
+            classify_session_token_state(&row, "alice", 1_299, false),
+            TokenDecision::Accept(_)
+        ));
+    }
+
+    #[test]
+    fn session_delegates_a_stale_password_bearing_token() {
+        // An app-password session whose `last_check` is stale: the sidecar
+        // cannot re-check the password it does not have, so it must delegate.
+        let row = token_row(1, "alice", "alice", 1_000);
+        assert_eq!(
+            classify_session_token_state(&row, "alice", 1_100, false),
+            TokenDecision::Accept("alice".to_string())
+        );
+        assert_eq!(
+            classify_session_token_state(&row, "alice", 1_301, false),
+            TokenDecision::Fallback
+        );
+        assert_eq!(
+            classify_session_token_state(&row, "alice", 1_300, false),
+            TokenDecision::Fallback
+        );
+    }
+
+    #[test]
+    fn session_rejects_a_different_uid_and_wipe_token() {
+        let mut row = token_row(2, "bob", "bob", 1_000);
+        assert_eq!(
+            classify_session_token_state(&row, "alice", 1_100, false),
+            TokenDecision::Reject
+        );
+        row.token_type = 0;
+        row.password_is_null = true;
+        assert_eq!(
+            classify_session_token_state(&row, "alice", 1_100, false),
+            TokenDecision::Reject
+        );
     }
 
     #[test]

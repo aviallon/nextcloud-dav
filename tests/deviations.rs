@@ -629,12 +629,12 @@ async fn assert_deviation(id: &str, f: &Fixture) -> Result<(), String> {
             }
         }
         "unauthenticated-delegates" => {
-            // No Authorization header at all. The request may still carry a
-            // Nextcloud session cookie - which is exactly how the web UI talks
-            // to DAV - or an OAuth Bearer token, and the sidecar can evaluate
-            // neither, so it must delegate rather than refuse. Refusing with 401
-            // sends `WWW-Authenticate`, which makes the browser pop up a Basic
-            // Auth prompt for a request PHP answers with 200.
+            // No Authorization header at all. When a session store is configured
+            // the sidecar first evaluates the Nextcloud session cookie (design
+            // doc §6); this test env has none, so it must delegate rather than
+            // refuse. Refusing with 401 sends `WWW-Authenticate`, which makes
+            // the browser pop up a Basic Auth prompt for a request PHP answers
+            // with 200.
             let req = axum::http::Request::builder()
                 .method("PROPFIND")
                 .uri(card_path)

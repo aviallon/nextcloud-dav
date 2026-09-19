@@ -18,6 +18,7 @@
 //! ],
 //! ```
 
+use crate::auth::session_redis::RedisConfig;
 use crate::error::{Error, Result};
 use indexmap::IndexMap;
 use nextcloud_config_parser::Config as NcConfig;
@@ -136,6 +137,10 @@ pub struct Config {
     pub nextcloud_url: String,
     pub log_level: String,
     pub bruteforce: BruteforceConfig,
+    /// `session.save_path` for the Redis session store, from
+    /// `nextcloud_dav.session_redis_url`. `None` disables session auth (every
+    /// session request delegates to PHP). The password is never logged.
+    pub session_redis: Option<RedisConfig>,
     /// The `nextcloud_dav.event_dispatch` block.
     pub event_dispatch: EventDispatchConfig,
     /// `nextcloud_dav.card_size_limit` override. When `None`, the value is read
@@ -324,6 +329,21 @@ impl Config {
                 .clamp(1, 300) as u64,
         );
 
+        // `session.save_path` for the session store. It lives in PHP's ini on
+        // production, not in `config.php`, so it is passed through the same
+        // `nextcloud_dav` extra config the harness already writes (the harness
+        // copies it from the container's ini, so the secret is not duplicated).
+        let session_redis = app
+            .and_then(|a| a.get_str_at("session_redis_url"))
+            .filter(|url| !url.is_empty())
+            .and_then(|url| {
+                let timeout = app
+                    .and_then(|a| a.get_int_at("session_redis_timeout_ms"))
+                    .unwrap_or(500)
+                    .clamp(50, 5000) as u64;
+                RedisConfig::from_url(&url, Duration::from_millis(timeout))
+            });
+
         let allow_self_signed = app
             .and_then(|a| a.get_bool_at("allow_self_signed"))
             .unwrap_or(false);
@@ -365,6 +385,7 @@ impl Config {
             nextcloud_url,
             log_level: opt.log_level.unwrap_or_else(|| "info".to_string()),
             bruteforce,
+            session_redis,
             event_dispatch,
             card_size_limit_override,
             max_connections: opt.max_connections.unwrap_or(16),

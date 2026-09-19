@@ -12,7 +12,7 @@ LOCAL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [ -f "$ENV_FILE" ]; then
 	load_env
 else
-	export DB_PASSWORD=unused ADMIN_PASSWORD=unused
+	export DB_PASSWORD=unused ADMIN_PASSWORD=unused REDIS_PASSWORD=unused
 fi
 
 stop_sidecar 2>/dev/null || true

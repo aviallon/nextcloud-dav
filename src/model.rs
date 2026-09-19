@@ -193,6 +193,11 @@ pub struct AuthToken {
     pub token_type: i64,
     pub expires: Option<i64>,
     pub password_invalid: bool,
+    /// `oc_authtoken.password IS NULL`. A passwordless token is what a plain
+    /// browser session creates; `PublicKeyTokenProvider::getPassword()` throws
+    /// `PasswordlessTokenException` for it, which `checkTokenCredentials()`
+    /// treats as valid without re-checking the login password.
+    pub password_is_null: bool,
     pub last_check: i64,
     pub last_activity: i64,
 }

@@ -1252,6 +1252,8 @@ impl TestEnv {
             php,
             self.secret.clone(),
             BruteforceConfig::default(),
+            None,
+            "testinst".to_string(),
         );
         let config = nextcloud_dav::config::Config {
             database: AnyConnectOptions::from_str(&self.url).unwrap(),
@@ -1268,6 +1270,7 @@ impl TestEnv {
             allow_self_signed: false,
             config_path: std::path::PathBuf::from("/dev/null"),
             instance_id: "testinst".to_string(),
+            session_redis: None,
             datadirectory: None,
             previews_enabled: true,
             data_fingerprint: String::new(),
@@ -1363,6 +1366,8 @@ impl TestEnv {
             php,
             self.secret.clone(),
             BruteforceConfig::default(),
+            None,
+            instance_id.to_string(),
         );
         let config = nextcloud_dav::config::Config {
             database: AnyConnectOptions::from_str(&self.url).unwrap(),
@@ -1379,6 +1384,7 @@ impl TestEnv {
             allow_self_signed: false,
             config_path: std::path::PathBuf::from("/dev/null"),
             instance_id: instance_id.to_string(),
+            session_redis: None,
             datadirectory,
             previews_enabled: true,
             data_fingerprint: String::new(),

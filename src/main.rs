@@ -121,7 +121,14 @@ async fn run() -> Result<(), Box<dyn Error>> {
         php,
         config.secret.clone(),
         config.bruteforce.clone(),
+        config.session_redis.clone(),
+        config.instance_id.clone(),
     );
+    if config.session_redis.is_some() {
+        log::info!("session-cookie authentication enabled");
+    } else {
+        log::info!("no nextcloud_dav.session_redis_url; session-cookie auth stays on PHP");
+    }
 
     let mounts = Arc::new(nextcloud_dav::mounts::MountCache::new(
         nextcloud_dav::mounts::MOUNT_CACHE_TTL,

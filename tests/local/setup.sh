@@ -27,6 +27,7 @@ if [ ! -f "$ENV_FILE" ]; then
 		echo "DB_PASSWORD=$(rand_hex 24)"
 		echo "ADMIN_PASSWORD=$(rand_hex 16)"
 		echo "ALICE_PASSWORD=$(rand_hex 16)"
+		echo "REDIS_PASSWORD=$(rand_hex 24)"
 	} >"$ENV_FILE"
 	chmod 600 "$ENV_FILE"
 	echo "generated state/env (secrets not shown)"
@@ -42,6 +43,22 @@ wait_for_nextcloud
 wait_for_http
 occ status | sed -n 's/^  - installed: /installed: /p; s/^  - version: /version: /p'
 
+# --- PHP session store -------------------------------------------------------
+# The sidecar's session-cookie auth needs the same store PHP writes to. PHP's
+# `session.save_path` lives in the ini, not in config.php, so it is installed as
+# a drop-in and Apache restarted. The secret comes from state/env and is never
+# echoed. The sidecar gets the same value (rewritten to the published port) in
+# its extra config, so the operator never duplicates it by hand.
+echo "==> pointing PHP sessions at redis"
+docker exec -i "$NC" sh -c \
+	'cat > /usr/local/etc/php/conf.d/zz-nextcloud-session-redis.ini' <<EOF
+session.save_handler = redis
+session.save_path = "tcp://redis:6379?auth=${REDIS_PASSWORD}"
+session.serialize_handler = igbinary
+EOF
+docker restart "$NC" >/dev/null
+wait_for_http
+
 # --- extra config ------------------------------------------------------------
 # Nextcloud loads config/*.config.php automatically; the sidecar loads the
 # same file from its host-side copy via --glob-config.
@@ -50,9 +67,11 @@ write_extra_config() {
 	docker exec -i -u www-data "$NC" sh -c \
 		'cat > /var/www/html/config/nextcloud_dav.config.php' <<<"$php"
 }
-DISPATCH_CONFIG='<?php
-$CONFIG = [
+DISPATCH_CONFIG="$(cat <<PHP
+<?php
+\$CONFIG = [
     "nextcloud_dav" => [
+        "session_redis_url" => "tcp://127.0.0.1:55479?auth=${REDIS_PASSWORD}",
         "event_dispatch" => [
             "enabled" => true,
             "max_attempts" => 3,
@@ -62,7 +81,8 @@ $CONFIG = [
         ],
     ],
 ];
-'
+PHP
+)"
 write_extra_config "$DISPATCH_CONFIG"
 
 # --- companion app -----------------------------------------------------------

@@ -7,6 +7,8 @@
 # Ports are bound to 127.0.0.1 only:
 #   55433 -> postgres (the sidecar on the host connects here)
 #   18081 -> Nextcloud Apache (MKCOL / PHP fallback)
+#   55479 -> redis (the sidecar's session-cookie store; PHP reaches it as
+#            `redis:6379` on the compose network)
 #
 # The Nextcloud config is kept in a named volume and copied to the host with
 # `docker cp` by setup.sh, so the host-side sidecar reads a snapshot of the
@@ -34,11 +36,35 @@ services:
       retries: 40
     networks: [ncdav]
 
+  redis:
+    image: redis:8.8.0-alpine
+    container_name: ncdav-e2e-redis
+    command:
+      - redis-server
+      - --requirepass
+      - ${REDIS_PASSWORD:?REDIS_PASSWORD is required}
+      - --save
+      - ""
+      - --appendonly
+      - "no"
+    ports:
+      - "127.0.0.1:55479:6379"
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" ping | grep -q PONG"]
+      interval: 2s
+      timeout: 3s
+      retries: 40
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD is required}
+    networks: [ncdav]
+
   app:
     image: nextcloud:33.0.5-apache
     container_name: ncdav-e2e-nc
     depends_on:
       db:
+        condition: service_healthy
+      redis:
         condition: service_healthy
     environment:
       POSTGRES_HOST: db

@@ -17,11 +17,15 @@ name = "nextcloud-dav"
 path = "src/main.rs"
 
 [dependencies]
+aes = "0.8.4"
 axum = "0.8.9"
 base64 = "0.22.1"
 calcard = { version = "0.3.14", default-features = false }
+cbc = { version = "0.1.2", features = ["alloc"] }
 env_logger = "0.11.11"
 hex = "0.4.3"
+hkdf = "0.12.4"
+hmac = "0.12.1"
 md-5 = "0.10.6"
 httpdate = "1.0.3"
 libc = "0.2.189"
@@ -29,6 +33,7 @@ indexmap = "2.14.2"
 log = "0.4.33"
 nextcloud-config-parser = "0.15.4"
 php-literal-parser = "0.7.1"
+pbkdf2 = "0.12.2"
 quick-xml = "0.42.0"
 reqwest = { version = "0.13.5", default-features = false, features = [
   "rustls",
@@ -37,6 +42,7 @@ reqwest = { version = "0.13.5", default-features = false, features = [
 ] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.150"
+sha1 = "0.10.6"
 sha2 = "0.10.9"
 sqlx = { version = "0.9.0", default-features = false, features = [
   "any",

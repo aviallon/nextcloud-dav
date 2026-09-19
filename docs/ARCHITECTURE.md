@@ -186,11 +186,47 @@ A deliberate, configurable deviation: `record_bruteforce_attempts` defaults to
 **false**, so the sidecar never records a failed login and the PHP fallback is
 what does. The delay/block *checks* always run.
 
+### Session-cookie authentication (the web UI)
+
+When `nextcloud_dav.session_redis_url` is set (the same value PHP has in
+`session.save_path`), the sidecar also evaluates the Nextcloud **session
+cookie**, which is how the web UI talks to DAV: `oc_sessionPassphrase` is a
+random passphrase and the session id cookie (named after `$CONFIG['instanceid']`)
+points at `PHPREDIS_SESSION:<id>` in redis. The stored value is an igbinary
+array holding the ciphertext produced by `OC\Security\Crypto`:
+
+1. `keyMaterial = HKDF-SHA512(passphrase)` (64 bytes), split into a 32-byte
+   encryption key and a 32-byte MAC key;
+2. the HMAC-SHA512 key is the **ASCII hex** of `sha512(macKey || 'a')` and the
+   message is `ciphertext_hex || iv_hex`, compared in constant time;
+3. the AES-128-CBC key is `PBKDF2-SHA1(encKey, "phpseclib", 1000, 16)` and the
+   IV is the envelope's, then PKCS#7 is unpadded;
+4. the plaintext is JSON.
+
+Every step is reproduced in `src/auth/session.rs` and pinned against a
+blob produced by PHP's own `OC\Security\Crypto` in the harness. The decision is
+the ordered one of `docs/recon/session-auth.md` §6: cookie pair -> redis ->
+crypto/JSON -> `user_id` -> native+enabled user -> `Session::validateSession()`
+token revalidation (the session's `app_password`, else the session id) -> 2FA
+(an app-password session skips it; otherwise `two_factor_auth_passed` must name
+the user) -> the two `Auth.php` acceptance branches, including PHP's CSRF rule
+(`requesttoken` + strict/lax same-site cookies) for a session without
+`AUTHENTICATED_TO_DAV_BACKEND`. **Anything that cannot be evaluated exactly is
+delegated**, never accepted.
+
+A browser form-login session stores no `app_password` and its session token is
+`TEMPORARY_TOKEN` (type 0), which the sidecar deliberately leaves to PHP: it is
+the fail-closed answer to `validateToken()`'s password re-check. Sessions created
+through a DAV Basic login (or an app password) carry a `PERMANENT` token and are
+served natively.
+
 ### No credentials at all → delegate, never 401
 
-A request with no `Authorization` header is **not** refused by the sidecar: it
-answers `501`, nginx replays it to PHP, and PHP decides. This is not politeness,
-it is the only correct answer, because a Nextcloud DAV request can be
+A request with no `Authorization` header that the session path cannot evaluate
+(no `session_redis_url`, a missing/odd cookie, a redis miss, or any crypto,
+JSON, token or 2FA failure) is **not** refused by the sidecar: it answers `501`,
+nginx replays it to PHP, and PHP decides. This is not politeness, it is the only
+correct answer, because a Nextcloud DAV request can be
 authenticated without any credentials at all:
 
 ```php

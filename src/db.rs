@@ -1110,7 +1110,8 @@ impl Db {
         // accept a token Nextcloud would reject.
         let sql = self.render(&format!(
             "SELECT uid, login_name, type, expires, last_check, last_activity, \
-                    CASE WHEN password_invalid THEN '1' ELSE '0' END AS password_invalid_flag \
+                    CASE WHEN password_invalid THEN '1' ELSE '0' END AS password_invalid_flag, \
+                    CASE WHEN password IS NULL THEN '1' ELSE '0' END AS password_is_null_flag \
              FROM {}authtoken WHERE token = ? AND version = 2 LIMIT 1",
             self.prefix
         ));
@@ -2561,6 +2562,7 @@ fn share_row_from_row(row: &AnyRow) -> Result<ShareRow> {
 
 fn auth_token_from_row(row: &AnyRow) -> Result<AuthToken> {
     let flag: String = row.try_get("password_invalid_flag")?;
+    let null_flag: String = row.try_get("password_is_null_flag")?;
     Ok(AuthToken {
         uid: row.try_get::<Option<String>, _>("uid")?.unwrap_or_default(),
         login_name: row
@@ -2571,6 +2573,7 @@ fn auth_token_from_row(row: &AnyRow) -> Result<AuthToken> {
             .try_get::<Option<i64>, _>("expires")?
             .filter(|expires| *expires != 0),
         password_invalid: flag != "0",
+        password_is_null: null_flag != "0",
         last_check: row
             .try_get::<Option<i64>, _>("last_check")?
             .unwrap_or_default(),

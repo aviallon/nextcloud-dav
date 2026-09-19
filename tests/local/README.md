@@ -36,6 +36,8 @@ toolchain (the sidecar is built with
 | `files_parity.sh` | seeds a large `files/ParityBig` directory and diffs the sidecar's files PROPFIND against PHP's (canonicalised XML); writes `state/evidence/files-parity.txt` |
 | `discovery_parity.sh` | diffs the sidecar's DAV-root and own-principal discovery PROPFIND against PHP's (canonicalised XML), for the explicit property set and allprop; writes `state/evidence/discovery-parity.txt` |
 | `caldav_parity.sh` | diffs the sidecar's CalDAV calendar-home (`Depth 0`/`1`) and per-calendar (`Depth 0`) PROPFIND, plus the `sync-collection` and `calendar-multiget` REPORTs, against PHP's (canonicalised XML), asserting sidecar attribution per case, a PHP create/modify/delete incremental-sync round trip, and 501 delegation for objects/trashbin/GET/`calendar-query`; writes `state/evidence/caldav-parity.txt` |
+| `session_auth.sh` | the session-cookie authentication matrix (accept cases asserted `207` + sidecar header and canonical PHP parity; delegate cases asserted `501` with no sidecar header), including forged/tampered, wrong-passphrase, truncated, wrong-user, wrong-path, revoked-token, missing-strict-cookie, wrong-requesttoken and Redis-unreachable cases; writes `state/evidence/session-auth.txt` |
+| `session_craft.php` | run inside the container to craft session-store fixtures for the negative cases; never prints session contents or the passphrase |
 | `canonicalize_propfind.py` | canonicaliser used by `files_parity.sh`, `discovery_parity.sh` and `caldav_parity.sh` |
 | `teardown.sh` | `compose down -v` + remove `state/` |
 | `state/` (git-ignored) | generated secrets, copied `config.php`, sidecar/worker logs, evidence |
@@ -43,6 +45,22 @@ toolchain (the sidecar is built with
 Secrets are generated into `state/env` (mode 0600) and never printed. The app
 password is written to `state/app_password` (0600) and used only through a curl
 config file (`state/curlrc`), never on a command line.
+
+## Session-cookie authentication
+
+PHP is pointed at the harness redis (`tcp://redis:6379?auth=...`, installed as
+`/usr/local/etc/php/conf.d/zz-nextcloud-session-redis.ini` and followed by a
+container restart) so the sidecar can read the same `PHPREDIS_SESSION:<id>`
+keys. `setup.sh` derives the sidecar's `nextcloud_dav.session_redis_url` from
+the same generated `REDIS_PASSWORD` (rewritten to the published
+`127.0.0.1:55479` port); the password is never printed. `./session_auth.sh`
+then obtains a real session with the Basic DAV login recipe and exercises the
+accept/delegate matrix. It also performs a **real browser form login** as alice
+and asserts the sidecar serves that session natively (PHP `207` -> sidecar `207`
+with the attribution header and a canonically identical body); the literal
+no-`requesttoken` request is `401` from PHP (CSRF) and delegates from the
+sidecar, which is why the assertion sends the `requesttoken` header the web UI
+sends. Redis is only for the throwaway harness.
 
 ## How the sidecar reaches the containerised Postgres
 

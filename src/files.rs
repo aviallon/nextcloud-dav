@@ -1114,8 +1114,9 @@ pub async fn handle_propfind(
     minimal: bool,
     body: &[u8],
 ) -> Result<Option<MultiStatus>> {
-    // Condition 1: only the app-password fast path may be served natively.
-    if user.method != AuthMethod::FastPath {
+    // Condition 1: only the app-password fast path or a session-cookie
+    // authentication may be served natively.
+    if user.method != AuthMethod::FastPath && user.method != AuthMethod::Session {
         return Ok(None);
     }
     if config.instance_id.is_empty() || config.sharing_exclude_groups {

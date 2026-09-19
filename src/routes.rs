@@ -7,7 +7,7 @@
 //! answered with `501 Not Implemented` so nginx can fall back to PHP (design doc
 //! §5.2, §5.3).
 
-use crate::auth::{AuthError, Authenticator};
+use crate::auth::{AuthError, AuthenticatedUser, Authenticator};
 use crate::config::{Config, DEFAULT_SYNC_LIMIT, MAX_RESOURCE_SIZE};
 use crate::dav_error;
 use crate::db::Db;
@@ -237,31 +237,41 @@ async fn handle_calendars(state: Arc<AppState>, request: Request) -> Result<Resp
     }
 
     let path = request.uri().path().to_string();
+    let query = request.uri().query().map(str::to_string);
     let headers = request.headers().clone();
     let parsed = crate::calendars::parse_calendars_path(&path);
     match parsed.target {
-        crate::calendars::CalendarsTarget::NotFound => {
-            return Ok(Error::NotFound.into_response())
-        }
+        crate::calendars::CalendarsTarget::NotFound => return Ok(Error::NotFound.into_response()),
         crate::calendars::CalendarsTarget::Delegated => return Ok(not_implemented()),
         _ => {}
     }
 
-    let Some((username, password)) = parse_basic_auth(headers.get(header::AUTHORIZATION)) else {
-        return Ok(not_implemented());
+    let target_user = match &parsed.target {
+        crate::calendars::CalendarsTarget::Home { user, .. }
+        | crate::calendars::CalendarsTarget::Calendar { user, .. } => Some(user.clone()),
+        _ => None,
     };
-    let client_ip = client_ip(&headers);
-    let user = match state.auth.authenticate(&username, &password, client_ip).await {
-        Ok(user) => user,
-        Err(error) => return Ok(auth_error_response(error)),
+    let user = match authenticate_dav(
+        &state,
+        &headers,
+        &method,
+        query.as_deref(),
+        target_user.as_deref(),
+    )
+    .await
+    {
+        AuthOutcome::User(user) => user,
+        AuthOutcome::Delegate => return Ok(not_implemented()),
+        AuthOutcome::Error(error) => return Ok(auth_error_response(error)),
     };
 
     let body = read_body(request).await?;
     if method == "REPORT" {
         return match crate::calendars::handle_report(&state.db, &user.uid, &parsed, &body).await? {
-            crate::calendars::ReportOutcome::Multistatus(multistatus) => {
-                Ok(xml_response(StatusCode::MULTI_STATUS, multistatus.to_xml_caldav()))
-            }
+            crate::calendars::ReportOutcome::Multistatus(multistatus) => Ok(xml_response(
+                StatusCode::MULTI_STATUS,
+                multistatus.to_xml_caldav(),
+            )),
             crate::calendars::ReportOutcome::Delegated => Ok(not_implemented()),
             crate::calendars::ReportOutcome::InvalidSyncToken => {
                 Ok(dav_error::invalid_sync_token())
@@ -315,14 +325,13 @@ async fn handle_discovery(state: Arc<AppState>, request: Request) -> Result<Resp
     }
 
     let path = request.uri().path().to_string();
+    let query = request.uri().query().map(str::to_string);
     let headers = request.headers().clone();
     let parsed = crate::discovery::parse_discovery_path(&path);
     match parsed.target {
         // A tree the discovery router does not own is a plain 404 (its own
         // route, if any, handles it).
-        crate::discovery::DiscoveryTarget::NotFound => {
-            return Ok(Error::NotFound.into_response())
-        }
+        crate::discovery::DiscoveryTarget::NotFound => return Ok(Error::NotFound.into_response()),
         // The principal collection listings and the other principal children
         // are PHP's: delegate so nginx replays the request.
         crate::discovery::DiscoveryTarget::Delegated => return Ok(not_implemented()),
@@ -334,30 +343,31 @@ async fn handle_discovery(state: Arc<AppState>, request: Request) -> Result<Resp
         return Ok(not_implemented());
     }
 
-    let Some((username, password)) = parse_basic_auth(headers.get(header::AUTHORIZATION)) else {
-        return Ok(not_implemented());
+    let target_user = match &parsed.target {
+        crate::discovery::DiscoveryTarget::Principal { uid, .. } => Some(uid.clone()),
+        _ => None,
     };
-    let client_ip = client_ip(&headers);
-    let user = match state.auth.authenticate(&username, &password, client_ip).await {
-        Ok(user) => user,
-        Err(error) => return Ok(auth_error_response(error)),
+    let user = match authenticate_dav(
+        &state,
+        &headers,
+        "PROPFIND",
+        query.as_deref(),
+        target_user.as_deref(),
+    )
+    .await
+    {
+        AuthOutcome::User(user) => user,
+        AuthOutcome::Delegate => return Ok(not_implemented()),
+        AuthOutcome::Error(error) => return Ok(auth_error_response(error)),
     };
 
     let body = read_body(request).await?;
-    match crate::discovery::handle_propfind(
-        &state.db,
-        &state.config,
-        &user.uid,
-        &parsed,
-        &body,
-    )
-    .await?
+    match crate::discovery::handle_propfind(&state.db, &state.config, &user.uid, &parsed, &body)
+        .await?
     {
         Some(multistatus) => {
             let namespaces = match parsed.target {
-                crate::discovery::DiscoveryTarget::Root { .. } => {
-                    MultiStatus::DAV_ROOT_NAMESPACES
-                }
+                crate::discovery::DiscoveryTarget::Root { .. } => MultiStatus::DAV_ROOT_NAMESPACES,
                 _ => MultiStatus::PRINCIPAL_NAMESPACES,
             };
             Ok(xml_response(
@@ -377,18 +387,24 @@ async fn handle_files(state: Arc<AppState>, request: Request) -> Result<Response
     }
 
     let path = request.uri().path().to_string();
+    let query = request.uri().query().map(str::to_string);
     let headers = request.headers().clone();
     let Some(parsed) = crate::files::parse_files_path(&path) else {
         return Ok(Error::NotFound.into_response());
     };
 
-    let Some((username, password)) = parse_basic_auth(headers.get(header::AUTHORIZATION)) else {
-        return Ok(not_implemented());
-    };
-    let client_ip = client_ip(&headers);
-    let user = match state.auth.authenticate(&username, &password, client_ip).await {
-        Ok(user) => user,
-        Err(error) => return Ok(auth_error_response(error)),
+    let user = match authenticate_dav(
+        &state,
+        &headers,
+        "PROPFIND",
+        query.as_deref(),
+        Some(parsed.uid.as_str()),
+    )
+    .await
+    {
+        AuthOutcome::User(user) => user,
+        AuthOutcome::Delegate => return Ok(not_implemented()),
+        AuthOutcome::Error(error) => return Ok(auth_error_response(error)),
     };
 
     // `Files\RootCollection::getChildForPrincipal()` only serves the caller's
@@ -420,6 +436,61 @@ async fn handle_files(state: Arc<AppState>, request: Request) -> Result<Response
     }
 }
 
+/// Outcome of the Basic-or-session authentication attempt.
+enum AuthOutcome {
+    User(AuthenticatedUser),
+    /// Return `501` so nginx replays the request to PHP.
+    Delegate,
+    /// A definitive Basic-auth failure (`401`/`429`/`503`/`502`).
+    Error(AuthError),
+}
+
+/// Authenticates a DAV request.
+///
+/// A Basic credential pair goes through the app-password fast path (unchanged).
+/// A request with **no** `Authorization` header is evaluated against the
+/// Nextcloud session cookie (design doc §6); anything uncertain returns
+/// [`AuthOutcome::Delegate`], never a user. A non-Basic `Authorization` header
+/// (OAuth Bearer) is PHP's and is delegated.
+async fn authenticate_dav(
+    state: &AppState,
+    headers: &HeaderMap,
+    method: &str,
+    query: Option<&str>,
+    target_user: Option<&str>,
+) -> AuthOutcome {
+    if let Some((username, password)) = parse_basic_auth(headers.get(header::AUTHORIZATION)) {
+        let client_ip = client_ip(headers);
+        return match state
+            .auth
+            .authenticate(&username, &password, client_ip)
+            .await
+        {
+            Ok(user) => AuthOutcome::User(user),
+            Err(error) => AuthOutcome::Error(error),
+        };
+    }
+    if headers.get(header::AUTHORIZATION).is_some() {
+        return AuthOutcome::Delegate;
+    }
+    match state
+        .auth
+        .authenticate_session(headers, method, query)
+        .await
+    {
+        Some(user) => {
+            // The session's user must own the request path; a session for a
+            // different user is delegated, never served (design doc §7).
+            if target_user.is_some_and(|target| target != user.uid) {
+                log::debug!("session user does not own the request path; delegating");
+                return AuthOutcome::Delegate;
+            }
+            AuthOutcome::User(user)
+        }
+        None => AuthOutcome::Delegate,
+    }
+}
+
 async fn handle(state: Arc<AppState>, request: Request) -> Result<Response> {
     let method = request.method().clone();
     let path = request.uri().path().to_string();
@@ -428,26 +499,31 @@ async fn handle(state: Arc<AppState>, request: Request) -> Result<Response> {
     let parsed = parse_path(&path);
 
     // A request with no Basic credentials is NOT refused here, not even for
-    // OPTIONS. It may still be authenticated by the Nextcloud session cookie -
-    // which is exactly how the web UI talks to DAV
-    // (`OCA\DAV\Connector\Sabre\Auth::validateUserPass` returns true straight
-    // from a logged-in session, with no credentials involved) - or by an OAuth
-    // Bearer token. The sidecar can evaluate neither, so a 401 from here would
+    // OPTIONS. It may be authenticated by the Nextcloud session cookie (which
+    // the sidecar now evaluates, see `Authenticator::authenticate_session`) or
+    // by an OAuth Bearer token. Anything it cannot evaluate is delegated:
+    // 501 -> nginx replays it to PHP, which owns auth. A 401 from here would
     // make the browser pop up a Basic Auth prompt for requests PHP serves
     // happily; that was a real regression in production, visible as 401s on
     // /remote.php/dav/files/<user>/ interleaved with 207s from the retry.
-    // Delegate instead: 501 -> nginx replays it to PHP, which owns auth.
-    let Some((username, password)) = parse_basic_auth(headers.get(header::AUTHORIZATION)) else {
-        return Ok(not_implemented());
+    let target_user = match &parsed.target {
+        DavTarget::Home { user, .. }
+        | DavTarget::Book { user, .. }
+        | DavTarget::Card { user, .. } => Some(user.clone()),
+        DavTarget::NotFound => None,
     };
-    let client_ip = client_ip(&headers);
-    let user = match state
-        .auth
-        .authenticate(&username, &password, client_ip)
-        .await
+    let user = match authenticate_dav(
+        &state,
+        &headers,
+        method.as_str(),
+        Some(&query),
+        target_user.as_deref(),
+    )
+    .await
     {
-        Ok(user) => user,
-        Err(error) => return Ok(auth_error_response(error)),
+        AuthOutcome::User(user) => user,
+        AuthOutcome::Delegate => return Ok(not_implemented()),
+        AuthOutcome::Error(error) => return Ok(auth_error_response(error)),
     };
 
     if method == Method::OPTIONS {
