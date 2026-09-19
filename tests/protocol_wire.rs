@@ -368,20 +368,33 @@ fn multistatus_has_expected_namespaces_and_shape() {
     let ms = MultiStatus {
         responses: vec![DavResponse::props(
             "/remote.php/dav/addressbooks/users/alice/contacts/",
-            vec![PropStat::ok(vec![(
-                PropQName::dav("displayname"),
-                PropValue::Text("Contacts".to_string()),
-            )])],
+            vec![PropStat::ok(vec![
+                (
+                    PropQName::dav("displayname"),
+                    PropValue::Text("Contacts".to_string()),
+                ),
+                (
+                    PropQName::carddav("addressbook-description"),
+                    PropValue::Text("Contacts".to_string()),
+                ),
+                (
+                    PropQName::nextcloud("owner-displayname"),
+                    PropValue::Text("Alice".to_string()),
+                ),
+            ])],
         )],
         sync_token: Some(format!("{SYNCTOKEN_PREFIX}5")),
     };
     let xml = ms.to_xml();
+    // Only the namespaces actually used are declared (PHP never declares the
+    // rest of the candidate set); `d` is always kept for the structural
+    // elements.
     assert!(xml.contains("xmlns:d=\"DAV:\""));
     assert!(xml.contains("xmlns:card=\"urn:ietf:params:xml:ns:carddav\""));
-    assert!(xml.contains("xmlns:cs=\"http://calendarserver.org/ns/\""));
-    assert!(xml.contains("xmlns:s=\"http://sabredav.org/ns\""));
-    assert!(xml.contains("xmlns:oc=\"http://owncloud.org/ns\""));
     assert!(xml.contains("xmlns:nc=\"http://nextcloud.com/ns\""));
+    assert!(!xml.contains("xmlns:cs=\"http://calendarserver.org/ns/\""));
+    assert!(!xml.contains("xmlns:s=\"http://sabredav.org/ns\""));
+    assert!(!xml.contains("xmlns:oc=\"http://owncloud.org/ns\""));
     assert!(xml.contains("HTTP/1.1 200 OK"));
     let doc = parse_document(xml.as_bytes()).unwrap();
     assert_eq!(doc.local, "multistatus");

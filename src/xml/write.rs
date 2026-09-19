@@ -5,6 +5,7 @@
 
 use quick_xml::events::{BytesDecl, BytesEnd, BytesStart, BytesText, Event};
 use quick_xml::Writer;
+use std::collections::HashSet;
 use std::io::Write;
 
 pub const NS_DAV: &str = "DAV:";
@@ -182,9 +183,10 @@ impl MultiStatus {
     ];
 
     /// The files namespace map (`d`, `s`, `oc`, `nc` = the `.org` namespace,
-    /// `ocs`), matching a Nextcloud files PROPFIND. Nextcloud registers `ocs`
-    /// only client-side (it is serialised ad-hoc by Sabre); the sidecar declares
-    /// it up front, which is namespace-equivalent on the wire.
+    /// `ocs`), matching a Nextcloud files PROPFIND. It is a *candidate* set:
+    /// `write_to` declares only the prefixes actually used by the emitted
+    /// qnames, so a response that does not carry `ocs:share-permissions` no
+    /// longer declares `xmlns:ocs` (PHP never did).
     pub const FILES_NAMESPACES: &'static [(&'static str, &'static str)] = &[
         ("d", NS_DAV),
         ("s", NS_SABREDAV),
@@ -224,11 +226,39 @@ impl MultiStatus {
     }
 
     pub fn to_xml_with(&self, namespaces: &[(&str, &str)]) -> String {
-        let mut writer = Writer::new_with_indent(Vec::new(), b' ', 2);
+        // Compact, like PHP: no indentation and no newlines between elements.
+        let mut writer = Writer::new(Vec::new());
         self.write_to(&mut writer, namespaces)
             .expect("writing XML to a Vec cannot fail");
         // The writer only ever emits UTF-8 (all inputs are Rust `String`s).
         String::from_utf8(writer.into_inner()).expect("quick-xml writes UTF-8")
+    }
+
+    /// The subset of `namespaces` whose prefix is actually used by the emitted
+    /// document, in the order given. `d` is always kept: the structural
+    /// elements (`multistatus`, `response`, `propstat`, `prop`, `href`,
+    /// `status`, `sync-token`) are all `d:`-prefixed.
+    fn used_namespaces<'a>(
+        &'a self,
+        namespaces: &'a [(&'a str, &'a str)],
+    ) -> Vec<(&'a str, &'a str)> {
+        let mut used: HashSet<&'a str> = HashSet::new();
+        used.insert("d");
+        for response in &self.responses {
+            for propstat in &response.propstats {
+                for (qname, value) in &propstat.props {
+                    if let Some(prefix) = qname.prefix() {
+                        used.insert(prefix);
+                    }
+                    collect_element_prefixes(value, &mut used);
+                }
+            }
+        }
+        namespaces
+            .iter()
+            .filter(|(prefix, _)| used.contains(prefix))
+            .copied()
+            .collect()
     }
 
     fn write_to<W: Write>(
@@ -236,14 +266,18 @@ impl MultiStatus {
         writer: &mut Writer<W>,
         namespaces: &[(&str, &str)],
     ) -> std::io::Result<()> {
-        writer.write_event(Event::Decl(BytesDecl::new("1.0", Some("utf-8"), None)))?;
+        // PHP/Sabre emit `<?xml version="1.0"?>` with no encoding pseudo-attribute.
+        writer.write_event(Event::Decl(BytesDecl::new("1.0", None, None)))?;
         let mut root = BytesStart::new("d:multistatus");
-        for (prefix, uri) in namespaces {
-            root.push_attribute((format!("xmlns:{prefix}").as_str(), *uri));
+        for (prefix, uri) in self.used_namespaces(namespaces) {
+            root.push_attribute((format!("xmlns:{prefix}").as_str(), uri));
         }
         writer.write_event(Event::Start(root.borrow()))?;
+        // Reused across every property of every response so serialising a
+        // large listing does not allocate one `String` per prop qname.
+        let mut name = String::new();
         for response in &self.responses {
-            self.write_response(writer, response)?;
+            self.write_response(writer, response, &mut name)?;
         }
         if let Some(token) = &self.sync_token {
             write_text_element(writer, "d:sync-token", token)?;
@@ -256,6 +290,7 @@ impl MultiStatus {
         &self,
         writer: &mut Writer<W>,
         response: &DavResponse,
+        name: &mut String,
     ) -> std::io::Result<()> {
         writer.write_event(Event::Start(BytesStart::new("d:response")))?;
         write_text_element(writer, "d:href", &response.href)?;
@@ -269,29 +304,29 @@ impl MultiStatus {
             writer.write_event(Event::Start(BytesStart::new("d:propstat")))?;
             writer.write_event(Event::Start(BytesStart::new("d:prop")))?;
             for (qname, value) in &propstat.props {
-                write_prop(writer, qname, value)?;
+                write_prop(writer, qname, value, name)?;
             }
             writer.write_event(Event::End(BytesEnd::new("d:prop")))?;
-            write_text_element(writer, "d:status", &status_line(propstat.status))?;
+            write_status(writer, propstat.status)?;
             writer.write_event(Event::End(BytesEnd::new("d:propstat")))?;
         }
 
         if !wrote_propstat {
             match response.status {
                 Some(status) => {
-                    write_text_element(writer, "d:status", &status_line(status))?;
+                    write_status(writer, status)?;
                 }
                 None => {
                     // WebDAV requires at least one propstat when there is no
                     // status; Sabre emits an empty 418 propstat.
                     writer.write_event(Event::Start(BytesStart::new("d:propstat")))?;
                     writer.write_event(Event::Empty(BytesStart::new("d:prop")))?;
-                    write_text_element(writer, "d:status", &status_line(418))?;
+                    write_status(writer, 418)?;
                     writer.write_event(Event::End(BytesEnd::new("d:propstat")))?;
                 }
             }
         } else if let Some(status) = response.status {
-            write_text_element(writer, "d:status", &status_line(status))?;
+            write_status(writer, status)?;
         }
 
         writer.write_event(Event::End(BytesEnd::new("d:response")))?;
@@ -303,10 +338,21 @@ fn write_prop<W: Write>(
     writer: &mut Writer<W>,
     qname: &PropQName,
     value: &PropValue,
+    name: &mut String,
 ) -> std::io::Result<()> {
-    let (name, unknown_ns) = match qname.prefix() {
-        Some(prefix) => (format!("{prefix}:{}", qname.local), None),
-        None => (format!("x:{}", qname.local), Some(qname.ns.as_str())),
+    name.clear();
+    let unknown_ns = match qname.prefix() {
+        Some(prefix) => {
+            name.push_str(prefix);
+            name.push(':');
+            name.push_str(&qname.local);
+            None
+        }
+        None => {
+            name.push_str("x:");
+            name.push_str(&qname.local);
+            Some(qname.ns.as_str())
+        }
     };
     let mut start = BytesStart::new(name.as_str());
     if let Some(ns) = unknown_ns {
@@ -317,9 +363,17 @@ fn write_prop<W: Write>(
             writer.write_event(Event::Empty(start))?;
         }
         PropValue::Text(text) => {
-            writer.write_event(Event::Start(start.borrow()))?;
-            writer.write_event(Event::Text(BytesText::new(text)))?;
-            writer.write_event(Event::End(start.to_end()))?;
+            if text.is_empty() {
+                // An empty value is an empty element, exactly like PHP/Sabre
+                // (`<oc:share-types/>`, not `<oc:share-types></oc:share-types>`):
+                // the two are XML-equivalent but the pair costs 16 bytes per
+                // child on a large listing.
+                writer.write_event(Event::Empty(start))?;
+            } else {
+                writer.write_event(Event::Start(start.borrow()))?;
+                writer.write_event(Event::Text(BytesText::new(text)))?;
+                writer.write_event(Event::End(start.to_end()))?;
+            }
         }
         PropValue::Elements(children) => {
             writer.write_event(Event::Start(start.borrow()))?;
@@ -363,6 +417,26 @@ fn write_element<W: Write>(writer: &mut Writer<W>, element: &XmlElement) -> std:
     Ok(())
 }
 
+/// Records the namespace prefixes referenced by a structured property value's
+/// nested elements (`d:collection`, `card:address-data-type`, …). Unqualified
+/// names (the metadata JSON keys) carry no prefix and are skipped.
+fn collect_element_prefixes<'a>(value: &'a PropValue, used: &mut HashSet<&'a str>) {
+    if let PropValue::Elements(children) = value {
+        for child in children {
+            collect_element_prefix(child, used);
+        }
+    }
+}
+
+fn collect_element_prefix<'a>(element: &'a XmlElement, used: &mut HashSet<&'a str>) {
+    if let Some((prefix, _)) = element.name.split_once(':') {
+        used.insert(prefix);
+    }
+    for child in &element.children {
+        collect_element_prefix(child, used);
+    }
+}
+
 fn write_text_element<W: Write>(
     writer: &mut Writer<W>,
     name: &str,
@@ -372,6 +446,29 @@ fn write_text_element<W: Write>(
     writer.write_event(Event::Text(BytesText::new(text)))?;
     writer.write_event(Event::End(BytesEnd::new(name)))?;
     Ok(())
+}
+
+/// The status line as a `'static` string for the statuses the sidecar actually
+/// emits, so serialising a large listing does not allocate one `String` per
+/// `propstat`. `None` means the caller must fall back to [`status_line`].
+fn status_line_static(status: u16) -> Option<&'static str> {
+    Some(match status {
+        200 => "HTTP/1.1 200 OK",
+        207 => "HTTP/1.1 207 Multi-Status",
+        403 => "HTTP/1.1 403 Forbidden",
+        404 => "HTTP/1.1 404 Not Found",
+        409 => "HTTP/1.1 409 Conflict",
+        418 => "HTTP/1.1 418 I'm a teapot",
+        507 => "HTTP/1.1 507 Insufficient Storage",
+        _ => return None,
+    })
+}
+
+fn write_status<W: Write>(writer: &mut Writer<W>, status: u16) -> std::io::Result<()> {
+    match status_line_static(status) {
+        Some(line) => write_text_element(writer, "d:status", line),
+        None => write_text_element(writer, "d:status", &status_line(status)),
+    }
 }
 
 pub fn status_line(status: u16) -> String {
