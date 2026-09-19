@@ -233,6 +233,15 @@ md5 = bb151705b7603d35fb3b10b5c2f3cee2   size = 2798181637966
 This is *computed from the formula + DB*, not captured from PHP (no production
 write was made); the local harness diff is the proof.
 
+**Correction from the local harness (real Nextcloud 33.0.5).** The `childEtags`
+value above uses the plain masked root permission (31 for the groupfolders). On
+the wire, a **Depth-1** listing uses the `View::getDirectoryContent()` branch
+instead: movable mounts get `|UPDATE|DELETE` (so shares stay 31) and
+non-movable mounts get `& ~(UPDATE|DELETE)` (so a groupfolder root is **21**, and
+a read-only external stays 17). Depth 0 uses the plain value. The sidecar
+reproduces both (`src/mounts.rs::child_etag_permissions`), and
+`tests/local/files_parity.sh` diffs both depths byte-for-byte against PHP.
+
 **(d) `{nc:}mount-type` and `{nc:}is-mount-root`.** `mount-type` is
 `$node->getFileInfo()->getMountPoint()->getMountType()` (`FilesPlugin.php:406-408`):
 `''` for the home mount, `group` for groupfolders, `shared` for received shares,

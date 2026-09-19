@@ -315,10 +315,60 @@ id = "files-mount-delegation"
 area = "delegation"
 status = "intentional"
 nextcloud = "View::getDirectoryContent() merges oc_mounts entries into a listing and View::getFileInfo() adds their sizes to the folder and synthesises its etag; mount roots are not rows in the parent storage's oc_filecache."
-sidecar = "A files PROPFIND is answered 501 whenever an oc_mounts row for the user is at, under, or (for a collection) below the requested path. The home mount itself is ignored."
-why = "oc_filecache alone silently drops every share/groupfolder/external mount and mis-sizes their parent. Delegating is the only way to stay correct without reimplementing the mount/permission wrappers."
+sidecar = "The mount model is served natively (home root, listings inside/containing share, groupfolder and local external mounts, the synthetic parent etag/size/mtime, and the groupfolder ACL rule engine). A mount whose *contents* the model cannot reproduce still contributes its entry to a listing that contains it; a request at or under such a mount, or a listing that contains a mount whose root row is gone, is answered 501, never a wrong listing or a 404. The remaining unservable cases are declared separately."
+why = "Serving the model removes the 85% home-root PROPFIND from PHP; the unservable cases are the ones whose inputs are not in the core schema (circles) or whose cache PHP would refresh from the backend."
 test = "tests/deviations.rs::every_declared_deviation_holds (id=files-mount-delegation)"
-evidence = "src/files.rs:mounts_delegate; docs/recon/files-propfind-model.md §2"
+evidence = "src/mounts.rs; src/files.rs:handle_propfind; docs/recon/files-mounts-model.md §9"
+
+[[deviation]]
+id = "files-mount-external-backend-delegated"
+area = "delegation"
+status = "intentional"
+nextcloud = "A files_external mount with a non-local backend (S3, WebDAV, ...) is listed from that backend's storage."
+sidecar = "A files_external mount whose oc_external_mounts.storage_backend is not 'local' has unservable contents: a request at or under it is answered 501. A listing that merely contains it is still served and merges the mount entry (name/etag/mtime/size/mimetype/permissions/mount-type) from oc_mounts plus the root oc_filecache row."
+why = "A non-local backend's filecache is empty or stale; reproducing its listing needs the remote, not SQL."
+test = "tests/deviations.rs::every_declared_deviation_holds (id=files-mount-external-backend-delegated)"
+evidence = "src/mounts.rs:apply_external_mask"
+
+[[deviation]]
+id = "files-mount-external-check-changes-delegated"
+area = "delegation"
+status = "intentional"
+nextcloud = "A local files_external mount with filesystem_check_changes = CHECK_ALWAYS stats the local path and may rescan before answering (View::getCacheEntry -> Watcher::needsUpdate)."
+sidecar = "A local files_external mount with filesystem_check_changes != 0 has unservable contents: a request at or under it is answered 501. A listing that merely contains it is still served and merges its entry."
+why = "The sidecar cannot stat the external path (it is inside the Nextcloud container), so the cached etag/mtime/size may lag the scan PHP would trigger."
+test = "tests/deviations.rs::every_declared_deviation_holds (id=files-mount-external-check-changes-delegated)"
+evidence = "src/mounts.rs:apply_external_mask"
+
+[[deviation]]
+id = "files-mount-circle-acl-delegated"
+area = "delegation"
+status = "intentional"
+nextcloud = "A groupfolder ACL rule may target a circle, and a groupfolder may be mounted through circle membership (UserMappingManager::getUserCircles)."
+sidecar = "A groupfolder that has a circle-mapped ACL rule, or a group-membership row that is a circle, has unservable contents: a request at or under it is answered 501. A listing that merely contains it is still served and merges its entry (with the group mask applied). User- and group-mapped ACL rules are applied natively."
+why = "Circle membership lives in the circles app's own tables, not the core oc_group_user schema the sidecar reads."
+test = "tests/deviations.rs::every_declared_deviation_holds (id=files-mount-circle-acl-delegated)"
+evidence = "src/mounts.rs:apply_groupfolder_mask; docs/recon/files-mounts-model.md §5"
+
+[[deviation]]
+id = "files-mount-share-type-delegated"
+area = "delegation"
+status = "intentional"
+nextcloud = "A received share can be a user, group, usergroup, circle, room or deck share; the super-share ORs all of them."
+sidecar = "Only user/group/usergroup received shares (oc_share.share_type 0/1/2) are resolved into a super-share; a share mount with any other type has unservable contents and a request at or under it delegates. A listing that merely contains it is still served and merges its entry."
+why = "Circle/room/deck share recipients are resolved by their own providers, not by a simple oc_share.share_with match."
+test = "tests/deviations.rs::every_declared_deviation_holds (id=files-mount-share-type-delegated)"
+evidence = "src/mounts.rs:apply_share_mask; docs/recon/files-mounts-model.md §4"
+
+[[deviation]]
+id = "files-mount-acl-inherit-delegated"
+area = "delegation"
+status = "intentional"
+nextcloud = "When groupfolders' global acl-inherit-per-user app config is 'true', ACLManager merges rules per user-mapping first (allow overwrites deny) instead of per path."
+sidecar = "The alternative merge is not ported. A groupfolder that actually uses ACLs (acl = 1 or acl_default_no_permission) has unservable contents: a request at or under it delegates. A groupfolder without ACLs is still served natively, and a listing that merely contains an ACL folder still merges its entry."
+why = "Production uses the default (false). The flag is global, so only ACL folders are affected, not the whole app."
+test = "tests/deviations.rs::every_declared_deviation_holds (id=files-mount-acl-inherit-delegated)"
+evidence = "src/mounts.rs:apply_groupfolder_mask"
 
 [[deviation]]
 id = "files-non-propfind-501"

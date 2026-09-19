@@ -580,16 +580,185 @@ impl TestEnv {
             .get("fileid")
     }
 
-    /// A `oc_mounts` row for `user_id`.
+    /// A `oc_mounts` row for `user_id` (a stale/unresolvable row by default).
     pub async fn seed_mount(&self, user_id: &str, mount_point: &str) {
+        self.seed_mount_full(user_id, mount_point, 0, 0, "").await;
+    }
+
+    /// A fully resolved `oc_mounts` row.
+    pub async fn seed_mount_full(
+        &self,
+        user_id: &str,
+        mount_point: &str,
+        storage_id: i64,
+        root_id: i64,
+        provider_class: &str,
+    ) {
         let sql = format!(
-            "INSERT INTO {}mounts (storage_id, root_id, user_id, mount_point) \
-             VALUES (0, 0, ?, ?)",
+            "INSERT INTO {}mounts (storage_id, root_id, user_id, mount_point, mount_provider_class) \
+             VALUES (?, ?, ?, ?, ?)",
             self.prefix
         );
         sqlx::query(safe(sql))
+            .bind(storage_id)
+            .bind(root_id)
             .bind(user_id)
             .bind(mount_point)
+            .bind(provider_class)
+            .execute(self.pool())
+            .await
+            .unwrap();
+    }
+
+    /// A resolved external mount row (`oc_mounts.mount_id` set).
+    pub async fn seed_mount_external(
+        &self,
+        user_id: &str,
+        mount_point: &str,
+        storage_id: i64,
+        root_id: i64,
+        mount_id: i64,
+    ) {
+        let sql = format!(
+            "INSERT INTO {}mounts (storage_id, root_id, user_id, mount_point, mount_provider_class, mount_id) \
+             VALUES (?, ?, ?, ?, ?, ?)",
+            self.prefix
+        );
+        sqlx::query(safe(sql))
+            .bind(storage_id)
+            .bind(root_id)
+            .bind(user_id)
+            .bind(mount_point)
+            .bind("OCA\\Files_External\\Config\\ConfigAdapter")
+            .bind(mount_id)
+            .execute(self.pool())
+            .await
+            .unwrap();
+    }
+
+    pub async fn seed_group_folder(
+        &self,
+        mount_point: &str,
+        acl: i64,
+        quota: i64,
+        storage_id: i64,
+        root_id: i64,
+    ) -> i64 {
+        let sql = format!(
+            "INSERT INTO {}group_folders (mount_point, acl, quota, storage_id, root_id) \
+             VALUES (?, ?, ?, ?, ?) RETURNING folder_id",
+            self.prefix
+        );
+        sqlx::query(safe(sql))
+            .bind(mount_point)
+            .bind(acl)
+            .bind(quota)
+            .bind(storage_id)
+            .bind(root_id)
+            .fetch_one(self.pool())
+            .await
+            .unwrap()
+            .get("folder_id")
+    }
+
+    pub async fn seed_group_folder_group(
+        &self,
+        folder_id: i64,
+        group_id: Option<&str>,
+        circle_id: Option<&str>,
+        permissions: i64,
+    ) {
+        let sql = format!(
+            "INSERT INTO {}group_folders_groups (folder_id, group_id, circle_id, permissions) \
+             VALUES (?, ?, ?, ?)",
+            self.prefix
+        );
+        sqlx::query(safe(sql))
+            .bind(folder_id)
+            .bind(group_id)
+            .bind(circle_id)
+            .bind(permissions)
+            .execute(self.pool())
+            .await
+            .unwrap();
+    }
+
+    /// An `oc_group_folders_acl` rule (a real rule, not a placeholder).
+    pub async fn seed_acl_rule(
+        &self,
+        fileid: i64,
+        mapping_type: &str,
+        mapping_id: &str,
+        mask: i64,
+        permissions: i64,
+    ) {
+        let sql = format!(
+            "INSERT INTO {}group_folders_acl (fileid, mapping_type, mapping_id, mask, permissions) \
+             VALUES (?, ?, ?, ?, ?)",
+            self.prefix
+        );
+        sqlx::query(safe(sql))
+            .bind(fileid)
+            .bind(mapping_type)
+            .bind(mapping_id)
+            .bind(mask)
+            .bind(permissions)
+            .execute(self.pool())
+            .await
+            .unwrap();
+    }
+
+    /// Set `oc_group_folders.acl_default_no_permission` (a PostgreSQL boolean).
+    pub async fn set_group_folder_acl_default(&self, folder_id: i64, value: bool) {
+        let sql = format!(
+            "UPDATE {}group_folders SET acl_default_no_permission = ? WHERE folder_id = ?",
+            self.prefix
+        );
+        sqlx::query(safe(sql))
+            .bind(value)
+            .bind(folder_id)
+            .execute(self.pool())
+            .await
+            .unwrap();
+    }
+
+    pub async fn seed_group_folder_manage(&self, folder_id: i64, mapping_type: &str, mapping_id: &str) {
+        let sql = format!(
+            "INSERT INTO {}group_folders_manage (folder_id, mapping_type, mapping_id) VALUES (?, ?, ?)",
+            self.prefix
+        );
+        sqlx::query(safe(sql))
+            .bind(folder_id)
+            .bind(mapping_type)
+            .bind(mapping_id)
+            .execute(self.pool())
+            .await
+            .unwrap();
+    }
+
+    pub async fn seed_external_mount(&self, storage_backend: &str) -> i64 {
+        let sql = format!(
+            "INSERT INTO {}external_mounts (mount_point, storage_backend) VALUES ('', ?) \
+             RETURNING mount_id",
+            self.prefix
+        );
+        sqlx::query(safe(sql))
+            .bind(storage_backend)
+            .fetch_one(self.pool())
+            .await
+            .unwrap()
+            .get("mount_id")
+    }
+
+    pub async fn seed_external_option(&self, mount_id: i64, key: &str, value: &str) {
+        let sql = format!(
+            "INSERT INTO {}external_options (mount_id, key, value) VALUES (?, ?, ?)",
+            self.prefix
+        );
+        sqlx::query(safe(sql))
+            .bind(mount_id)
+            .bind(key)
+            .bind(value)
             .execute(self.pool())
             .await
             .unwrap();
@@ -661,6 +830,38 @@ impl TestEnv {
             .bind(uid_initiator)
             .bind(file_source)
             .bind(permissions)
+            .fetch_one(self.pool())
+            .await
+            .unwrap()
+            .get("id")
+    }
+
+    /// An incoming share row (a received share), with the `accepted`/`stime`
+    /// fields the mount model reads.
+    pub async fn seed_incoming_share(
+        &self,
+        share_type: i64,
+        share_with: &str,
+        uid_owner: &str,
+        file_source: i64,
+        permissions: i64,
+        accepted: i64,
+    ) -> i64 {
+        let sql = format!(
+            "INSERT INTO {}share \
+             (share_type, share_with, uid_owner, uid_initiator, item_type, file_source, \
+              permissions, accepted, stime) \
+             VALUES (?, ?, ?, ?, 'folder', ?, ?, ?, 1) RETURNING id",
+            self.prefix
+        );
+        sqlx::query(safe(sql))
+            .bind(share_type as i16)
+            .bind(share_with)
+            .bind(uid_owner)
+            .bind(uid_owner)
+            .bind(file_source)
+            .bind(permissions)
+            .bind(accepted)
             .fetch_one(self.pool())
             .await
             .unwrap()
@@ -847,6 +1048,8 @@ impl TestEnv {
             card_size_limit: nextcloud_dav::config::DEFAULT_CARD_SIZE_LIMIT,
             native_writes: true,
             registry: Arc::new(EffectRegistry::default()),
+            // Tests seed mounts after the env is built, so reload every request.
+            mounts: Arc::new(nextcloud_dav::mounts::MountCache::new(Duration::ZERO)),
         }))
     }
 
@@ -944,6 +1147,7 @@ impl TestEnv {
             card_size_limit: nextcloud_dav::config::DEFAULT_CARD_SIZE_LIMIT,
             native_writes: true,
             registry: Arc::new(EffectRegistry::default()),
+            mounts: Arc::new(nextcloud_dav::mounts::MountCache::new(Duration::ZERO)),
         }))
     }
 }
@@ -1327,9 +1531,63 @@ CREATE TABLE oc_mounts (
     root_id bigint NOT NULL,
     user_id varchar(64) NOT NULL,
     mount_point varchar(4000) NOT NULL,
-    mount_id bigint NULL
+    mount_id bigint NULL,
+    mount_provider_class varchar(128) NULL,
+    mount_point_hash varchar(32) NOT NULL DEFAULT ''
 );
 CREATE INDEX mounts_user_index ON oc_mounts (user_id);
+
+CREATE TABLE oc_group_folders (
+    folder_id bigint GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+    mount_point varchar(4000) NOT NULL DEFAULT '',
+    quota bigint NOT NULL DEFAULT -3,
+    acl integer NOT NULL DEFAULT 0,
+    root_id bigint NOT NULL DEFAULT 0,
+    storage_id bigint NOT NULL DEFAULT 0,
+    options text NULL,
+    acl_default_no_permission boolean NOT NULL DEFAULT false
+);
+CREATE TABLE oc_group_folders_groups (
+    applicable_id bigint GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+    folder_id bigint NOT NULL,
+    permissions integer NOT NULL DEFAULT 0,
+    group_id varchar(64) NULL,
+    circle_id varchar(64) NULL
+);
+CREATE TABLE oc_group_folders_acl (
+    acl_id bigint GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+    fileid bigint NOT NULL,
+    mapping_type varchar(32) NOT NULL DEFAULT '',
+    mapping_id varchar(64) NOT NULL DEFAULT '',
+    mask smallint NOT NULL DEFAULT 0,
+    permissions smallint NOT NULL DEFAULT 0
+);
+CREATE TABLE oc_group_folders_manage (
+    id bigint GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+    folder_id bigint NOT NULL,
+    mapping_type varchar(32) NOT NULL DEFAULT '',
+    mapping_id varchar(64) NOT NULL DEFAULT ''
+);
+CREATE TABLE oc_authorized_groups (
+    id bigint GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+    appid varchar(32) NOT NULL DEFAULT '',
+    class varchar(255) NOT NULL DEFAULT '',
+    group_id varchar(64) NOT NULL DEFAULT ''
+);
+CREATE TABLE oc_external_mounts (
+    mount_id bigint GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+    mount_point varchar(255) NOT NULL DEFAULT '',
+    storage_backend varchar(64) NOT NULL DEFAULT '',
+    auth_backend varchar(64) NULL,
+    priority integer NOT NULL DEFAULT 0,
+    type integer NOT NULL DEFAULT 0
+);
+CREATE TABLE oc_external_options (
+    option_id bigint GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+    mount_id bigint NOT NULL,
+    key varchar(64) NOT NULL DEFAULT '',
+    value text NULL
+);
 
 CREATE TABLE oc_share (
     id bigint GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
@@ -1342,6 +1600,7 @@ CREATE TABLE oc_share (
     file_target varchar(512) NULL,
     permissions integer NOT NULL DEFAULT 0,
     accepted smallint NOT NULL DEFAULT 0,
+    stime bigint NOT NULL DEFAULT 0,
     note text NULL,
     hide_download smallint NOT NULL DEFAULT 0,
     attributes text NULL

@@ -171,6 +171,102 @@ q "SELECT string_agg(uri||'->'||access, ',' ORDER BY uri)
    WHERE a.principaluri='principals/users/bob' AND s.principaluri='principals/users/alice'" |
 	sed 's/^/shares seeded: /'
 
+# --- files: mount fixtures (share, groupfolder with ACL, local external) ------
+# The parity run needs a received share, a groupfolder with ACLs and a local
+# external mount, so the sidecar's mount model is diffed against real PHP.
+echo "==> installing groupfolders + files_external"
+if ! occ app:list 2>/dev/null | grep -q '"groupfolders"'; then
+	GF_VERSION=21.0.15
+	curl -fsSL -o /tmp/groupfolders.tar.gz \
+		"https://github.com/nextcloud/groupfolders/archive/refs/tags/v${GF_VERSION}.tar.gz"
+	tar -xzf /tmp/groupfolders.tar.gz -C /tmp
+	docker exec "$NC" rm -rf /var/www/html/custom_apps/groupfolders
+	docker cp "/tmp/groupfolders-${GF_VERSION}" "$NC:/var/www/html/custom_apps/groupfolders"
+	docker exec "$NC" chown -R www-data:www-data /var/www/html/custom_apps/groupfolders
+fi
+occ app:enable groupfolders >/dev/null 2>&1 || true
+occ app:enable files_external >/dev/null 2>&1 || true
+occ app:list 2>/dev/null | grep -E 'groupfolders|files_external' || true
+
+# A group both users share, so the groupfolder has a recipient.
+occ group:add parity-team >/dev/null 2>&1 || true
+occ group:adduser parity-team alice >/dev/null 2>&1 || true
+
+# A received share: bob owns /ParityShare, shared read-write with alice.
+echo "==> creating bob's shared folder"
+docker exec -u www-data "$NC" mkdir -p /var/www/html/data/bob/files/ParityShare
+docker exec -u www-data "$NC" sh -c 'echo "from bob" > /var/www/html/data/bob/files/ParityShare/from-bob.txt'
+occ files:scan bob >/dev/null 2>&1 || true
+BOB_STORAGE=$(q "SELECT numeric_id FROM oc_storages WHERE id='home::bob'")
+SHARE_ROOT=$(q "SELECT fileid FROM oc_filecache WHERE storage=$BOB_STORAGE AND path='files/ParityShare'")
+q "INSERT INTO oc_share
+     (share_type, share_with, uid_owner, uid_initiator, item_type, file_source,
+      file_target, permissions, accepted, stime)
+   SELECT 0, 'alice', 'bob', 'bob', 'folder', $SHARE_ROOT, '/ParityShare', 31, 1,
+          extract(epoch from now())::bigint
+   WHERE NOT EXISTS (SELECT 1 FROM oc_share
+                     WHERE file_source=$SHARE_ROOT AND share_with='alice')" >/dev/null
+
+# A groupfolder with ACLs: one denied child and one denied permission.
+echo "==> creating the ACL groupfolder"
+occ groupfolders:create ParityTeam >/dev/null 2>&1 || true
+GF_ID=$(q "SELECT folder_id FROM oc_group_folders WHERE mount_point='ParityTeam'")
+q "INSERT INTO oc_group_folders_groups (folder_id, group_id, permissions)
+   SELECT $GF_ID, 'parity-team', 31
+   WHERE NOT EXISTS (SELECT 1 FROM oc_group_folders_groups
+                     WHERE folder_id=$GF_ID AND group_id='parity-team')" >/dev/null
+occ groupfolders:permissions "$GF_ID" --enable >/dev/null 2>&1 || true
+# `groupfolders:create` uses a separate storage: the mount root is `files/`
+# under `<datadirectory>/__groupfolders/<id>/`.
+GF_DIR="/var/www/html/data/__groupfolders/$GF_ID/files"
+docker exec -u www-data "$NC" mkdir -p "$GF_DIR/sub"
+docker exec -u www-data "$NC" sh -c "echo a > $GF_DIR/visible.txt"
+docker exec -u www-data "$NC" sh -c "echo b > $GF_DIR/hidden.txt"
+docker exec -u www-data "$NC" sh -c "echo c > $GF_DIR/sub/deep.txt"
+occ groupfolders:scan "$GF_ID" >/dev/null 2>&1 || true
+# Deny READ on hidden.txt (the row must disappear) and DELETE on sub/.
+# `--` keeps Symfony from parsing the `-read`/`-delete` permission tokens as
+# options.
+occ groupfolders:permissions "$GF_ID" hidden.txt -g parity-team -- -read >/dev/null 2>&1 || true
+occ groupfolders:permissions "$GF_ID" sub -g parity-team -- -delete >/dev/null 2>&1 || true
+
+# A read-only groupfolder (group permission = READ only).
+echo "==> creating the read-only groupfolder"
+occ groupfolders:create ParityRO >/dev/null 2>&1 || true
+RO_ID=$(q "SELECT folder_id FROM oc_group_folders WHERE mount_point='ParityRO'")
+q "INSERT INTO oc_group_folders_groups (folder_id, group_id, permissions)
+   SELECT $RO_ID, 'parity-team', 1
+   WHERE NOT EXISTS (SELECT 1 FROM oc_group_folders_groups
+                     WHERE folder_id=$RO_ID AND group_id='parity-team')" >/dev/null
+RO_DIR="/var/www/html/data/__groupfolders/$RO_ID/files"
+docker exec -u www-data "$NC" mkdir -p "$RO_DIR"
+docker exec -u www-data "$NC" sh -c "echo ro > $RO_DIR/ro.txt"
+occ groupfolders:scan "$RO_ID" >/dev/null 2>&1 || true
+
+# A read-only local external mount for alice.
+echo "==> creating the local external mount"
+docker exec -u www-data "$NC" mkdir -p /var/www/html/data/external-parity
+EXT_ID=$(q "SELECT mount_id FROM oc_external_mounts WHERE mount_point='/ParityExt' ORDER BY mount_id DESC LIMIT 1")
+if [ -z "$EXT_ID" ]; then
+	EXT_ID=$(occ files_external:create /ParityExt local null::null \
+		-c datadir=/var/www/html/data/external-parity 2>/dev/null |
+		grep -oE 'id [0-9]+' | grep -oE '[0-9]+' | tail -1 || true)
+fi
+if [ -n "$EXT_ID" ]; then
+	occ files_external:option "$EXT_ID" readonly 1 >/dev/null 2>&1 || true
+	occ files_external:option "$EXT_ID" filesystem_check_changes 0 >/dev/null 2>&1 || true
+	occ files_external:applicable --add-user alice "$EXT_ID" >/dev/null 2>&1 || true
+fi
+docker exec -u www-data "$NC" sh -c 'echo ext > /var/www/html/data/external-parity/ext.txt'
+
+# Warm PHP once so `oc_mounts` is materialised before the sidecar starts.
+echo "==> warming oc_mounts via PHP"
+curl -s -o /dev/null -K "$STATE_DIR/curlrc" -X PROPFIND -H 'Depth: 1' \
+	-H 'Content-Type: application/xml; charset=utf-8' \
+	--data-binary '<?xml version="1.0"?><d:propfind xmlns:d="DAV:"><d:prop><d:getetag/></d:prop></d:propfind>' \
+	"$NC_URL/remote.php/dav/files/alice/" || true
+q "SELECT count(*) FROM oc_mounts WHERE user_id='alice'" | sed 's/^/oc_mounts rows for alice: /'
+
 # --- copy config to the host sidecar -----------------------------------------
 # The sidecar gets a *copy* of the container's config.php plus two sibling
 # config files: the shared dispatch block and a dbhost/dbport override that

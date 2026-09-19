@@ -23,12 +23,14 @@ use crate::error::{Error, Result};
 use crate::model::{FileCacheRow, ShareRow};
 use crate::util::{encode_path_segment, http_date, percent_decode};
 use crate::xml::parse::PropList;
+use crate::mounts::{MountCache, MountInfo, MountKind, ShareInfo};
 use crate::xml::write::{
     DavResponse, MultiStatus, PropQName, PropStat, PropValue, XmlElement, NS_DAV,
     NS_NEXTCLOUD_FILES, NS_OCS, NS_OWNCLOUD,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::Arc;
 use unicode_normalization::UnicodeNormalization;
 
 /// `ITags::TAG_FAVORITE`.
@@ -150,12 +152,12 @@ fn collapse_slashes(path: &str) -> String {
 
 /// Whether any `oc_mounts` row for this user makes the path unservable.
 ///
-/// Two directions matter, and both are delegated:
-/// - the path is **at or under** a mount (`View::find()` resolves to the mount's
-///   storage, not the home storage's `oc_filecache`);
-/// - a mount is **below** the path (`View::getDirectoryContent()` merges mounts
-///   into the listing, and `View::getFileInfo()` adds their sizes to the folder
-///   and synthesises its etag).
+/// This is the *live* fallback used only when the requested path has no row in
+/// the home storage (the cached mount map may be stale). Only a mount **at or
+/// under** the path matters here: such a path resolves to the mount's storage,
+/// not the home storage's `oc_filecache`. A mount that is merely *below* the
+/// path does not explain a missing row, and a containing listing is served from
+/// the mount map (a stale map is refreshed there).
 ///
 /// The home mount (`/<uid>/`) is not a row under `files/`, so it is ignored.
 pub fn mounts_delegate(mount_points: &[String], uid: &str, rel_norm: &str) -> bool {
@@ -169,11 +171,7 @@ pub fn mounts_delegate(mount_points: &[String], uid: &str, rel_norm: &str) -> bo
             continue;
         }
         let mount_rel = normalize_rel(rest);
-        if rel_norm.is_empty()
-            || rel_norm == mount_rel
-            || rel_norm.starts_with(&format!("{mount_rel}/"))
-            || mount_rel.starts_with(&format!("{rel_norm}/"))
-        {
+        if rel_norm == mount_rel || rel_norm.starts_with(&format!("{mount_rel}/")) {
             return true;
         }
     }
@@ -273,7 +271,32 @@ impl Needs {
 // The node
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone)]
+/// The mount facts `DavUtil`, `FilesPlugin` and `Node::getSharePermissions`
+/// need. Defaults describe a plain own-home node (no mount).
+#[derive(Debug, Clone, Default)]
+pub struct MountMeta {
+    /// `MountPoint::getMountType()` (`''`, `shared`, `group`, `external`, …).
+    pub mount_type: String,
+    /// `internalPath === ''`.
+    pub is_mount_root: bool,
+    /// The storage is an `ISharedStorage` (`S` permission letter).
+    pub is_shared_mount: bool,
+    /// A non-home, non-shared mount (`M` permission letter).
+    pub is_mounted: bool,
+    /// A movable mount root (`canRename`, and the `isWritable` re-read).
+    pub movable_mount_root: bool,
+    /// The root row's permissions before the listing injected `|UPDATE|DELETE`.
+    pub raw_root_permissions: Option<i64>,
+    /// The received share's super-share, when the storage is shared.
+    pub share: Option<Arc<ShareInfo>>,
+    /// `Storage::getOwner()` when it differs from the caller.
+    pub owner: Option<String>,
+    pub owner_display_name: Option<String>,
+    /// The mount's `readonly` option (`Node::getSharePermissions`).
+    pub readonly: bool,
+}
+
+#[derive(Debug, Clone, Default)]
 pub struct FilesNode {
     pub fileid: i64,
     pub name: String,
@@ -293,6 +316,11 @@ pub struct FilesNode {
     pub creation_time: i64,
     /// `oc_files_metadata.json` reduced to `key -> value`.
     pub metadata: HashMap<String, serde_json::Value>,
+    /// `FileInfo::rawSize` (`getSize(false)`), for `d:quota-used-bytes`.
+    pub raw_size: i64,
+    /// A per-node `d:quota-available-bytes` override (mounts); `None` = context.
+    pub quota_available: Option<i64>,
+    pub mount: MountMeta,
 }
 
 impl FilesNode {
@@ -319,17 +347,56 @@ impl FilesNode {
             is_home_root,
             creation_time: row.creation_time,
             metadata: row.metadata.clone(),
+            raw_size: row.effective_size(),
+            quota_available: None,
+            mount: MountMeta::default(),
         }
     }
 
-    /// `DavUtil::getDavPermissions()`. `S`/`M` are always absent: a servable
-    /// node lives on the caller's home mount (never `ISharedMountPoint`, never a
-    /// non-home mount), and mount roots are delegated.
+    /// A mount entry, as `View::getDirectoryContent()` builds it: the root row
+    /// metadata with the mount's name, the movable/non-movable permission
+    /// branch, and no synthetic etag (this `FileInfo` has no submounts).
+    pub fn from_mount(mount: &MountInfo, href: String, parent_permissions: i64) -> Self {
+        let permissions = if mount.movable {
+            mount.masked_permissions | PERMISSION_UPDATE | PERMISSION_DELETE
+        } else {
+            mount.masked_permissions & !(PERMISSION_UPDATE | PERMISSION_DELETE)
+        };
+        let name = mount.wire_name();
+        FilesNode {
+            fileid: mount.root_id,
+            name: name.clone(),
+            displayname: name,
+            size: mount.effective_size(),
+            mtime: mount.root_mtime,
+            etag: mount.root_etag.clone(),
+            permissions,
+            is_dir: mount.is_dir(),
+            mimetype: mount.root_mimetype.clone(),
+            checksum: None,
+            href,
+            parent_permissions,
+            is_home_root: false,
+            creation_time: 0,
+            metadata: HashMap::new(),
+            raw_size: mount.effective_size(),
+            quota_available: None,
+            mount: mount_meta(mount, true),
+        }
+    }
+
+    /// `DavUtil::getDavPermissions()`.
     pub fn dav_permissions(&self) -> String {
         let p = self.permissions;
         let mut out = String::new();
+        if self.mount.is_shared_mount {
+            out.push('S');
+        }
         if p & PERMISSION_SHARE != 0 {
             out.push('R');
+        }
+        if self.mount.is_mounted {
+            out.push('M');
         }
         if p & PERMISSION_READ != 0 {
             out.push('G');
@@ -343,12 +410,18 @@ impl FilesNode {
         if p & PERMISSION_UPDATE != 0 {
             out.push('V');
         }
+        // For a movable mount root the listing injected UPDATE, but the `W`
+        // letter is decided from the *unmodified* root cache entry.
+        let is_writable = if self.mount.is_mount_root && self.mount.movable_mount_root {
+            self.mount.raw_root_permissions.unwrap_or(p) & PERMISSION_UPDATE != 0
+        } else {
+            p & PERMISSION_UPDATE != 0
+        };
         if self.is_dir {
             if p & PERMISSION_CREATE != 0 {
                 out.push_str("CK");
             }
-        } else if p & PERMISSION_UPDATE != 0 {
-            // `$isWritable`: internalPath is never '' for a servable node.
+        } else if is_writable {
             out.push('W');
         }
         out
@@ -356,6 +429,10 @@ impl FilesNode {
 
     /// `DavUtil::canRename()`.
     fn can_rename(&self) -> bool {
+        // The root of a movable mount point is always renamable.
+        if self.mount.is_mount_root && self.mount.movable_mount_root {
+            return true;
+        }
         if self.permissions & PERMISSION_UPDATE != 0 {
             return true;
         }
@@ -365,6 +442,25 @@ impl FilesNode {
         }
         self.permissions & PERMISSION_DELETE != 0
             && self.parent_permissions & PERMISSION_CREATE != 0
+    }
+}
+
+/// The mount facts for a node inside a mount (root or descendant).
+fn mount_meta(mount: &MountInfo, is_root: bool) -> MountMeta {
+    MountMeta {
+        mount_type: mount.kind.mount_type().to_string(),
+        is_mount_root: is_root,
+        is_shared_mount: mount.kind == MountKind::Share,
+        is_mounted: !matches!(mount.kind, MountKind::Home | MountKind::Share),
+        movable_mount_root: mount.movable && is_root,
+        raw_root_permissions: is_root.then_some(mount.raw_permissions),
+        share: mount.share.clone(),
+        owner: mount.owner.clone(),
+        owner_display_name: mount
+            .share
+            .as_ref()
+            .and_then(|share| share.owner_display_name.clone()),
+        readonly: mount.readonly,
     }
 }
 
@@ -427,7 +523,11 @@ fn resolve_property(
 ) -> Option<PropValue> {
     match (qname.ns.as_str(), qname.local.as_str()) {
         (NS_DAV, "getetag") => Some(PropValue::Text(format!("\"{}\"", node.etag))),
-        (NS_DAV, "getlastmodified") => Some(PropValue::Text(http_date(node.mtime))),
+        // `CorePlugin::propFind`: `$lm = $node->getLastModified(); if ($lm) { … }`,
+        // so an mtime of 0 (an unscanned mount root) is a 404, not the epoch.
+        (NS_DAV, "getlastmodified") => {
+            (node.mtime != 0).then(|| PropValue::Text(http_date(node.mtime)))
+        }
         (NS_DAV, "resourcetype") => Some(if node.is_dir {
             PropValue::Elements(vec![XmlElement::new("d:collection")])
         } else {
@@ -445,11 +545,18 @@ fn resolve_property(
         // -> `DateTimeInterface::ATOM`.
         (NS_DAV, "creationdate") => Some(PropValue::Text(atom_date(node.creation_time))),
         // `CorePlugin::propFind` handles these only for `IQuota` (`Directory`).
-        (NS_DAV, "quota-available-bytes") => {
-            node.is_dir.then(|| PropValue::Text(ctx.quota_available.to_string()))
-        }
+        // `Directory::getQuotaInfo()` calls `getStorageInfo($path, $info, false)`
+        // so `used` is the node's *raw* size, and `available` is the storage's
+        // free space (a mount has its own storage).
+        (NS_DAV, "quota-available-bytes") => node.is_dir.then(|| {
+            PropValue::Text(
+                node.quota_available
+                    .unwrap_or(ctx.quota_available)
+                    .to_string(),
+            )
+        }),
         (NS_DAV, "quota-used-bytes") => {
-            node.is_dir.then(|| PropValue::Text(node.size.to_string()))
+            node.is_dir.then(|| PropValue::Text(node.raw_size.to_string()))
         }
         (NS_OWNCLOUD, "size") => Some(PropValue::Text(node.size.to_string())),
         (NS_OWNCLOUD, "fileid") => Some(PropValue::Text(node.fileid.to_string())),
@@ -458,10 +565,18 @@ fn resolve_property(
             node.fileid, ctx.instance_id
         ))),
         (NS_OWNCLOUD, "permissions") => Some(PropValue::Text(node.dav_permissions())),
-        (NS_OWNCLOUD, "owner-id") => Some(PropValue::Text(ctx.uid.clone())),
-        (NS_OWNCLOUD, "owner-display-name") => {
-            Some(PropValue::Text(ctx.owner_display_name.clone()))
-        }
+        (NS_OWNCLOUD, "owner-id") => Some(PropValue::Text(
+            node.mount
+                .owner
+                .clone()
+                .unwrap_or_else(|| ctx.uid.clone()),
+        )),
+        (NS_OWNCLOUD, "owner-display-name") => Some(PropValue::Text(
+            node.mount
+                .owner_display_name
+                .clone()
+                .unwrap_or_else(|| ctx.owner_display_name.clone()),
+        )),
         (NS_OWNCLOUD, "favorite") => Some(PropValue::Text(
             if ctx.favorites.contains(&node.fileid) {
                 "1"
@@ -499,23 +614,45 @@ fn resolve_property(
             .to_string(),
         )),
         // `MountPoint::getMountType()` returns '' for the home mount.
-        (NS_NEXTCLOUD_FILES, "mount-type") => Some(PropValue::Empty),
-        // `FilesPlugin` -> `getInternalPath() === '' ? 'true' : 'false'`. A
-        // servable node is never a mount root (mount roots are delegated).
-        (NS_NEXTCLOUD_FILES, "is-mount-root") => Some(PropValue::Text("false".to_string())),
+        (NS_NEXTCLOUD_FILES, "mount-type") => Some(PropValue::Text(node.mount.mount_type.clone())),
+        // `FilesPlugin` -> `getInternalPath() === '' ? 'true' : 'false'`.
+        (NS_NEXTCLOUD_FILES, "is-mount-root") => Some(PropValue::Text(
+            if node.mount.is_mount_root {
+                "true"
+            } else {
+                "false"
+            }
+            .to_string(),
+        )),
         // `FilesPlugin` -> `isset($metadata['files-live-photo']) && mimetype
         // === 'video/quicktime'`.
         (NS_NEXTCLOUD_FILES, "hidden") => Some(PropValue::Text(
             if is_hidden(node) { "true" } else { "false" }.to_string(),
         )),
-        // `FilesPlugin` -> `getShareAttributes()`: `[]` for a node whose storage
-        // is not an `ISharedStorage` (every servable own-home node).
-        (NS_NEXTCLOUD_FILES, "share-attributes") => {
-            Some(PropValue::Text("[]".to_string()))
-        }
-        // `getNoteFromShare()` / `getHideDownload()` return null for a
-        // non-shared storage, so Sabre leaves the property at 404.
-        (NS_NEXTCLOUD_FILES, "note") | (NS_NEXTCLOUD_FILES, "hide-download") => None,
+        // `FilesPlugin` -> `getShareAttributes()`: the merged super-share
+        // attributes for a shared storage, `[]` otherwise.
+        (NS_NEXTCLOUD_FILES, "share-attributes") => Some(PropValue::Text(
+            node.mount
+                .share
+                .as_ref()
+                .map(|share| share.attributes.clone())
+                .unwrap_or_else(|| "[]".to_string()),
+        )),
+        // `getNoteFromShare()`: the super-share note for a shared storage (the
+        // recipient is never the owner), null otherwise (404).
+        (NS_NEXTCLOUD_FILES, "note") => node
+            .mount
+            .share
+            .as_ref()
+            .map(|share| PropValue::Text(share.note.clone())),
+        // `getHideDownload()`: the super-share's `hideDownload`, which
+        // `buildSuperShares()` never copies, so it stays `false`; null
+        // otherwise (404).
+        (NS_NEXTCLOUD_FILES, "hide-download") => node
+            .mount
+            .share
+            .as_ref()
+            .map(|share| PropValue::Text(share.hide_download.to_string())),
         // No server handler exists for `nc:is-encrypted` in Nextcloud 33/36 (nor
         // in the encryption app), so PHP answers 404. Match it; deriving from
         // `oc_filecache.encrypted` would be a deviation.
@@ -537,9 +674,7 @@ fn resolve_property(
         (NS_OWNCLOUD, "data-fingerprint") => {
             Some(PropValue::Text(ctx.data_fingerprint.clone()))
         }
-        // `Node::getSharePermissions()`: the stored permissions, with CREATE and
-        // DELETE stripped for files. A servable node is never on shared storage
-        // nor a (non-movable) mount root, so the wrapper branches do not apply.
+        // `Node::getSharePermissions()`.
         (NS_OCS, "share-permissions") => {
             Some(PropValue::Text(share_permissions(node).to_string()))
         }
@@ -559,9 +694,17 @@ fn is_hidden(node: &FilesNode) -> bool {
     node.metadata.contains_key("files-live-photo") && node.mimetype == "video/quicktime"
 }
 
-/// `Node::getSharePermissions()` for a mount-free own-home node.
+/// `Node::getSharePermissions()`: a shared storage reports the super-share's
+/// permissions, a non-movable mount root gets `|UPDATE|DELETE` (unless
+/// `readonly`), and files strip `CREATE|DELETE`.
 fn share_permissions(node: &FilesNode) -> i64 {
-    let mut permissions = node.permissions;
+    let mut permissions = match &node.mount.share {
+        Some(share) => share.permissions,
+        None => node.permissions,
+    };
+    if node.mount.is_mount_root && !node.mount.movable_mount_root && !node.mount.readonly {
+        permissions |= PERMISSION_UPDATE | PERMISSION_DELETE;
+    }
     if !node.is_dir {
         permissions &= !(PERMISSION_CREATE | PERMISSION_DELETE);
     }
@@ -923,9 +1066,48 @@ pub fn prefer_minimal(headers: &axum::http::HeaderMap) -> bool {
 }
 
 /// Serves a files `PROPFIND` or returns 501 (delegate to PHP).
+/// Every mount strictly below `rel` (all nested levels), ascending by mount
+/// point, as `FileInfo::addSubEntry()` sees them.
+fn mounts_below(mounts: &[Arc<MountInfo>], rel: &str) -> Vec<Arc<MountInfo>> {
+    let prefix = format!("{rel}/");
+    mounts
+        .iter()
+        .filter(|mount| {
+            mount.describable && !mount.rel.is_empty() && mount.rel.starts_with(&prefix)
+        })
+        .cloned()
+        .collect()
+}
+
+/// `d:quota-available-bytes` for a mount node (`Directory::getQuotaInfo()`).
+async fn mount_quota_available(
+    db: &Db,
+    config: &Config,
+    mount: &MountInfo,
+) -> Result<i64> {
+    match mount.kind {
+        MountKind::GroupFolder => match mount.groupfolder_quota {
+            Some(quota) if quota >= 0 => Ok((quota - mount.effective_size()).max(0)),
+            _ => Ok(SPACE_UNLIMITED),
+        },
+        // A received share's free space is the owner's home quota.
+        MountKind::Share => {
+            let owner = mount.owner.clone().unwrap_or_default();
+            if owner.is_empty() {
+                Ok(SPACE_UNLIMITED)
+            } else {
+                quota_available(db, &owner, config).await
+            }
+        }
+        // A local external storage has no Quota wrapper: unlimited.
+        _ => Ok(SPACE_UNLIMITED),
+    }
+}
+
 pub async fn handle_propfind(
     db: &Db,
     config: &Config,
+    mount_cache: &MountCache,
     user: &crate::auth::AuthenticatedUser,
     parsed: &FilesPath,
     depth: i64,
@@ -943,18 +1125,57 @@ pub async fn handle_propfind(
     // Parse the request body first: a malformed body is a 400 in PHP too.
     let request = crate::xml::parse::parse_propfind(body)?;
 
-    // Condition 3: no mount at/under the path, and no mount below it.
+    // Condition 3: resolve against the (cached) mount map. A stale or
+    // unavailable map delegates (501), never 404.
     let rel_norm = normalize_rel(&parsed.rel_raw);
-    let mounts = db.user_mount_points(&parsed.uid).await?;
-    if mounts_delegate(&mounts, &parsed.uid, &rel_norm) {
+    let Some(mount_map) = mount_cache.get(db, &parsed.uid).await else {
+        return Ok(None);
+    };
+    let resolution = crate::mounts::resolve(&mount_map, &rel_norm);
+    if resolution.delegate {
+        return Ok(None);
+    }
+    // The mount map caches the structure; the root etag/size/mtime and raw
+    // permissions are mutable (`Propagator`), so refresh them per request.
+    let resolution = crate::mounts::refresh_resolution(db, resolution).await?;
+    if resolution.delegate {
         return Ok(None);
     }
 
-    // Condition 2: resolve inside the caller's own home storage.
-    let internal = internal_path(&rel_norm);
-    let path_hash = crate::db::md5_hex(internal.as_bytes());
-    let Some(row) = db.resolve_home_file(&parsed.uid, &path_hash).await? else {
-        return Err(Error::NotFound);
+    // Condition 2: resolve the node. Inside a mount the row lives in the mount's
+    // storage; otherwise in the caller's own home storage.
+    let (row, active_mount, is_mount_root) = if let Some(mount) = &resolution.mount {
+        let Some(row) = crate::mounts::resolve_mount_file(db, mount, &rel_norm).await? else {
+            // A mount matches but the path is not in its cache: the map may be
+            // stale, so delegate rather than claim the path is missing.
+            return Ok(None);
+        };
+        (row, Some(mount.clone()), rel_norm == mount.rel)
+    } else {
+        let internal = internal_path(&rel_norm);
+        let path_hash = crate::db::md5_hex(internal.as_bytes());
+        match db.resolve_home_file(&parsed.uid, &path_hash).await? {
+            Some(row) => (row, None, false),
+            None => {
+                // A mount that exists but is hidden by ACLs (zero root
+                // permissions) is a genuine not-found, like PHP's dropped cache
+                // entry.
+                if mount_map.iter().any(|mount| {
+                    mount.servable
+                        && mount.rel == rel_norm
+                        && mount.masked_permissions & PERMISSION_READ == 0
+                }) {
+                    return Err(Error::NotFound);
+                }
+                // A freshly created mount may not be in the cached map yet. A
+                // live check keeps it from being reported as 404.
+                let points = db.user_mount_points(&parsed.uid).await?;
+                if mounts_delegate(&points, &parsed.uid, &rel_norm) {
+                    return Ok(None);
+                }
+                return Err(Error::NotFound);
+            }
+        }
     };
 
     // Condition 4: every explicit property must be implemented.
@@ -1007,18 +1228,56 @@ pub async fn handle_propfind(
     };
 
     let is_dir = row.is_directory();
-    let is_home_root = rel_norm.is_empty();
+    let is_home_root = rel_norm.is_empty() && active_mount.is_none();
 
-    // Depth 1 children, in PHP's (unordered) database order.
-    let children = if depth >= 1 && is_dir {
+    // Depth 1 children, in PHP's (unordered) database order, masked by the
+    // mount's provider permissions when we are inside a mount.
+    let mut children = if depth >= 1 && is_dir {
         db.file_children(row.storage, row.fileid).await?
     } else {
         Vec::new()
     };
+    if let Some(mount) = &active_mount {
+        // Apply the provider mask and, for a groupfolder with ACLs, the
+        // per-path ACL permissions; PHP's `ACLCacheWrapper` drops a row whose
+        // masked permissions are zero, so we do too.
+        children.retain_mut(|child| {
+            child.permissions &= mount.mask;
+            if let Some(acl) = &mount.acl {
+                child.permissions &= acl.permissions_for_path(&child.path);
+            }
+            child.permissions != 0
+        });
+    }
+
+    // A nested mount whose intermediate folder is missing from the cache makes
+    // PHP's `View::getDirectoryContent()` call `mkdir` (a read that writes); we
+    // delegate that rather than silently omit the folder.
+    if depth >= 1 && is_dir {
+        let child_names: HashSet<String> = children.iter().map(|c| c.display_name()).collect();
+        for mount in resolution.below.iter().filter(|mount| {
+            !resolution
+                .direct
+                .iter()
+                .any(|direct| direct.root_id == mount.root_id)
+        }) {
+            let remainder = if rel_norm.is_empty() {
+                mount.rel.as_str()
+            } else {
+                &mount.rel[rel_norm.len() + 1..]
+            };
+            if let Some(first) = remainder.split('/').next() {
+                if !child_names.contains(first) {
+                    return Ok(None);
+                }
+            }
+        }
+    }
 
     let mut ids: Vec<i64> = Vec::with_capacity(children.len() + 1);
     ids.push(row.fileid);
     ids.extend(children.iter().map(|child| child.fileid));
+    ids.extend(resolution.direct.iter().map(|mount| mount.root_id));
     let favorites = if needs.favorite {
         db.favorite_fileids(&parsed.uid, &ids).await?
     } else {
@@ -1040,6 +1299,42 @@ pub async fn handle_propfind(
         if depth >= 1 && is_dir {
             for (fileid, rows) in db.folder_share_rows(&parsed.uid, row.fileid).await? {
                 shares.entry(fileid).or_default().extend(rows);
+            }
+        }
+        // A received share's mount root reports the incoming shares (the
+        // `getSharedWith` branch of `SharesPlugin::getShare`).
+        if is_mount_root {
+            if let Some(mount) = &active_mount {
+                if let Some(share) = &mount.share {
+                    for grouped in &share.grouped {
+                        if matches!(grouped.share_type, 0 | 1) {
+                            shares.entry(row.fileid).or_default().push(ShareRow {
+                                file_source: row.fileid,
+                                share_type: grouped.share_type,
+                                share_with: grouped.share_with.clone(),
+                                permissions: grouped.permissions,
+                                user_displayname: grouped.user_displayname.clone(),
+                                group_displayname: grouped.group_displayname.clone(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Per-mount `d:quota-available-bytes` (one computation per distinct mount).
+    let mut mount_quota: HashMap<i64, i64> = HashMap::new();
+    if needs.quota {
+        for mount in resolution
+            .mount
+            .iter()
+            .chain(resolution.below.iter())
+            .chain(resolution.direct.iter())
+        {
+            if !mount_quota.contains_key(&mount.root_id) {
+                let available = mount_quota_available(db, config, mount).await?;
+                mount_quota.insert(mount.root_id, available);
             }
         }
     }
@@ -1064,34 +1359,138 @@ pub async fn handle_propfind(
     };
     let displayname = if is_home_root {
         parsed.uid.clone()
+    } else if is_mount_root {
+        active_mount
+            .as_ref()
+            .map(|mount| mount.wire_name())
+            .unwrap_or_else(|| row.display_name())
     } else {
         row.display_name()
     };
-    let node = FilesNode::from_row(
+    let mut node = FilesNode::from_row(
         &row,
         node_href.clone(),
         displayname,
         parent_permissions,
         is_home_root,
     );
+    if let Some(mount) = &active_mount {
+        let masked = if is_mount_root {
+            mount.masked_permissions
+        } else {
+            let mut permissions = row.permissions & mount.mask;
+            if let Some(acl) = &mount.acl {
+                permissions &= acl.permissions_for_path(&row.path);
+            }
+            permissions
+        };
+        if masked == 0 {
+            // A zero-permission entry is dropped by PHP's `ACLCacheWrapper`
+            // (`formatCacheEntry` returns false), which the tree turns into a
+            // not-found for a Depth 0 request.
+            return Err(Error::NotFound);
+        }
+        node.permissions = if is_mount_root && mount.movable {
+            // `View::getFileInfo()`: only movable mount roots gain DELETE.
+            masked | PERMISSION_DELETE
+        } else {
+            masked
+        };
+        node.mount = mount_meta(mount, is_mount_root);
+        node.quota_available = mount_quota.get(&mount.root_id).copied();
+    }
+    // `FileInfo::getEtag()/getSize()/getMTime()`: a directory with submounts is
+    // synthetic. The parent path has no trailing slash, so each child etag keeps
+    // both slashes (a double slash).
+    if !resolution.below.is_empty() {
+        let parent_abs = if rel_norm.is_empty() {
+            format!("/{}/files", parsed.uid)
+        } else {
+            format!("/{}/files/{}", parsed.uid, rel_norm)
+        };
+        let (etag, size, mtime) = crate::mounts::sub_mount_aggregate(
+            &resolution.below,
+            &node.etag,
+            node.size,
+            node.mtime,
+            &parent_abs,
+            depth >= 1,
+        );
+        node.etag = etag;
+        node.size = size;
+        node.mtime = mtime;
+    }
 
     let mut responses = vec![build_response(&node, &ctx, &request.props, minimal)];
+    let listing_permissions = node.permissions;
+    let direct_names: HashSet<String> = resolution
+        .direct
+        .iter()
+        .map(|mount| mount.wire_name())
+        .collect();
     for child in &children {
+        // A direct mount with the same name replaces the stale cache row.
+        if direct_names.contains(&child.display_name()) {
+            continue;
+        }
         // Sabre appends a trailing slash to a collection's href.
         let child_href = format!(
             "{node_href}{}{}",
             encode_path_segment(&child.display_name()),
             if child.is_directory() { "/" } else { "" }
         );
-        let child_node = FilesNode::from_row(
+        let mut child_node = FilesNode::from_row(
             child,
             child_href,
             child.display_name(),
-            row.permissions,
+            listing_permissions,
             false,
         );
+        if let Some(mount) = &active_mount {
+            child_node.mount = mount_meta(mount, false);
+            child_node.quota_available = mount_quota.get(&mount.root_id).copied();
+        }
+        // A nested mount inside this child adds its size/etag to the child.
+        let child_rel = if rel_norm.is_empty() {
+            child.display_name()
+        } else {
+            format!("{}/{}", rel_norm, child.display_name())
+        };
+        let below = mounts_below(&resolution.below, &child_rel);
+        if !below.is_empty() {
+            let parent_abs = format!("/{}/files/{}", parsed.uid, child_rel);
+            let (etag, size, mtime) = crate::mounts::sub_mount_aggregate(
+                &below,
+                &child_node.etag,
+                child_node.size,
+                child_node.mtime,
+                &parent_abs,
+                false,
+            );
+            child_node.etag = etag;
+            child_node.size = size;
+            child_node.mtime = mtime;
+        }
         responses.push(build_response(
             &child_node,
+            &ctx,
+            &request.props,
+            minimal,
+        ));
+    }
+    // The direct mount entries, in ascending mount-point order, after the cache
+    // children (PHP inserts them in that order). Depth 0 lists only the node.
+    for mount in resolution.direct.iter().filter(|_| depth >= 1 && is_dir) {
+        let name = mount.wire_name();
+        let child_href = format!(
+            "{node_href}{}{}",
+            encode_path_segment(&name),
+            if mount.is_dir() { "/" } else { "" }
+        );
+        let mut mount_node = FilesNode::from_mount(mount, child_href, listing_permissions);
+        mount_node.quota_available = mount_quota.get(&mount.root_id).copied();
+        responses.push(build_response(
+            &mount_node,
             &ctx,
             &request.props,
             minimal,
@@ -1107,6 +1506,37 @@ pub async fn handle_propfind(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn zero_mtime_is_not_found() {
+        // Sabre's CorePlugin returns nothing for `getlastmodified` when the
+        // node's mtime is 0 (an unscanned mount root), so PHP answers 404.
+        let ctx = FilesContext {
+            uid: "alice".into(),
+            instance_id: "oc".into(),
+            owner_display_name: "Alice".into(),
+            quota_available: SPACE_UNLIMITED,
+            previews_enabled: true,
+            data_fingerprint: String::new(),
+            favorites: HashSet::new(),
+            unread: HashMap::new(),
+            shares: HashMap::new(),
+        };
+        let qname = PropQName::dav("getlastmodified");
+        let node = FilesNode {
+            mtime: 0,
+            ..Default::default()
+        };
+        assert!(resolve_property(&qname, &node, &ctx).is_none());
+        let node = FilesNode {
+            mtime: 1,
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_property(&qname, &node, &ctx),
+            Some(PropValue::Text(http_date(1)))
+        );
+    }
 
     #[test]
     fn parses_files_paths() {
@@ -1154,7 +1584,7 @@ mod tests {
     }
 
     #[test]
-    fn mount_delegation_both_directions() {
+    fn mount_delegation_at_or_under_only() {
         let mounts = vec![
             "/alice/".to_string(),
             "/alice/files/Share/".to_string(),
@@ -1166,10 +1596,11 @@ mod tests {
         assert!(mounts_delegate(&mounts, "alice", "Share"));
         // Under a mount.
         assert!(mounts_delegate(&mounts, "alice", "Share/sub"));
-        // A mount below the collection.
-        assert!(mounts_delegate(&mounts, "alice", "A"));
-        // Any mount at all makes the home root unservable.
-        assert!(mounts_delegate(&mounts, "alice", ""));
+        // A mount below the collection does not explain a missing row; the
+        // containing listing is served from the mount map.
+        assert!(!mounts_delegate(&mounts, "alice", "A"));
+        // The home root is a containing listing, not a missing row.
+        assert!(!mounts_delegate(&mounts, "alice", ""));
         // Sibling of a mount is fine.
         assert!(!mounts_delegate(&mounts, "alice", "Other"));
         assert!(!mounts_delegate(&mounts, "alice", "A/C"));
@@ -1234,6 +1665,9 @@ mod tests {
             is_home_root: false,
             creation_time: 0,
             metadata: HashMap::new(),
+            raw_size: 0,
+            quota_available: None,
+            mount: MountMeta::default(),
         };
         // A directory keeps its permissions (live PHP: 31).
         assert_eq!(share_permissions(&node(31, true)), 31);
@@ -1282,6 +1716,9 @@ mod tests {
             is_home_root: false,
             creation_time: 0,
             metadata: HashMap::new(),
+            raw_size: 0,
+            quota_available: None,
+            mount: MountMeta::default(),
         };
         assert!(!is_hidden(&node));
         node.metadata
@@ -1313,6 +1750,9 @@ mod tests {
             is_home_root: false,
             creation_time: 0,
             metadata: HashMap::new(),
+            raw_size: 0,
+            quota_available: None,
+            mount: MountMeta::default(),
         };
         // A plain home dir is RGDNVCK, a plain file RGDNVW.
         assert_eq!(node(31, true).dav_permissions(), "RGDNVCK");

@@ -15,6 +15,7 @@ pub mod discovery;
 pub mod error;
 pub mod files;
 pub mod model;
+pub mod mounts;
 pub mod outbox;
 pub mod php;
 pub mod routes;

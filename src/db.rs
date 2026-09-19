@@ -1009,6 +1009,356 @@ impl Db {
         Ok(mounts)
     }
 
+    /// Resolves `<internal path>` inside an arbitrary storage by `path_hash`,
+    /// exactly like `Cache::get()` (used for paths inside a mount).
+    pub async fn resolve_storage_file(
+        &self,
+        storage: i64,
+        path_hash: &str,
+    ) -> Result<Option<FileCacheRow>> {
+        let sql = self.render(&format!(
+            "SELECT f.fileid, f.storage, f.path, f.name, f.size, f.mtime, f.etag, \
+                    f.permissions, f.encrypted, f.unencrypted_size, f.checksum, f.parent, \
+                    mt.mimetype, fe.creation_time, md.json AS meta_json \
+             FROM {p}filecache f \
+             LEFT JOIN {p}mimetypes mt ON mt.id = f.mimetype \
+             LEFT JOIN {p}filecache_extended fe ON fe.fileid = f.fileid \
+             LEFT JOIN {p}files_metadata md ON md.file_id = f.fileid \
+             WHERE f.storage = ? AND f.path_hash = ? LIMIT 1",
+            p = self.prefix
+        ));
+        let row = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(storage)
+            .bind(path_hash)
+            .fetch_optional(&self.pool)
+            .await?;
+        row.as_ref().map(file_cache_row_from_row).transpose()
+    }
+
+    /// Whether an `oc_<table>` exists (the companion apps are optional).
+    pub async fn table_exists(&self, table: &str) -> Result<bool> {
+        let sql = self.render(&format!(
+            "SELECT 1 FROM {}{} LIMIT 1",
+            self.prefix, table
+        ));
+        match sqlx::query(sqlx::AssertSqlSafe(sql))
+            .fetch_optional(&self.pool)
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(_) => Ok(false),
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Mounts (files PROPFIND phase 2)
+    // ------------------------------------------------------------------
+
+    /// The raw `oc_group_user` gids for `uid` (not principal URIs).
+    pub async fn user_group_ids(&self, uid: &str) -> Result<Vec<String>> {
+        let sql = self.render(&format!(
+            "SELECT gid FROM {p}group_user WHERE uid = ?",
+            p = self.prefix
+        ));
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(uid)
+            .fetch_all(&self.pool)
+            .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in &rows {
+            if let Some(gid) = row.try_get::<Option<String>, _>("gid")? {
+                out.push(gid);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Every `oc_mounts` row for `uid`, joined to its root `oc_filecache` row.
+    pub async fn mount_base_rows(&self, uid: &str) -> Result<Vec<crate::mounts::MountBaseRow>> {
+        let sql = self.render(&format!(
+            "SELECT m.mount_point, m.mount_provider_class, m.mount_id, m.storage_id, \
+                    m.root_id, s.id AS storage_string, \
+                    f.path AS root_path, f.name AS root_name, f.size AS root_size, \
+                    f.mtime AS root_mtime, f.etag AS root_etag, \
+                    f.permissions AS root_permissions, f.encrypted AS root_encrypted, \
+                    f.unencrypted_size AS root_unencrypted_size, \
+                    mt.mimetype AS root_mimetype \
+             FROM {p}mounts m \
+             LEFT JOIN {p}storages s ON s.numeric_id = m.storage_id \
+             LEFT JOIN {p}filecache f ON f.fileid = m.root_id \
+             LEFT JOIN {p}mimetypes mt ON mt.id = f.mimetype \
+             WHERE m.user_id = ? ORDER BY m.mount_point",
+            p = self.prefix
+        ));
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(uid)
+            .fetch_all(&self.pool)
+            .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in &rows {
+            out.push(crate::mounts::MountBaseRow {
+                mount_point: row.try_get::<Option<String>, _>("mount_point")?.unwrap_or_default(),
+                provider_class: row
+                    .try_get::<Option<String>, _>("mount_provider_class")?
+                    .unwrap_or_default(),
+                mount_id: row.try_get("mount_id")?,
+                storage_id: row.try_get("storage_id")?,
+                root_id: row.try_get("root_id")?,
+                storage_string: row
+                    .try_get::<Option<String>, _>("storage_string")?
+                    .unwrap_or_default(),
+                root_path: row.try_get("root_path")?,
+                root_name: row.try_get("root_name")?,
+                root_size: row.try_get("root_size")?,
+                root_mtime: row.try_get("root_mtime")?,
+                root_etag: row.try_get("root_etag")?,
+                root_permissions: row.try_get("root_permissions")?,
+                root_encrypted: row.try_get("root_encrypted")?,
+                root_unencrypted_size: row.try_get("root_unencrypted_size")?,
+                root_mimetype: row.try_get("root_mimetype")?,
+            });
+        }
+        Ok(out)
+    }
+
+    /// All `oc_group_folders_groups` rows (folder -> group/circle permission).
+    pub async fn group_folder_group_rows(
+        &self,
+    ) -> Result<Vec<crate::mounts::GroupFolderGroupRow>> {
+        let sql = self.render(&format!(
+            "SELECT folder_id, permissions, group_id, circle_id FROM {p}group_folders_groups",
+            p = self.prefix
+        ));
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .fetch_all(&self.pool)
+            .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in &rows {
+            out.push(crate::mounts::GroupFolderGroupRow {
+                folder_id: row.try_get("folder_id")?,
+                permissions: row.try_get::<Option<i64>, _>("permissions")?.unwrap_or(0),
+                group_id: row.try_get("group_id")?,
+                circle_id: row.try_get("circle_id")?,
+            });
+        }
+        Ok(out)
+    }
+
+    /// All `oc_group_folders` metadata rows.
+    pub async fn group_folder_meta_rows(&self) -> Result<Vec<crate::mounts::GroupFolderMetaRow>> {
+        // `acl_default_no_permission` is a PostgreSQL `boolean` in production
+        // (and a tinyint on MySQL); select it as a portable integer.
+        let sql = self.render(&format!(
+            "SELECT folder_id, acl, quota, storage_id, \
+                    CASE WHEN acl_default_no_permission THEN 1 ELSE 0 END \
+                        AS acl_default_no_permission \
+             FROM {p}group_folders",
+            p = self.prefix
+        ));
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .fetch_all(&self.pool)
+            .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in &rows {
+            out.push(crate::mounts::GroupFolderMetaRow {
+                folder_id: row.try_get("folder_id")?,
+                acl: row.try_get::<Option<i64>, _>("acl")?.unwrap_or(0),
+                quota: row.try_get::<Option<i64>, _>("quota")?.unwrap_or(-3),
+                storage_id: row.try_get::<Option<i64>, _>("storage_id")?.unwrap_or(0),
+                acl_default_no_permission: row
+                    .try_get::<Option<i64>, _>("acl_default_no_permission")?
+                    .unwrap_or(0)
+                    != 0,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Every `oc_group_folders_acl` row joined to its filecache path.
+    pub async fn group_folder_acl_rows(&self) -> Result<Vec<crate::mounts::GroupFolderAclRow>> {
+        let sql = self.render(&format!(
+            "SELECT f.storage AS storage_id, f.path AS path, a.mapping_type, a.mapping_id, \
+                    a.mask, a.permissions \
+             FROM {p}group_folders_acl a \
+             JOIN {p}filecache f ON f.fileid = a.fileid",
+            p = self.prefix
+        ));
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .fetch_all(&self.pool)
+            .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in &rows {
+            out.push(crate::mounts::GroupFolderAclRow {
+                storage_id: row.try_get("storage_id")?,
+                path: row.try_get::<Option<String>, _>("path")?.unwrap_or_default(),
+                mapping_type: row
+                    .try_get::<Option<String>, _>("mapping_type")?
+                    .unwrap_or_default(),
+                mapping_id: row
+                    .try_get::<Option<String>, _>("mapping_id")?
+                    .unwrap_or_default(),
+                mask: row.try_get::<Option<i64>, _>("mask")?.unwrap_or(0),
+                permissions: row.try_get::<Option<i64>, _>("permissions")?.unwrap_or(0),
+            });
+        }
+        Ok(out)
+    }
+
+    /// Every `oc_group_folders_manage` row.
+    pub async fn group_folder_manage_rows(
+        &self,
+    ) -> Result<Vec<crate::mounts::GroupFolderManageRow>> {
+        let sql = self.render(&format!(
+            "SELECT folder_id, mapping_type, mapping_id FROM {p}group_folders_manage",
+            p = self.prefix
+        ));
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .fetch_all(&self.pool)
+            .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in &rows {
+            out.push(crate::mounts::GroupFolderManageRow {
+                folder_id: row.try_get("folder_id")?,
+                mapping_type: row
+                    .try_get::<Option<String>, _>("mapping_type")?
+                    .unwrap_or_default(),
+                mapping_id: row
+                    .try_get::<Option<String>, _>("mapping_id")?
+                    .unwrap_or_default(),
+            });
+        }
+        Ok(out)
+    }
+
+    /// Group ids authorized to administer the groupfolders app settings
+    /// (`oc_authorized_groups`; NC 33 has no `appid` column, the class encodes
+    /// the app).
+    pub async fn group_folder_authorized_groups(&self) -> Result<Vec<String>> {
+        let sql = self.render(&format!(
+            "SELECT group_id FROM {p}authorized_groups WHERE class = ?",
+            p = self.prefix
+        ));
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind("OCA\\GroupFolders\\Settings\\Admin")
+            .fetch_all(&self.pool)
+            .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in &rows {
+            if let Some(group) = row.try_get::<Option<String>, _>("group_id")? {
+                out.push(group);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Incoming shares relevant to `uid` (user, group and usergroup shares,
+    /// plus the types we cannot resolve so the mount is marked unservable).
+    pub async fn mount_share_rows(&self, uid: &str) -> Result<Vec<crate::mounts::MountShareRow>> {
+        // `oc_share.attributes` is a PostgreSQL `json` column; the `Any` driver
+        // cannot decode it, so cast it to text on Postgres.
+        let attributes = if self.postgres {
+            "s.attributes::text"
+        } else {
+            "s.attributes"
+        };
+        let sql = self.render(&format!(
+            "SELECT s.file_source, s.id, s.share_type, s.share_with, s.permissions, \
+                    s.note, s.hide_download, {attributes} AS attributes, s.uid_owner, \
+                    s.accepted, s.stime, \
+                    u.displayname AS user_displayname, g.displayname AS group_displayname, \
+                    uo.displayname AS owner_displayname \
+             FROM {p}share s \
+             LEFT JOIN {p}users u ON s.share_type IN (0, 2) AND u.uid = s.share_with \
+             LEFT JOIN {p}groups g ON s.share_type = 1 AND g.gid = s.share_with \
+             LEFT JOIN {p}users uo ON uo.uid = s.uid_owner \
+             WHERE s.item_type IN ('file', 'folder') \
+               AND s.share_type IN (0, 1, 2, 7, 10, 11, 12) \
+               AND s.uid_owner <> ? AND s.uid_initiator <> ? \
+               AND ( \
+                     (s.share_type IN (0, 2) AND s.share_with = ?) \
+                     OR (s.share_type = 1 AND s.share_with IN \
+                         (SELECT gid FROM {p}group_user WHERE uid = ?)) \
+                     OR s.share_type IN (7, 10, 11, 12) \
+                   )",
+            p = self.prefix
+        ));
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(uid)
+            .bind(uid)
+            .bind(uid)
+            .bind(uid)
+            .fetch_all(&self.pool)
+            .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in &rows {
+            out.push(crate::mounts::MountShareRow {
+                file_source: row.try_get("file_source")?,
+                id: row.try_get("id")?,
+                share_type: row.try_get::<Option<i64>, _>("share_type")?.unwrap_or(0),
+                share_with: row.try_get("share_with")?,
+                permissions: row.try_get::<Option<i64>, _>("permissions")?.unwrap_or(0),
+                note: row.try_get("note")?,
+                hide_download: row.try_get::<Option<i64>, _>("hide_download")?.unwrap_or(0),
+                attributes: row.try_get("attributes")?,
+                uid_owner: row.try_get::<Option<String>, _>("uid_owner")?.unwrap_or_default(),
+                accepted: row.try_get::<Option<i64>, _>("accepted")?.unwrap_or(0),
+                stime: row.try_get::<Option<i64>, _>("stime")?.unwrap_or(0),
+                user_displayname: row
+                    .try_get::<Option<String>, _>("user_displayname")?
+                    .filter(|name| !name.is_empty()),
+                group_displayname: row
+                    .try_get::<Option<String>, _>("group_displayname")?
+                    .filter(|name| !name.is_empty()),
+                owner_displayname: row
+                    .try_get::<Option<String>, _>("owner_displayname")?
+                    .filter(|name| !name.is_empty()),
+            });
+        }
+        Ok(out)
+    }
+
+    /// All `oc_external_mounts` rows.
+    pub async fn external_mount_rows(&self) -> Result<Vec<crate::mounts::ExternalMountRow>> {
+        let sql = self.render(&format!(
+            "SELECT mount_id, storage_backend, auth_backend FROM {p}external_mounts",
+            p = self.prefix
+        ));
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .fetch_all(&self.pool)
+            .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in &rows {
+            out.push(crate::mounts::ExternalMountRow {
+                mount_id: row.try_get("mount_id")?,
+                storage_backend: row
+                    .try_get::<Option<String>, _>("storage_backend")?
+                    .unwrap_or_default(),
+                auth_backend: row.try_get("auth_backend")?,
+            });
+        }
+        Ok(out)
+    }
+
+    /// All `oc_external_options` rows.
+    pub async fn external_option_rows(&self) -> Result<Vec<crate::mounts::ExternalOptionRow>> {
+        let sql = self.render(&format!(
+            "SELECT mount_id, key, value FROM {p}external_options",
+            p = self.prefix
+        ));
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .fetch_all(&self.pool)
+            .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in &rows {
+            out.push(crate::mounts::ExternalOptionRow {
+                mount_id: row.try_get("mount_id")?,
+                key: row.try_get::<Option<String>, _>("key")?.unwrap_or_default(),
+                value: row.try_get::<Option<String>, _>("value")?.unwrap_or_default(),
+            });
+        }
+        Ok(out)
+    }
+
     /// Shares in a folder, keyed by `file_source`, exactly like
     /// `SharesPlugin::preloadCollection()` -> `DefaultShareProvider::getSharesInFolder()`:
     /// user/group/link shares the caller owns or initiated, on a direct child of

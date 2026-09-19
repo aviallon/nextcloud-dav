@@ -10,7 +10,7 @@
 
 mod common;
 
-use common::{call, get, propfind, report, request, TestEnv};
+use common::{call, get, propfind, report, request, safe, TestEnv};
 use nextcloud_dav::outbox::EffectRegistry;
 use nextcloud_dav::xml::parse::{parse_document, XNode};
 use nextcloud_dav::xml::write::{NS_CARDDAV, NS_DAV, NS_NEXTCLOUD_FILES, NS_OWNCLOUD};
@@ -54,6 +54,11 @@ const DECLARED_IDS: &[&str] = &[
     "error-body-501",
     "files-property-gate-501",
     "files-mount-delegation",
+    "files-mount-external-backend-delegated",
+    "files-mount-external-check-changes-delegated",
+    "files-mount-circle-acl-delegated",
+    "files-mount-share-type-delegated",
+    "files-mount-acl-inherit-delegated",
     "files-non-propfind-501",
     "files-has-preview-static",
     "files-shareapi-exclude-groups-delegated",
@@ -114,7 +119,7 @@ fn files_prop_body(props: &str) -> String {
 
 /// The text of one property of one response in a files multistatus.
 fn files_prop_text(body: &[u8], href: &str, ns: &str, local: &str) -> Option<String> {
-    let d = doc(body);
+    let d = parse_document(body).ok()?;
     let r = response(&d, href)?;
     prop_text(r, ns, local)
 }
@@ -278,9 +283,6 @@ async fn fixture() -> Option<Fixture> {
         None,
     )
     .await;
-    // A received share under the home root: any Depth 1 home listing must
-    // delegate, and the mount root itself is not in the home filecache.
-    env.seed_mount(USER, "/alice/files/Shared/").await;
 
     let app = env.app_shared();
     Some(Fixture {
@@ -895,8 +897,35 @@ async fn assert_deviation(id: &str, f: &Fixture) -> Result<(), String> {
             );
         }
         "files-mount-delegation" => {
-            let body = files_prop_body("<d:getetag/>");
-            // The home root contains a mount, so its listing would drop it.
+            let body = files_prop_body(
+                "<d:getetag/><nc:mount-type/><nc:is-mount-root/>",
+            );
+            // A servable local external mount.
+            let storage = f.env.seed_storage("local::/external/local/").await;
+            let root = f
+                .env
+                .seed_file(storage, "", "", "httpd/unix-directory", 5, 1, "eLocal", 31, 0, None)
+                .await;
+            let mount_id = f.env.seed_external_mount("local").await;
+            f.env
+                .seed_external_option(mount_id, "filesystem_check_changes", "0")
+                .await;
+            f.env
+                .seed_mount_external(USER, "/alice/files/LocalExt/", storage, root, mount_id)
+                .await;
+            // A non-local external mount: its contents delegate, its entry does
+            // not suppress the containing listing.
+            let s3 = f.env.seed_storage("amazons3::bucket-home").await;
+            let s3_root = f
+                .env
+                .seed_file(s3, "", "", "httpd/unix-directory", 5, 1, "eS3", 31, 0, None)
+                .await;
+            let s3_mount_id = f.env.seed_external_mount("amazons3").await;
+            f.env
+                .seed_mount_external(USER, "/alice/files/S3/", s3, s3_root, s3_mount_id)
+                .await;
+
+            // The 85 % case: the home root contains mounts and is served.
             let resp = propfind(
                 &f.app,
                 "/remote.php/dav/files/alice",
@@ -907,19 +936,66 @@ async fn assert_deviation(id: &str, f: &Fixture) -> Result<(), String> {
             )
             .await;
             ensure!(
-                resp.status == 501,
-                "the home root with a mount must delegate, got {}",
+                resp.status == 207,
+                "the home root with mounts must be served, got {}",
                 resp.status
             );
-            // The mount root is not a row in the home storage's filecache.
+            ensure!(
+                resp.header(nextcloud_dav::routes::SIDECAR_HEADER).as_deref()
+                    == Some(nextcloud_dav::routes::SIDECAR_VALUE),
+                "a served listing must carry the sidecar header"
+            );
+            ensure!(
+                files_prop_text(
+                    &resp.body,
+                    "/remote.php/dav/files/alice/S3/",
+                    NS_NEXTCLOUD_FILES,
+                    "mount-type",
+                )
+                .as_deref()
+                    == Some("external"),
+                "an unservable mount entry must be merged into the listing"
+            );
+            ensure!(
+                files_prop_text(
+                    &resp.body,
+                    "/remote.php/dav/files/alice/LocalExt/",
+                    NS_NEXTCLOUD_FILES,
+                    "mount-type",
+                )
+                .as_deref()
+                    == Some("external"),
+                "a servable mount entry must be merged into the listing"
+            );
+
+            // Inside the non-local mount: delegate, and no sidecar header.
             for path in [
-                "/remote.php/dav/files/alice/Shared",
-                "/remote.php/dav/files/alice/Shared/sub",
+                "/remote.php/dav/files/alice/S3",
+                "/remote.php/dav/files/alice/S3/sub",
             ] {
                 let resp = propfind(&f.app, path, USER, PASSWORD, "0", &body).await;
                 ensure!(resp.status == 501, "{path} must delegate, got {}", resp.status);
+                ensure!(
+                    resp.header(nextcloud_dav::routes::SIDECAR_HEADER).is_none(),
+                    "{path} delegated but carried the sidecar header"
+                );
             }
-            // A sibling of the mount is still native.
+            // The servable local external mount is native.
+            let resp = propfind(
+                &f.app,
+                "/remote.php/dav/files/alice/LocalExt",
+                USER,
+                PASSWORD,
+                "0",
+                &body,
+            )
+            .await;
+            ensure!(
+                resp.status == 207,
+                "a servable local external mount must be native, got {}",
+                resp.status
+            );
+            // A sibling of the mounts is still native.
             let resp = propfind(
                 &f.app,
                 "/remote.php/dav/files/alice/Doc.pdf",
@@ -934,6 +1010,233 @@ async fn assert_deviation(id: &str, f: &Fixture) -> Result<(), String> {
                 "a mount sibling must stay native, got {}",
                 resp.status
             );
+
+            // A mount whose root row is gone cannot be described at all: the
+            // containing listing delegates rather than silently dropping it.
+            f.env.seed_mount(USER, "/alice/files/Ghost/").await;
+            let resp = propfind(
+                &f.app,
+                "/remote.php/dav/files/alice/Ghost",
+                USER,
+                PASSWORD,
+                "0",
+                &body,
+            )
+            .await;
+            ensure!(
+                resp.status == 501,
+                "an undescribable mount must delegate, got {}",
+                resp.status
+            );
+            let resp = propfind(
+                &f.app,
+                "/remote.php/dav/files/alice",
+                USER,
+                PASSWORD,
+                "1",
+                &body,
+            )
+            .await;
+            ensure!(
+                resp.status == 501,
+                "a listing containing an undescribable mount must delegate, got {}",
+                resp.status
+            );
+        }
+        "files-mount-external-backend-delegated" => {
+            let storage = f.env.seed_storage("amazons3::bucket").await;
+            let root = f
+                .env
+                .seed_file(storage, "", "", "httpd/unix-directory", 5, 1, "eS3", 31, 0, None)
+                .await;
+            let mount_id = f.env.seed_external_mount("amazons3").await;
+            f.env
+                .seed_mount_external(USER, "/alice/files/S3/", storage, root, mount_id)
+                .await;
+            let body = files_prop_body("<d:getetag/>");
+            let resp = propfind(
+                &f.app,
+                "/remote.php/dav/files/alice/S3",
+                USER,
+                PASSWORD,
+                "0",
+                &body,
+            )
+            .await;
+            ensure!(
+                resp.status == 501,
+                "a non-local external backend must delegate, got {}",
+                resp.status
+            );
+        }
+        "files-mount-external-check-changes-delegated" => {
+            let storage = f.env.seed_storage("local::/external/cc/").await;
+            let root = f
+                .env
+                .seed_file(storage, "", "", "httpd/unix-directory", 5, 1, "eCC", 31, 0, None)
+                .await;
+            let mount_id = f.env.seed_external_mount("local").await;
+            f.env
+                .seed_external_option(mount_id, "filesystem_check_changes", "1")
+                .await;
+            f.env
+                .seed_mount_external(USER, "/alice/files/CheckChanges/", storage, root, mount_id)
+                .await;
+            let body = files_prop_body("<d:getetag/>");
+            let resp = propfind(
+                &f.app,
+                "/remote.php/dav/files/alice/CheckChanges",
+                USER,
+                PASSWORD,
+                "0",
+                &body,
+            )
+            .await;
+            ensure!(
+                resp.status == 501,
+                "filesystem_check_changes must delegate, got {}",
+                resp.status
+            );
+        }
+        "files-mount-circle-acl-delegated" => {
+            f.env.seed_group("circle-team").await;
+            f.env.seed_group_member("circle-team", USER).await;
+            let storage = f.env.seed_storage("local::/data/circle/").await;
+            let root = f
+                .env
+                .seed_file(storage, "__groupfolders/9", "9", "httpd/unix-directory", 5, 1, "eCircle", 31, 0, None)
+                .await;
+            let folder_id = f
+                .env
+                .seed_group_folder("CircleGf", 1, -3, storage, root)
+                .await;
+            f.env
+                .seed_group_folder_group(folder_id, Some("circle-team"), None, 31)
+                .await;
+            f.env
+                .seed_acl_rule(root, "circle", "circle-single-id", 1, 1)
+                .await;
+            f.env
+                .seed_mount_full(
+                    USER,
+                    "/alice/files/CircleGf/",
+                    storage,
+                    root,
+                    "OCA\\GroupFolders\\Mount\\MountProvider",
+                )
+                .await;
+            let body = files_prop_body("<d:getetag/>");
+            let resp = propfind(
+                &f.app,
+                "/remote.php/dav/files/alice/CircleGf",
+                USER,
+                PASSWORD,
+                "0",
+                &body,
+            )
+            .await;
+            ensure!(
+                resp.status == 501,
+                "a circle ACL rule must delegate, got {}",
+                resp.status
+            );
+        }
+        "files-mount-share-type-delegated" => {
+            let storage = f.env.seed_storage("home::bob").await;
+            let root = f
+                .env
+                .seed_file(storage, "files/CircleShare", "CircleShare", "httpd/unix-directory", 5, 1, "eCS", 31, 0, None)
+                .await;
+            f.env.seed_incoming_share(7, "circle-id", "bob", root, 31, 1).await;
+            f.env
+                .seed_mount_full(
+                    USER,
+                    "/alice/files/CircleShare/",
+                    storage,
+                    root,
+                    "OCA\\Files_Sharing\\MountProvider",
+                )
+                .await;
+            let body = files_prop_body("<d:getetag/>");
+            let resp = propfind(
+                &f.app,
+                "/remote.php/dav/files/alice/CircleShare",
+                USER,
+                PASSWORD,
+                "0",
+                &body,
+            )
+            .await;
+            ensure!(
+                resp.status == 501,
+                "an unresolvable share type must delegate, got {}",
+                resp.status
+            );
+        }
+        "files-mount-acl-inherit-delegated" => {
+            f.env.seed_group("inherit-team").await;
+            f.env.seed_group_member("inherit-team", USER).await;
+            let storage = f.env.seed_storage("local::/data/inherit/").await;
+            let root = f
+                .env
+                .seed_file(storage, "__groupfolders/10", "10", "httpd/unix-directory", 5, 1, "eInherit", 31, 0, None)
+                .await;
+            let folder_id = f
+                .env
+                .seed_group_folder("InheritGf", 1, -3, storage, root)
+                .await;
+            f.env
+                .seed_group_folder_group(folder_id, Some("inherit-team"), None, 31)
+                .await;
+            f.env
+                .seed_mount_full(
+                    USER,
+                    "/alice/files/InheritGf/",
+                    storage,
+                    root,
+                    "OCA\\GroupFolders\\Mount\\MountProvider",
+                )
+                .await;
+            let body = files_prop_body("<d:getetag/>");
+            // Default (false): the ACL folder is served.
+            let resp = propfind(
+                &f.app,
+                "/remote.php/dav/files/alice/InheritGf",
+                USER,
+                PASSWORD,
+                "0",
+                &body,
+            )
+            .await;
+            ensure!(
+                resp.status == 207,
+                "an ACL groupfolder must be served by default, got {}",
+                resp.status
+            );
+            // `acl-inherit-per-user = true`: the alternative merge, delegate.
+            f.env
+                .seed_appconfig("groupfolders", "acl-inherit-per-user", "true")
+                .await;
+            let resp = propfind(
+                &f.app,
+                "/remote.php/dav/files/alice/InheritGf",
+                USER,
+                PASSWORD,
+                "0",
+                &body,
+            )
+            .await;
+            ensure!(
+                resp.status == 501,
+                "acl-inherit-per-user must delegate ACL folders, got {}",
+                resp.status
+            );
+            // A groupfolder without ACLs is unaffected: reset the flag.
+            let sql = format!(
+                "UPDATE {}appconfig SET configvalue = 'false' WHERE appid='groupfolders' AND configkey='acl-inherit-per-user'",
+                f.env.prefix
+            );
+            sqlx::query(safe(sql)).execute(f.env.pool()).await.unwrap();
         }
         "files-non-propfind-501" => {
             for method in [

@@ -123,6 +123,9 @@ async fn run() -> Result<(), Box<dyn Error>> {
         config.bruteforce.clone(),
     );
 
+    let mounts = Arc::new(nextcloud_dav::mounts::MountCache::new(
+        nextcloud_dav::mounts::MOUNT_CACHE_TTL,
+    ));
     let state = Arc::new(AppState {
         db,
         auth,
@@ -130,6 +133,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
         card_size_limit,
         native_writes,
         registry,
+        mounts,
     });
     let app = router(state);
 

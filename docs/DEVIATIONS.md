@@ -207,7 +207,12 @@ in `src/files.rs`; the recon is `recon/files-propfind-model.md`.
 | id | area | status | one-line difference |
 |---|---|---|---|
 | `files-property-gate-501` | propfind | intentional | an explicit request for any unimplemented qname → 501, never 404 |
-| `files-mount-delegation` | delegation | intentional | any mount at/under the path, or below a collection → 501 |
+| `files-mount-delegation` | delegation | intentional | the mount model is served natively; a mount's *contents* may still delegate, its entry never does |
+| `files-mount-external-backend-delegated` | delegation | intentional | a non-`local` files_external backend → 501 |
+| `files-mount-external-check-changes-delegated` | delegation | intentional | local external with `filesystem_check_changes != 0` → 501 |
+| `files-mount-circle-acl-delegated` | delegation | intentional | a groupfolder circle ACL rule or circle group membership → 501 |
+| `files-mount-acl-inherit-delegated` | delegation | intentional | groupfolders `acl-inherit-per-user = true` → ACL folders → 501 |
+| `files-mount-share-type-delegated` | delegation | intentional | a received share whose type is not user/group/usergroup → 501 |
 | `files-non-propfind-501` | delegation | intentional | every non-PROPFIND method (including OPTIONS) → 501 |
 | `files-has-preview-static` | propfind | accepted | `nc:has-preview` uses a static mimetype list, not the live provider registry |
 | `files-shareapi-exclude-groups-delegated` | delegation | intentional | `core/shareapi_exclude_groups` configured → 501 |
@@ -248,11 +253,43 @@ delegates with 501, because a 404 would tell the client a property PHP serves
 does not exist. `allprop` and `propname` use Sabre's fixed 7-property list
 (`PropFind::ALLPROPS`), so they are always servable.
 
-**Mounts.** A received share, a groupfolder or an external storage is an
-`oc_mounts` row, not a child row in the home storage's `oc_filecache`. Serving a
-listing from `oc_filecache` alone would silently drop it, and a directory's
-`oc:size`/`getetag` include its submounts (`View::getFileInfo()`), so any path
-that has a mount at, under, or (as a collection) below it is delegated.
+**Mounts (phase 2).** A received share, a groupfolder or an external storage is
+an `oc_mounts` row, not a child row in the home storage's `oc_filecache`. The
+sidecar now serves the mount model natively (`src/mounts.rs`):
+
+- a listing that **contains** mounts (the home root, 85 % of files PROPFINDs)
+  merges one entry per `oc_mounts` row after the cache children, ascending by
+  mount point, with the provider permission masks, `nc:mount-type` and
+  `nc:is-mount-root`;
+- a listing **inside** a share, groupfolder or local external mount reuses
+  `oc_filecache` in the mount's storage and applies the provider mask to every
+  row;
+- the parent's synthetic `getetag`/`oc:size`/`getlastmodified`
+  (`md5(etag.'::'.join('::', relPath.'/'.rootEtag.perms))`, decimal
+  permissions, the double slash from the trailing mount-point slash, ascending
+  order, `size += Σ`, `mtime = max`);
+- the groupfolder **ACL rule engine** (`ACLManager`/`Rule`/`ACLCacheWrapper`):
+  per-path rules for the caller's user/group mappings, parent-first
+  `mergeRules`/`applyPermissions`, the `acl_default_no_permission` base
+  permission and `canManageACL`; a row whose masked permissions are zero is
+  dropped from the listing (and is a 404 at Depth 0).
+
+Only genuinely unreproducible inputs stay delegated, each with its own entry:
+circle membership (the circles app's own tables), non-local external backends,
+external `filesystem_check_changes`, and received-share types other than
+user/group/usergroup. Delegation is driven by the **requested** path: a mount
+whose *contents* are unreproducible is still **described** as an entry in any
+listing that contains it (name, etag, mtime, size, mimetype, permissions,
+`nc:mount-type`, `nc:is-mount-root`, and its contribution to the parent's
+synthetic etag/size/mtime); only a request **at or under** it answers 501. The
+sole case that still suppresses a containing listing is a mount whose root
+`oc_filecache` row is gone (a stale `oc_mounts` row), which cannot be described
+at all. The share-manager properties for mounts
+(`oc:share-types`, `nc:sharees`, `ocs:share-permissions`, `nc:note`,
+`nc:hide-download`, `nc:share-attributes`) and `d:quota-*` are served from the
+super-share / mount model rather than delegated. The mount map is cached per
+user with a 30 s TTL; a stale or failed load answers 501, never 404, so a newly
+created mount cannot be reported as missing.
 
 **`nc:has-preview`.** `PreviewManager::isAvailable()` depends on the enabled
 apps, the loaded imagick/ffmpeg/libreoffice binaries and third-party providers,

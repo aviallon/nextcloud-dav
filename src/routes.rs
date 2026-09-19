@@ -36,6 +36,14 @@ use std::sync::Arc;
 
 const MAX_BODY: usize = 10 * 1024 * 1024;
 
+/// Marks a response the sidecar served itself. It is deliberately **not** set
+/// on the `501` responses that delegate to PHP (nginx replays those), so a
+/// differential harness can prove which backend produced a body instead of
+/// silently diffing PHP against itself.
+pub const SIDECAR_HEADER: &str = "x-nextcloud-dav";
+/// The value of [`SIDECAR_HEADER`] on a native response.
+pub const SIDECAR_VALUE: &str = "sidecar";
+
 pub struct AppState {
     pub db: Arc<Db>,
     pub auth: Authenticator,
@@ -49,6 +57,8 @@ pub struct AppState {
     pub native_writes: bool,
     /// The effect-ownership registry frozen into every outbox row.
     pub registry: Arc<EffectRegistry>,
+    /// The short-TTL per-user mount map for the files `PROPFIND`.
+    pub mounts: Arc<crate::mounts::MountCache>,
 }
 
 pub fn router(state: Arc<AppState>) -> Router {
@@ -306,6 +316,7 @@ async fn handle_files(state: Arc<AppState>, request: Request) -> Result<Response
     match crate::files::handle_propfind(
         &state.db,
         &state.config,
+        &state.mounts,
         &user,
         &parsed,
         depth,
@@ -1614,6 +1625,12 @@ fn xml_response(status: StatusCode, body: String) -> Response {
         header::CONTENT_TYPE,
         HeaderValue::from_static("application/xml; charset=utf-8"),
     );
+    // Every `xml_response` is a body the sidecar produced itself (a native
+    // multistatus). The `501` delegation path uses `not_implemented()` and must
+    // stay indistinguishable from PHP.
+    response
+        .headers_mut()
+        .insert(SIDECAR_HEADER, HeaderValue::from_static(SIDECAR_VALUE));
     response
 }
 
