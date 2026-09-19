@@ -34,6 +34,7 @@ toolchain (the sidecar is built with
 | `setup.sh` | bring up, install, enable the app, create user/app-password/address book, copy `config.php`, build + start the sidecar |
 | `e2e.sh` | the acceptance checks; writes `state/evidence/e2e.txt` |
 | `files_parity.sh` | seeds a large `files/ParityBig` directory and diffs the sidecar's files PROPFIND against PHP's (canonicalised XML); writes `state/evidence/files-parity.txt` |
+| `discovery_parity.sh` | diffs the sidecar's DAV-root and own-principal discovery PROPFIND against PHP's (canonicalised XML), for the explicit property set and allprop; writes `state/evidence/discovery-parity.txt` |
 | `canonicalize_propfind.py` | canonicaliser used by `files_parity.sh` |
 | `teardown.sh` | `compose down -v` + remove `state/` |
 | `state/` (git-ignored) | generated secrets, copied `config.php`, sidecar/worker logs, evidence |

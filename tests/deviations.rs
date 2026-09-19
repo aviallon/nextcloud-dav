@@ -62,6 +62,12 @@ const DECLARED_IDS: &[&str] = &[
     "files-downloadurl-objectstore-delegated",
     "files-is-encrypted-e2ee-delegated",
     "files-sharees-ldap-display-name",
+    "discovery-property-gate-501",
+    "discovery-own-principal-only",
+    "discovery-collection-listings-delegated",
+    "discovery-non-propfind-501",
+    "discovery-group-membership-backends",
+    "discovery-language-request-fallback",
 ];
 
 fn toml_ids() -> Vec<String> {
@@ -1145,6 +1151,177 @@ async fn assert_deviation(id: &str, f: &Fixture) -> Result<(), String> {
             ensure!(
                 display == "ldapuser",
                 "sharee display-name is {display:?}, expected the id fallback"
+            );
+        }
+        "discovery-property-gate-501" => {
+            let body = |props: &str| {
+                format!(
+                    r#"<d:propfind xmlns:d="DAV:" xmlns:nc="http://nextcloud.com/ns"><d:prop>{props}</d:prop></d:propfind>"#
+                )
+            };
+            let root = "/remote.php/dav/";
+            let principal = "/remote.php/dav/principals/users/alice/";
+            // An implemented property is served.
+            let resp = propfind(
+                &f.app,
+                root,
+                USER,
+                PASSWORD,
+                "0",
+                &body("<d:current-user-principal/>"),
+            )
+            .await;
+            ensure!(
+                resp.status == 207,
+                "an implemented root property must be served, got {}",
+                resp.status
+            );
+            // An unimplemented property on the root delegates.
+            let resp = propfind(&f.app, root, USER, PASSWORD, "0", &body("<d:displayname/>")).await;
+            ensure!(
+                resp.status == 501,
+                "an unimplemented root property must delegate, got {}",
+                resp.status
+            );
+            // An unimplemented property on the principal delegates.
+            let resp = propfind(
+                &f.app,
+                principal,
+                USER,
+                PASSWORD,
+                "0",
+                &body("<d:getetag/>"),
+            )
+            .await;
+            ensure!(
+                resp.status == 501,
+                "an unimplemented principal property must delegate, got {}",
+                resp.status
+            );
+            // A mixed set delegates as a whole.
+            let resp = propfind(
+                &f.app,
+                principal,
+                USER,
+                PASSWORD,
+                "0",
+                &body("<d:displayname/><d:getetag/>"),
+            )
+            .await;
+            ensure!(
+                resp.status == 501,
+                "a mixed property set must delegate, got {}",
+                resp.status
+            );
+        }
+        "discovery-own-principal-only" => {
+            let body =
+                r#"<d:propfind xmlns:d="DAV:"><d:prop><d:displayname/></d:prop></d:propfind>"#;
+            let resp = propfind(
+                &f.app,
+                "/remote.php/dav/principals/users/bob/",
+                USER,
+                PASSWORD,
+                "0",
+                body,
+            )
+            .await;
+            ensure!(
+                resp.status == 501,
+                "another user's principal must delegate, got {}",
+                resp.status
+            );
+            let resp = propfind(
+                &f.app,
+                "/remote.php/dav/principals/users/alice/",
+                USER,
+                PASSWORD,
+                "0",
+                body,
+            )
+            .await;
+            ensure!(
+                resp.status == 207,
+                "the caller's own principal must be served, got {}",
+                resp.status
+            );
+        }
+        "discovery-collection-listings-delegated" => {
+            let body =
+                r#"<d:propfind xmlns:d="DAV:"><d:prop><d:resourcetype/></d:prop></d:propfind>"#;
+            for path in [
+                "/remote.php/dav/principals",
+                "/remote.php/dav/principals/",
+                "/remote.php/dav/principals/users/",
+                "/remote.php/dav/principals/groups/admin/",
+            ] {
+                let resp = propfind(&f.app, path, USER, PASSWORD, "0", body).await;
+                ensure!(resp.status == 501, "{path} must delegate, got {}", resp.status);
+            }
+        }
+        "discovery-non-propfind-501" => {
+            for path in ["/remote.php/dav/", "/remote.php/dav/principals/users/alice/"] {
+                for method in ["OPTIONS", "GET", "HEAD", "PUT", "MKCOL", "REPORT"] {
+                    let resp = call(&f.app, request(method, path, USER, PASSWORD)).await;
+                    ensure!(
+                        resp.status == 501,
+                        "{method} {path} must delegate, got {}",
+                        resp.status
+                    );
+                }
+            }
+        }
+        "discovery-group-membership-backends" => {
+            f.env.seed_group("devs").await;
+            f.env.seed_group_member("devs", USER).await;
+            let body =
+                r#"<d:propfind xmlns:d="DAV:"><d:prop><d:group-membership/></d:prop></d:propfind>"#;
+            let principal = "/remote.php/dav/principals/users/alice/";
+            let resp = propfind(&f.app, principal, USER, PASSWORD, "0", body).await;
+            ensure!(resp.status == 207, "group-membership returned {}", resp.status);
+            let d = doc(&resp.body);
+            let r = response(&d, principal).ok_or("no principal response")?;
+            let membership = prop_of(r, NS_DAV, "group-membership")
+                .ok_or("no group-membership property")?;
+            let hrefs: Vec<String> = membership
+                .children
+                .iter()
+                .filter(|c| c.ns == NS_DAV && c.local == "href")
+                .map(|c| c.text.clone())
+                .collect();
+            ensure!(
+                hrefs.contains(&"/remote.php/dav/principals/groups/devs/".to_string()),
+                "group-membership is missing the database group: {hrefs:?}"
+            );
+        }
+        "discovery-language-request-fallback" => {
+            let env = match TestEnv::new().await {
+                Some(env) => env,
+                None => return Ok(()),
+            };
+            env.seed_user(USER, Some("Alice A")).await;
+            env.seed_token(USER, USER, PASSWORD, 1, 2).await;
+            let app = env.app_shared();
+            let body = r#"<d:propfind xmlns:d="DAV:" xmlns:nc="http://nextcloud.com/ns"><d:prop><nc:language/></d:prop></d:propfind>"#;
+            let principal = "/remote.php/dav/principals/users/alice/";
+            let resp = propfind(&app, principal, USER, PASSWORD, "0", body).await;
+            ensure!(
+                resp.status == 501,
+                "an underivable language must delegate, got {}",
+                resp.status
+            );
+            env.seed_preference(USER, "core", "lang", "fr").await;
+            let resp = propfind(&app, principal, USER, PASSWORD, "0", body).await;
+            ensure!(
+                resp.status == 207,
+                "a derivable language must be served, got {}",
+                resp.status
+            );
+            let d = doc(&resp.body);
+            let r = response(&d, principal).unwrap();
+            ensure!(
+                prop_text(r, "http://nextcloud.com/ns", "language").as_deref() == Some("fr"),
+                "language is wrong"
             );
         }
         other => {

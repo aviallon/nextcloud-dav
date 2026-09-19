@@ -4,8 +4,10 @@
 //! The PHP fallback: a credentialed `PROPFIND /remote.php/dav/` Depth 0.
 //!
 //! This is the same code path clients already exercise, so it needs no server
-//! modifications and it cannot recurse: `/remote.php/dav/` (the DAV root) is
-//! never routed to the sidecar (design doc §3.3 and §5.5).
+//! modifications. The DAV root is now served natively, so the probe carries
+//! [`FALLBACK_HEADER`]: the discovery handler answers `501`, nginx replays the
+//! request to PHP (`error_page`), and PHP returns the principal. That is what
+//! keeps the fallback from recursing through the root route.
 
 use crate::error::{Error, Result};
 use crate::util::percent_decode;
@@ -15,6 +17,15 @@ use std::time::Duration;
 
 const PROPFIND_BODY: &str = "<?xml version=\"1.0\"?>\
 <d:propfind xmlns:d=\"DAV:\"><d:prop><d:current-user-principal/></d:prop></d:propfind>";
+
+/// Marks a request as the sidecar's own authentication probe.
+///
+/// The probe is a credentialed `PROPFIND /remote.php/dav/` through the public
+/// URL, so once the DAV root is routed to the sidecar it would otherwise recurse
+/// (`authenticate` -> `php_fallback` -> `authenticate` -> ...). The discovery
+/// handler sees this header and answers `501`, which nginx replays to PHP via
+/// `error_page`; PHP then produces the principal.
+pub const FALLBACK_HEADER: &str = "x-nextcloud-dav-fallback";
 
 /// The outcome of a fallback authentication attempt.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -87,6 +98,7 @@ impl PhpClient {
             .request(reqwest::Method::from_bytes(b"PROPFIND").unwrap(), url)
             .header("Depth", "0")
             .header("Content-Type", "application/xml; charset=utf-8")
+            .header(FALLBACK_HEADER, "1")
             .basic_auth(username, Some(password))
             .body(PROPFIND_BODY);
         if let Some(ip) = forwarded_for {

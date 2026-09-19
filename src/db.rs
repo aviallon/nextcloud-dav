@@ -1169,6 +1169,26 @@ impl Db {
         }
     }
 
+    /// The `oc_accounts.data` JSON for a user, used by the DAV discovery
+    /// `{DAV:}alternate-URI-set` (the `additional_mail` property collection).
+    ///
+    /// `AccountManager::getAccount()` reads this table; when it is unavailable
+    /// the caller treats the account as having no extra addresses.
+    pub async fn account_data(&self, uid: &str) -> Result<Option<String>> {
+        let sql = self.render(&format!(
+            "SELECT data FROM {p}accounts WHERE uid = ? LIMIT 1",
+            p = self.prefix
+        ));
+        let row = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(uid)
+            .fetch_optional(&self.pool)
+            .await?;
+        match row {
+            Some(row) => Ok(row.try_get::<Option<String>, _>("data")?),
+            None => Ok(None),
+        }
+    }
+
     // ------------------------------------------------------------------
     // Brute force (read + the single opt-in write)
     // ------------------------------------------------------------------

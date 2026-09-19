@@ -216,6 +216,12 @@ in `src/files.rs`; the recon is `recon/files-propfind-model.md`.
 | `files-downloadurl-objectstore-delegated` | delegation | intentional | primary object store configured → `oc:downloadURL` → 501 |
 | `files-is-encrypted-e2ee-delegated` | delegation | intentional | `end_to_end_encryption` enabled → `nc:is-encrypted` → 501 (else 404, like PHP) |
 | `files-sharees-ldap-display-name` | propfind | intentional | `nc:sharees` display-name is joined from `oc_users`/`oc_groups`; an LDAP/circle sharee falls back to the id |
+| `discovery-property-gate-501` | propfind | intentional | an explicit request for any unimplemented discovery qname → 501, never 404 |
+| `discovery-own-principal-only` | delegation | intentional | another user's principal → 501 |
+| `discovery-collection-listings-delegated` | delegation | intentional | `/principals/` and `/principals/users/` listings (and other principal children) → 501 |
+| `discovery-non-propfind-501` | delegation | intentional | every non-PROPFIND discovery method (including OPTIONS) → 501 |
+| `discovery-group-membership-backends` | propfind | intentional | `group-membership` expands database groups only; LDAP/circles invisible |
+| `discovery-language-request-fallback` | propfind | intentional | `nc:language` delegates when no `force_language`/`core/lang` is set |
 
 **The property gate** is the safety rule that makes the whole thing honest: an
 explicit property list is only served when *every* requested qname is in the
@@ -258,3 +264,69 @@ always-registered core providers plus the common imagick/office/video formats.
 `min(disk_free, max(quota - used_root, 0))` for a finite one. `disk_free` is read
 with `statvfs(datadirectory)`; when that is unavailable the sidecar reports
 `max(quota - used_root, 0)`.
+
+## DAV discovery `PROPFIND` (v1)
+
+The sidecar also serves the two requests every client session performs before
+it lists anything:
+
+- `PROPFIND` **Depth 0** on the DAV root `/remote.php/dav/`;
+- `PROPFIND` **Depth 0** on the caller's own principal
+  `/remote.php/dav/principals/users/<uid>/`.
+
+Everything else stays on PHP. The scope and delegation rules live in
+`src/discovery.rs`; nginx routes only the two anchored paths
+(`^/remote\.php/dav/$`, `^/remote\.php/dav/principals/users/[^/]+/?$`).
+
+**The property gate.** As for files, an explicit property list is served only
+when *every* qname is in the implemented set; anything else answers **501**
+(delegated), never 404. The implemented sets are the exact live 200 responses
+(captured 2026-09-19):
+
+- **root**: `d:resourcetype`, `d:current-user-principal`,
+  `d:principal-collection-set`, `d:supported-report-set`,
+  `d:current-user-privilege-set`;
+- **principal**: the root set plus `d:principal-URL`, `d:displayname`,
+  `d:owner`, `d:alternate-URI-set`, `d:group-membership`,
+  `card:addressbook-home-set`, `cal:calendar-home-set`,
+  `cal:calendar-user-address-set`, `cal:calendar-user-type`, `nc:language`,
+  `s:email-address`.
+
+`allprop`/`propname` reproduce PHP's result for these nodes: only
+`{DAV:}resourcetype`. The values come from `oc_users` (display name),
+`oc_group_user`/`oc_groups` (group hrefs), `oc_preferences` (`settings/email`,
+`core/lang`) and `oc_accounts.data` (`additional_mail`). The
+`current-user-privilege-set` is the fixed Sabre ACL result for the root
+(`{DAV:}authenticated` → `{DAV:}all`) and for a principal
+(`{DAV:}owner` → `{DAV:}all`); it is verified user-independent.
+
+**Own principal only.** The principal response mixes the *target* uid (href,
+displayname, homes) with *caller-scoped* properties (`current-user-principal`,
+`current-user-privilege-set`), so another user's principal answers 501 rather
+than inventing the caller-scoped half.
+
+**Delegated listings.** The `/principals/` and `/principals/users/` collection
+listings (and group principals, calendar resources/rooms, calendar-proxy
+children) answer 501. The nginx location is anchored to the own-principal path,
+so these never reach the sidecar in production; the 501 is a safety net.
+
+**Delegated OPTIONS.** Every non-`PROPFIND` method, OPTIONS included, answers
+501 before authentication. PHP's `DAV:`/`Allow` headers are long
+(`dav: 1, 3, extended-mkcol, access-control, …`), and the sidecar's OPTIONS
+advertises addressbook capabilities, which is wrong here.
+
+**Group membership.** `{DAV:}group-membership` is expanded from
+`oc_group_user`/`oc_groups` only; LDAP/circle membership and
+`hideFromCollaboration()` are not visible in the schema (the same limitation as
+`shared-books-group-backends`).
+
+**Language.** `nc:language` is served from `$CONFIG['force_language']` or the
+user's `core/lang`. When neither is set, PHP falls back to the `forceLanguage`
+request param, the request's `Accept-Language` and `default_language`, which the
+sidecar does not reproduce, so the request is delegated.
+
+**The fallback probe.** The sidecar's own authentication fallback is a
+credentialed `PROPFIND /remote.php/dav/` through the public URL. Once the root
+is served natively that would recurse, so the probe carries
+`X-Nextcloud-Dav-Fallback: 1`; the discovery handler answers 501 for it and
+nginx replays it to PHP. A client that sends the header is simply delegated.

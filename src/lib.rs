@@ -11,6 +11,7 @@ pub mod auth;
 pub mod config;
 pub mod dav_error;
 pub mod db;
+pub mod discovery;
 pub mod error;
 pub mod files;
 pub mod model;

@@ -5,7 +5,7 @@ Three layers, all runnable from this directory:
 | layer | files | needs PostgreSQL? | needs a live Nextcloud? |
 |---|---|---|---|
 | Pure protocol/wire | `protocol_wire.rs`, `auth_gates.rs` | no | no |
-| DB-backed read path | `db_read_path.rs`, `http_read.rs`, `files_read_path.rs`, `deviations.rs` | yes (auto-started) | no |
+| DB-backed read path | `db_read_path.rs`, `http_read.rs`, `files_read_path.rs`, `discovery_read_path.rs`, `deviations.rs` | yes (auto-started) | no |
 | Differential conformance | `conformance/conformance.py` | no | yes (sidecar + PHP) |
 
 ## Running
@@ -143,6 +143,17 @@ non-PROPFIND method returning 501, NFC/decomposed path resolution, a >5000-child
 listing, the `oc:comments-unread` and quota bulk queries, and the
 fast-path-only requirement.
 
+### `discovery_read_path.rs` — the native DAV discovery `PROPFIND`
+
+The router and `src/discovery.rs`: `PROPFIND` Depth 0 on `/remote.php/dav/` and
+on the caller's own principal, the exact live PHP property values (including
+`current-user-privilege-set` and the `supported-report-set` list), the
+`allprop`/`propname` result (`{DAV:}resourcetype` only), and the delegation
+rules: another user's principal, an unimplemented property, a non-zero Depth,
+the `/principals/` collection listings and every non-`PROPFIND` method
+(OPTIONS included) answer 501. `nc:language` is served from `force_language` or
+`core/lang` and delegated when neither is derivable.
+
 ### `deviations.rs` — the declared exceptions
 
 Reads `deviations.toml`, asserts the TOML and the Rust list agree, and runs one
@@ -190,6 +201,11 @@ Write-path deviations added with the native write support:
 `no-event-dispatch`, `events-queued-not-dispatched`, `jcard-rejected`,
 `vcard-2.1-rejected`, `effect-ownership-registry`.
 
+DAV discovery deviations: `discovery-property-gate-501`,
+`discovery-own-principal-only`, `discovery-collection-listings-delegated`,
+`discovery-non-propfind-501`, `discovery-group-membership-backends`,
+`discovery-language-request-fallback`.
+
 ## What is NOT covered
 
 - **Live PHP parity in CI.** The differential harness needs a running Nextcloud
@@ -213,7 +229,9 @@ Write-path deviations added with the native write support:
   tested, but no test waits 0.1·2ⁿ seconds; the recording-off behaviour is
   asserted.
 - **`current-user-privilege-set` exact contents, `OPTIONS` header set, home
-  `resourcetype`** — see the open questions in `docs/DEVIATIONS.md`.
+  `resourcetype`** — see the open questions in `docs/DEVIATIONS.md`. The DAV
+  discovery `current-user-privilege-set` is covered by
+  `discovery_read_path.rs` and `tests/local/discovery_parity.sh`.
 
 ## Cases that could not be run here
 

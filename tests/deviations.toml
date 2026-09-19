@@ -399,3 +399,63 @@ sidecar = "The display name is LEFT JOINed from oc_users/oc_groups; a sharee the
 why = "The sidecar cannot query LDAP/circles. The database backend (the reference instance) agrees exactly; only a deployment that shares with LDAP/circle users would see the id instead of a friendly name."
 test = "tests/deviations.rs::every_declared_deviation_holds (id=files-sharees-ldap-display-name)"
 evidence = "src/files.rs:sharee_elements; src/db.rs:folder_share_rows; lib/private/Share20/DefaultShareProvider.php:createShare"
+
+[[deviation]]
+id = "discovery-property-gate-501"
+area = "propfind"
+status = "intentional"
+nextcloud = "A discovery PROPFIND for a property Nextcloud serves returns it; for a property it does not know it returns a 404 propstat."
+sidecar = "An explicit discovery PROPFIND whose property list contains any qname outside the implemented set is answered 501 (delegated to PHP), never 404. allprop/propname reproduce PHP's result for these nodes (just {DAV:}resourcetype)."
+why = "A 404 would claim a property PHP serves is absent, which silently breaks clients. The implemented set is the exact live 200 set for the two nodes (root: resourcetype, current-user-principal, principal-collection-set, supported-report-set, current-user-privilege-set; principal: adds principal-URL, displayname, owner, alternate-URI-set, group-membership, card:addressbook-home-set, cal:calendar-home-set, cal:calendar-user-address-set, cal:calendar-user-type, nc:language, s:email-address)."
+test = "tests/deviations.rs::every_declared_deviation_holds (id=discovery-property-gate-501)"
+evidence = "src/discovery.rs:is_implemented; src/discovery.rs:handle_propfind"
+
+[[deviation]]
+id = "discovery-own-principal-only"
+area = "delegation"
+status = "intentional"
+nextcloud = "Any authenticated user can PROPFIND another user's principal; the response's current-user-principal is the *caller's* principal."
+sidecar = "Only the authenticated user's own principal is served. Another user's principal answers 501 so nginx replays it to PHP."
+why = "The response mixes the target uid (href, displayname, homes) with caller-scoped properties (current-user-principal, current-user-privilege-set). Reproducing that from the target uid alone would be inventing an answer; delegation is safe and the discovery chain only ever asks for the caller's own principal."
+test = "tests/deviations.rs::every_declared_deviation_holds (id=discovery-own-principal-only)"
+evidence = "src/discovery.rs:handle_propfind"
+
+[[deviation]]
+id = "discovery-collection-listings-delegated"
+area = "delegation"
+status = "intentional"
+nextcloud = "PROPFIND on /remote.php/dav/principals/ or /principals/users/ lists every principal (users, groups, resources, rooms)."
+sidecar = "The sidecar has no native listing for these collections; it answers 501 so nginx replays them to PHP. The nginx location is anchored to the own-principal path so the listings never reach the sidecar in production."
+why = "Listing every user is privacy-sensitive and heavy; PHP already produces it. Only the single principal a client discovered is served natively."
+test = "tests/deviations.rs::every_declared_deviation_holds (id=discovery-collection-listings-delegated)"
+evidence = "src/discovery.rs:parse_discovery_path (DiscoveryTarget::Delegated); src/routes.rs:handle_discovery"
+
+[[deviation]]
+id = "discovery-non-propfind-501"
+area = "delegation"
+status = "intentional"
+nextcloud = "OPTIONS advertises the DAV/Allow capability headers for the DAV root and a principal; the write methods mutate state."
+sidecar = "Every non-PROPFIND discovery request (including OPTIONS) is answered 501 before authentication, so nginx replays it to PHP."
+why = "PHP's DAV/Allow headers are long and getting them subtly wrong would break capability discovery; the sidecar's OPTIONS advertises addressbook capabilities, which is wrong here. A 501 is the correct fallback signal."
+test = "tests/deviations.rs::every_declared_deviation_holds (id=discovery-non-propfind-501)"
+evidence = "src/routes.rs:handle_discovery"
+
+[[deviation]]
+id = "discovery-group-membership-backends"
+area = "propfind"
+status = "intentional"
+nextcloud = "Principal::getGroupMembership() merges every registered group backend (LDAP, circles) through traitGetGroupMembership and skips groups for which hideFromCollaboration() is true."
+sidecar = "Group principals in {DAV:}group-membership are expanded from oc_group_user/oc_groups only."
+why = "With the database group backend (the reference instance) the two agree exactly; a deployment using LDAP or circles would miss those group hrefs. The same schema limitation is declared for shared address books as shared-books-group-backends."
+test = "tests/deviations.rs::every_declared_deviation_holds (id=discovery-group-membership-backends)"
+evidence = "src/db.rs:group_principals; apps/dav/lib/Connector/Sabre/Principal.php:187-217"
+
+[[deviation]]
+id = "discovery-language-request-fallback"
+area = "propfind"
+status = "intentional"
+nextcloud = "L10N\\Factory::getUserLanguage() resolves force_language, then core/lang, then the forceLanguage request param, then the request's Accept-Language, then default_language."
+sidecar = "nc:language is served from force_language or core/lang. When neither is set the request is answered 501 (delegated), because the remaining fallbacks depend on request headers or instance config the sidecar does not reproduce."
+why = "Delegating an underivable value is always safe; the reference instance's users have core/lang, so the property is served natively there."
+test = "tests/deviations.rs::every_declared_deviation_holds (id=discovery-language-request-fallback)"
+evidence = "src/discovery.rs:handle_propfind; lib/private/L10N/Factory.php:getUserLanguage"

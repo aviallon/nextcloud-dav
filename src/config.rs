@@ -170,6 +170,10 @@ pub struct Config {
     /// delegates, because it cannot reproduce `ShareDisableChecker` group
     /// expansion for LDAP/circles.
     pub sharing_exclude_groups: bool,
+    /// `$CONFIG['force_language']` when set. `L10N\Factory::getUserLanguage()`
+    /// returns it before the user's `core/lang` preference, so the discovery
+    /// `nc:language` property must too.
+    pub force_language: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -376,6 +380,10 @@ impl Config {
             // Set from `oc_appconfig` at startup (see `main.rs`).
             e2e_encryption: false,
             sharing_exclude_groups: false,
+            force_language: raw
+                .get_str("force_language")
+                .filter(|value| !value.is_empty())
+                .map(str::to_string),
         })
     }
 

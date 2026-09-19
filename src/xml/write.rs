@@ -9,6 +9,7 @@ use std::io::Write;
 
 pub const NS_DAV: &str = "DAV:";
 pub const NS_CARDDAV: &str = "urn:ietf:params:xml:ns:carddav";
+pub const NS_CALDAV: &str = "urn:ietf:params:xml:ns:caldav";
 pub const NS_CALENDARSERVER: &str = "http://calendarserver.org/ns/";
 pub const NS_SABREDAV: &str = "http://sabredav.org/ns";
 pub const NS_OWNCLOUD: &str = "http://owncloud.org/ns";
@@ -41,6 +42,7 @@ impl PropQName {
         match self.ns.as_str() {
             NS_DAV => Some("d"),
             NS_CARDDAV => Some("card"),
+            NS_CALDAV => Some("cal"),
             NS_CALENDARSERVER => Some("cs"),
             NS_SABREDAV => Some("s"),
             NS_OWNCLOUD => Some("oc"),
@@ -189,6 +191,28 @@ impl MultiStatus {
         ("oc", NS_OWNCLOUD),
         ("nc", NS_NEXTCLOUD_FILES),
         ("ocs", NS_OCS),
+    ];
+
+    /// The DAV-root discovery namespace map, matching PHP's
+    /// `PROPFIND /remote.php/dav/` response (`d`, `s`, `oc`, `nc`).
+    pub const DAV_ROOT_NAMESPACES: &'static [(&'static str, &'static str)] = &[
+        ("d", NS_DAV),
+        ("s", NS_SABREDAV),
+        ("oc", NS_OWNCLOUD),
+        ("nc", NS_NEXTCLOUD),
+    ];
+
+    /// The principal discovery namespace map, matching PHP's
+    /// `PROPFIND /remote.php/dav/principals/users/<uid>/` response
+    /// (`d`, `s`, `cal`, `cs`, `card`, `oc`, `nc`).
+    pub const PRINCIPAL_NAMESPACES: &'static [(&'static str, &'static str)] = &[
+        ("d", NS_DAV),
+        ("s", NS_SABREDAV),
+        ("cal", NS_CALDAV),
+        ("cs", NS_CALENDARSERVER),
+        ("card", NS_CARDDAV),
+        ("oc", NS_OWNCLOUD),
+        ("nc", NS_NEXTCLOUD),
     ];
 
     pub fn to_xml(&self) -> String {

@@ -54,6 +54,22 @@ pub struct AppState {
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
+        .route("/remote.php/dav", any(dispatch_discovery))
+        .route("/remote.php/dav/", any(dispatch_discovery))
+        .route(
+            "/remote.php/dav/principals/users/{uid}",
+            any(dispatch_discovery),
+        )
+        .route(
+            "/remote.php/dav/principals/users/{uid}/",
+            any(dispatch_discovery),
+        )
+        .route("/remote.php/dav/principals", any(dispatch_discovery))
+        .route("/remote.php/dav/principals/", any(dispatch_discovery))
+        .route(
+            "/remote.php/dav/principals/{*rest}",
+            any(dispatch_discovery),
+        )
         .route("/remote.php/dav/addressbooks", any(dispatch))
         .route("/remote.php/dav/addressbooks/{*rest}", any(dispatch))
         .route("/remote.php/dav/files", any(dispatch_files))
@@ -177,6 +193,82 @@ async fn dispatch_files(State(state): State<Arc<AppState>>, request: Request) ->
     match handle_files(state, request).await {
         Ok(response) => response,
         Err(error) => error.into_response(),
+    }
+}
+
+/// DAV **discovery** dispatch: `PROPFIND` Depth 0 on the DAV root and on the
+/// caller's own principal. See `src/discovery.rs`.
+async fn dispatch_discovery(State(state): State<Arc<AppState>>, request: Request) -> Response {
+    match handle_discovery(state, request).await {
+        Ok(response) => response,
+        Err(error) => error.into_response(),
+    }
+}
+
+async fn handle_discovery(state: Arc<AppState>, request: Request) -> Result<Response> {
+    // Every non-PROPFIND method (OPTIONS included) is delegated before touching
+    // credentials: PHP owns the DAV/Allow capability headers and the write path.
+    if request.method().as_str() != "PROPFIND" {
+        return Ok(not_implemented());
+    }
+    // The sidecar's own PHP-fallback probe must not recurse through the root
+    // route; delegate it so nginx replays it to PHP (see `php::FALLBACK_HEADER`).
+    if request.headers().contains_key(crate::php::FALLBACK_HEADER) {
+        return Ok(not_implemented());
+    }
+
+    let path = request.uri().path().to_string();
+    let headers = request.headers().clone();
+    let parsed = crate::discovery::parse_discovery_path(&path);
+    match parsed.target {
+        // A tree the discovery router does not own is a plain 404 (its own
+        // route, if any, handles it).
+        crate::discovery::DiscoveryTarget::NotFound => {
+            return Ok(Error::NotFound.into_response())
+        }
+        // The principal collection listings and the other principal children
+        // are PHP's: delegate so nginx replays the request.
+        crate::discovery::DiscoveryTarget::Delegated => return Ok(not_implemented()),
+        _ => {}
+    }
+    // Only Depth 0 is served; Depth 1 on the root lists every collection and on
+    // the principal collection lists every user, so both are delegated.
+    if parse_depth(&headers) != 0 {
+        return Ok(not_implemented());
+    }
+
+    let Some((username, password)) = parse_basic_auth(headers.get(header::AUTHORIZATION)) else {
+        return Ok(unauthorized());
+    };
+    let client_ip = client_ip(&headers);
+    let user = match state.auth.authenticate(&username, &password, client_ip).await {
+        Ok(user) => user,
+        Err(error) => return Ok(auth_error_response(error)),
+    };
+
+    let body = read_body(request).await?;
+    match crate::discovery::handle_propfind(
+        &state.db,
+        &state.config,
+        &user.uid,
+        &parsed,
+        &body,
+    )
+    .await?
+    {
+        Some(multistatus) => {
+            let namespaces = match parsed.target {
+                crate::discovery::DiscoveryTarget::Root { .. } => {
+                    MultiStatus::DAV_ROOT_NAMESPACES
+                }
+                _ => MultiStatus::PRINCIPAL_NAMESPACES,
+            };
+            Ok(xml_response(
+                StatusCode::MULTI_STATUS,
+                multistatus.to_xml_with(namespaces),
+            ))
+        }
+        None => Ok(not_implemented()),
     }
 }
 
