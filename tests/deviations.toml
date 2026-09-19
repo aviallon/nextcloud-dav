@@ -669,3 +669,13 @@ sidecar = "A REPORT whose property list contains any qname outside the implement
 why = "A 404 would claim a property PHP serves is absent, which silently breaks clients. The implemented set is the live 200 set captured from Nextcloud 33.0.5."
 test = "tests/deviations.rs::every_declared_deviation_holds (id=calendars-report-property-gate-501)"
 evidence = "src/calendars.rs:object_gate_ok; src/calendars.rs:is_known_404_object"
+
+[[deviation]]
+id = "unauthenticated-delegates"
+area = "auth"
+status = "intentional"
+nextcloud = "An unauthenticated DAV request is refused with 401 and `WWW-Authenticate: Basic` - but only after the session check: `OCA\\DAV\\Connector\\Sabre\\Auth::validateUserPass` returns true straight from a logged-in session (`isLoggedIn()` + `isDavAuthenticated()`), with no credentials involved at all. A request carrying a valid session cookie is therefore served, not refused."
+sidecar = "A request with no Basic `Authorization` header is delegated (501 -> nginx replays it to PHP) instead of being refused. The sidecar cannot evaluate a Nextcloud session cookie or an OAuth Bearer token, so it must not be the component that refuses: PHP returns the same 401 for a genuinely anonymous request, and the 200 that a session-cookie client expects. Credentials that are present but invalid still get 401, exactly as PHP does."
+why = "A 401 carrying `WWW-Authenticate` makes the browser pop up a Basic Auth prompt. In production the web UI's DAV PROPFINDs (session cookie, no Basic) hit the sidecar and were refused - visible in the nginx access log as 401s on /remote.php/dav/files/<user>/ and /remote.php/dav/principals/users/<user>/ interleaved with the 207s the browser got on retry with cached credentials. Delegating makes PHP the only authority on authentication, which is where that decision belongs."
+test = "tests/deviations.rs::every_declared_deviation_holds (id=unauthenticated-delegates)"
+evidence = "src/routes.rs:handle; src/routes.rs:handle_calendars; src/routes.rs:dispatch_discovery; src/routes.rs:files"

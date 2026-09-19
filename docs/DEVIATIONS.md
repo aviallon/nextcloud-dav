@@ -25,6 +25,7 @@ Status vocabulary:
 | id | area | status | one-line difference |
 |---|---|---|---|
 | `weak-etag-get` | etag | accepted | PHP GET may be weak; sidecar always strong, matching PROPFIND |
+| `unauthenticated-delegates` | auth | intentional | a request with no Basic header is delegated, never refused with 401 (the web UI authenticates DAV by session cookie, which the sidecar cannot evaluate) |
 | `photo-delegated` | delegation | accepted | `?photo` → 501 → PHP |
 | `export-delegated` | delegation | accepted | `?export` → 501 → PHP |
 | `home-listing-php` | routing | accepted | home listing (and app-generated books) served by PHP |

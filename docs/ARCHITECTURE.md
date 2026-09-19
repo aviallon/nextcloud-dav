@@ -186,6 +186,36 @@ A deliberate, configurable deviation: `record_bruteforce_attempts` defaults to
 **false**, so the sidecar never records a failed login and the PHP fallback is
 what does. The delay/block *checks* always run.
 
+### No credentials at all → delegate, never 401
+
+A request with no `Authorization` header is **not** refused by the sidecar: it
+answers `501`, nginx replays it to PHP, and PHP decides. This is not politeness,
+it is the only correct answer, because a Nextcloud DAV request can be
+authenticated without any credentials at all:
+
+```php
+// apps/dav/lib/Connector/Sabre/Auth.php::validateUserPass()
+if ($this->userSession->isLoggedIn()
+    && $this->isDavAuthenticated($this->userSession->getUser()->getUID())) {
+    return true;   // session cookie, no Basic credentials involved
+}
+```
+
+That is exactly how the **web UI** talks to DAV, and how an OAuth `Bearer`
+token does. The sidecar holds `config.php` and the database, but not PHP's
+session store, so it cannot evaluate either. Refusing with `401` also sends
+`WWW-Authenticate: Basic`, which makes the browser pop up a Basic Auth prompt —
+this was a real production regression, visible as `401`s on
+`/remote.php/dav/files/<user>/` interleaved with the `207`s the browser got when
+it retried with cached credentials. `OPTIONS` is no exception, even though PHP
+does advertise `DAV`/`Allow` on an unauthenticated `OPTIONS`: the headers are
+worth less than the prompt is costly, and a credentialed `OPTIONS` still gets
+them from the sidecar.
+
+Credentials that are *present but invalid* still get `401`, exactly as PHP does.
+The rule is only that the sidecar must never be the component that refuses a
+request it cannot evaluate. See the `unauthenticated-delegates` deviation.
+
 The database role therefore needs `SELECT` on the read path plus
 `INSERT`/`UPDATE`/`DELETE` on `oc_cards`, `oc_addressbookchanges`,
 `oc_addressbooks` (synctoken only), `oc_cards_properties` and

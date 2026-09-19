@@ -808,9 +808,14 @@ async fn options_advertises_dav_classes() {
 }
 
 #[tokio::test]
-async fn unauthenticated_requests_get_401() {
+async fn unauthenticated_requests_delegate() {
     let (_env, _book, app) = setup!();
-    // No Authorization header.
+    // No Authorization header: the request may still be authenticated by the
+    // Nextcloud session cookie (which is exactly how the web UI talks to DAV)
+    // or by an OAuth Bearer token, and the sidecar can evaluate neither.
+    // Answering 401 here made the browser show a Basic Auth prompt for requests
+    // PHP serves happily, so every such request is delegated instead
+    // (501 -> nginx replays it to PHP, which owns the auth stack).
     let resp = call(
         &app,
         axum::http::Request::builder()
@@ -820,10 +825,14 @@ async fn unauthenticated_requests_get_401() {
             .unwrap(),
     )
     .await;
-    assert_eq!(resp.status, 401);
-    assert!(resp.header("www-authenticate").is_some());
+    assert_eq!(resp.status, 501);
+    assert!(
+        resp.header("www-authenticate").is_none(),
+        "a 401 with WWW-Authenticate makes the browser pop up a Basic Auth prompt"
+    );
 
-    // OPTIONS without auth still advertises discovery, but is 401.
+    // OPTIONS is no exception: it delegates too, so a capability probe from a
+    // session-authenticated client is not refused either.
     let resp = call(
         &app,
         axum::http::Request::builder()
@@ -833,8 +842,7 @@ async fn unauthenticated_requests_get_401() {
             .unwrap(),
     )
     .await;
-    assert_eq!(resp.status, 401);
-    assert_eq!(resp.header("dav").as_deref(), Some("1, 2, 3, addressbook"));
+    assert_eq!(resp.status, 501);
 }
 
 // ---------------------------------------------------------------------------

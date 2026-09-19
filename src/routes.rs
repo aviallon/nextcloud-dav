@@ -248,7 +248,7 @@ async fn handle_calendars(state: Arc<AppState>, request: Request) -> Result<Resp
     }
 
     let Some((username, password)) = parse_basic_auth(headers.get(header::AUTHORIZATION)) else {
-        return Ok(unauthorized());
+        return Ok(not_implemented());
     };
     let client_ip = client_ip(&headers);
     let user = match state.auth.authenticate(&username, &password, client_ip).await {
@@ -335,7 +335,7 @@ async fn handle_discovery(state: Arc<AppState>, request: Request) -> Result<Resp
     }
 
     let Some((username, password)) = parse_basic_auth(headers.get(header::AUTHORIZATION)) else {
-        return Ok(unauthorized());
+        return Ok(not_implemented());
     };
     let client_ip = client_ip(&headers);
     let user = match state.auth.authenticate(&username, &password, client_ip).await {
@@ -383,7 +383,7 @@ async fn handle_files(state: Arc<AppState>, request: Request) -> Result<Response
     };
 
     let Some((username, password)) = parse_basic_auth(headers.get(header::AUTHORIZATION)) else {
-        return Ok(unauthorized());
+        return Ok(not_implemented());
     };
     let client_ip = client_ip(&headers);
     let user = match state.auth.authenticate(&username, &password, client_ip).await {
@@ -427,13 +427,18 @@ async fn handle(state: Arc<AppState>, request: Request) -> Result<Response> {
     let headers = request.headers().clone();
     let parsed = parse_path(&path);
 
-    // Authenticate every request, including OPTIONS. Unauthenticated OPTIONS
-    // still needs the discovery headers (DAV/Allow) before it is refused.
+    // A request with no Basic credentials is NOT refused here, not even for
+    // OPTIONS. It may still be authenticated by the Nextcloud session cookie -
+    // which is exactly how the web UI talks to DAV
+    // (`OCA\DAV\Connector\Sabre\Auth::validateUserPass` returns true straight
+    // from a logged-in session, with no credentials involved) - or by an OAuth
+    // Bearer token. The sidecar can evaluate neither, so a 401 from here would
+    // make the browser pop up a Basic Auth prompt for requests PHP serves
+    // happily; that was a real regression in production, visible as 401s on
+    // /remote.php/dav/files/<user>/ interleaved with 207s from the retry.
+    // Delegate instead: 501 -> nginx replays it to PHP, which owns auth.
     let Some((username, password)) = parse_basic_auth(headers.get(header::AUTHORIZATION)) else {
-        if method == Method::OPTIONS {
-            return options_response(&parsed, false);
-        }
-        return Ok(unauthorized());
+        return Ok(not_implemented());
     };
     let client_ip = client_ip(&headers);
     let user = match state
@@ -446,7 +451,7 @@ async fn handle(state: Arc<AppState>, request: Request) -> Result<Response> {
     };
 
     if method == Method::OPTIONS {
-        return options_response(&parsed, true);
+        return options_response(&parsed);
     }
 
     if let Some(method) = unsupported_method(&method) {
@@ -722,7 +727,10 @@ fn auth_error_response(error: AuthError) -> Response {
     }
 }
 
-fn options_response(parsed: &ParsedPath, authenticated: bool) -> Result<Response> {
+/// The `OPTIONS` answer, reachable only with credentials: an unauthenticated
+/// request is delegated before this point, because the sidecar cannot tell a
+/// session-cookie client (the web UI) from an anonymous one.
+fn options_response(parsed: &ParsedPath) -> Result<Response> {
     if matches!(parsed.target, DavTarget::NotFound) {
         return Ok(Error::NotFound.into_response());
     }
@@ -739,13 +747,6 @@ fn options_response(parsed: &ParsedPath, authenticated: bool) -> Result<Response
     response
         .headers_mut()
         .insert("MS-Author-Via", HeaderValue::from_static("DAV"));
-    if !authenticated {
-        *response.status_mut() = StatusCode::UNAUTHORIZED;
-        response.headers_mut().insert(
-            header::WWW_AUTHENTICATE,
-            HeaderValue::from_static("Basic realm=\"Nextcloud\", charset=\"UTF-8\""),
-        );
-    }
     Ok(response)
 }
 

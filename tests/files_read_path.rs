@@ -596,7 +596,9 @@ async fn unknown_paths_are_not_found() {
     .await;
     assert_eq!(resp.status, 404);
 
-    // Unauthenticated PROPFIND is a 401.
+    // Unauthenticated PROPFIND is delegated, never refused with 401: the
+    // request may carry a Nextcloud session cookie, which the sidecar cannot
+    // evaluate, and a 401 with WWW-Authenticate makes the browser prompt.
     let req = Request::builder()
         .method("PROPFIND")
         .uri(FILES)
@@ -604,7 +606,7 @@ async fn unknown_paths_are_not_found() {
         .body(Body::from(body))
         .unwrap();
     let resp = call(&f.app, req).await;
-    assert_eq!(resp.status, 401);
+    assert_eq!(resp.status, 501);
 }
 
 #[tokio::test]

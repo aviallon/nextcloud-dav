@@ -743,7 +743,9 @@ async fn unauthenticated_is_401() {
         .body(axum::body::Body::from(body.to_string()))
         .unwrap();
     let resp = call(&app, request).await;
-    assert_eq!(resp.status, 401);
+    // Delegated, not 401: the web UI authenticates DAV with the session cookie,
+    // which the sidecar cannot evaluate.
+    assert_eq!(resp.status, 501);
 }
 
 // ---------------------------------------------------------------------------

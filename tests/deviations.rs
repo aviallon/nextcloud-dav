@@ -53,6 +53,7 @@ const DECLARED_IDS: &[&str] = &[
     "supported-address-data-missing-json",
     "supported-collation-element-name",
     "sync-invalid-token-400",
+    "unauthenticated-delegates",
     "groups-sorted",
     "query-depth0-on-collection",
     "authtoken-v2-only",
@@ -626,6 +627,38 @@ async fn assert_deviation(id: &str, f: &Fixture) -> Result<(), String> {
                     resp.status
                 );
             }
+        }
+        "unauthenticated-delegates" => {
+            // No Authorization header at all. The request may still carry a
+            // Nextcloud session cookie - which is exactly how the web UI talks
+            // to DAV - or an OAuth Bearer token, and the sidecar can evaluate
+            // neither, so it must delegate rather than refuse. Refusing with 401
+            // sends `WWW-Authenticate`, which makes the browser pop up a Basic
+            // Auth prompt for a request PHP answers with 200.
+            let req = axum::http::Request::builder()
+                .method("PROPFIND")
+                .uri(card_path)
+                .header("Depth", "0")
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let resp = call(&f.app, req).await;
+            ensure!(
+                resp.status == 501,
+                "an unauthenticated request returned {} instead of delegating",
+                resp.status
+            );
+            ensure!(
+                resp.header("www-authenticate").is_none(),
+                "the delegation carried WWW-Authenticate, which triggers a browser prompt"
+            );
+            // Credentials that ARE present but invalid are still refused, which
+            // is what PHP does with them too.
+            let bad = get(&f.app, card_path, USER, "wrong-password").await;
+            ensure!(
+                bad.status == 401 || bad.status == 502,
+                "invalid credentials returned {}",
+                bad.status
+            );
         }
         "bruteforce-recording-off" => {
             let resp = get(&f.app, card_path, USER, "wrong-password").await;

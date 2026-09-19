@@ -488,5 +488,7 @@ async fn missing_credentials_are_unauthorized() {
         .body(axum::body::Body::empty())
         .unwrap();
     let resp: Resp = call(&app, request).await;
-    assert_eq!(resp.status, 401);
+    // Delegated, not 401: a session-cookie client (the web UI) is authenticated
+    // by PHP, and a 401 here would make the browser pop up a Basic Auth prompt.
+    assert_eq!(resp.status, 501);
 }
