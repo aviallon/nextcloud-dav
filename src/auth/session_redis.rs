@@ -24,7 +24,9 @@ use tokio::net::TcpStream;
 pub struct RedisConfig {
     pub host: String,
     pub port: u16,
-    /// `?auth=...` (URL-decoded). Never logged.
+    /// `redis://user:password@host` ACL username (URL-decoded). Not secret.
+    pub user: Option<String>,
+    /// `?auth=...` / the userinfo password (URL-decoded). Never logged.
     pub auth: Option<String>,
     /// `?database=` / `?db=`; redis `SELECT`.
     pub database: Option<u32>,
@@ -32,28 +34,54 @@ pub struct RedisConfig {
 }
 
 impl RedisConfig {
-    /// Parses `tcp://host:port?auth=...&database=...`. `auth` and `database`
-    /// are the keys php-redis accepts; a value-less `auth` or a `unix://` path
-    /// is rejected (fail closed).
+    /// Parses `tcp://` / `redis://` URLs. Accepts an optional
+    /// `user:password@` userinfo (percent-encoded) and the php-redis query keys
+    /// `auth` / `database` (`db`). A value-less `auth` or a `unix://` path is
+    /// rejected (fail closed).
     pub fn from_url(url: &str, timeout: Duration) -> Option<Self> {
         let rest = url
             .strip_prefix("tcp://")
             .or_else(|| url.strip_prefix("redis://"))?;
-        let (authority, query) = match rest.split_once('?') {
+        let (rest, query) = match rest.split_once('?') {
             Some((a, q)) => (a, q),
             None => (rest, ""),
         };
-        if authority.is_empty() {
+        if rest.is_empty() {
             return None;
         }
-        let (host, port) = match authority.rsplit_once(':') {
-            Some((host, port)) => (host, port.parse::<u16>().ok()?),
-            None => (authority, 6379),
+        // Optional `user:password@` userinfo. Credentials are percent-encoded by
+        // whoever builds the URL, so a literal `@` only appears as the delimiter.
+        let (userinfo, authority) = match rest.rsplit_once('@') {
+            Some((userinfo, authority)) => (Some(userinfo), authority),
+            None => (None, rest),
+        };
+        let (user, userinfo_password) = match userinfo {
+            Some(userinfo) => match userinfo.split_once(':') {
+                Some((user, password)) => (Some(urldecode(user)), Some(urldecode(password))),
+                None => (Some(urldecode(userinfo)), None),
+            },
+            None => (None, None),
+        };
+        let user = user.filter(|u| !u.is_empty());
+        // A bracketed IPv6 literal keeps its colons (`redis://[::1]:6379`).
+        let (host, port) = if let Some(host) = authority.strip_prefix('[') {
+            let (host, rest) = host.split_once(']')?;
+            let port = match rest.strip_prefix(':') {
+                Some(port) => port.parse::<u16>().ok()?,
+                None if rest.is_empty() => 6379,
+                None => return None,
+            };
+            (host, port)
+        } else {
+            match authority.rsplit_once(':') {
+                Some((host, port)) => (host, port.parse::<u16>().ok()?),
+                None => (authority, 6379),
+            }
         };
         if host.is_empty() {
             return None;
         }
-        let mut auth = None;
+        let mut auth = userinfo_password.filter(|password| !password.is_empty());
         let mut database = None;
         for pair in query.split('&').filter(|p| !p.is_empty()) {
             let (key, value) = match pair.split_once('=') {
@@ -76,6 +104,7 @@ impl RedisConfig {
         Some(Self {
             host: host.to_string(),
             port,
+            user,
             auth,
             database,
             timeout,
@@ -88,6 +117,7 @@ impl std::fmt::Debug for RedisConfig {
         f.debug_struct("RedisConfig")
             .field("host", &self.host)
             .field("port", &self.port)
+            .field("user", &self.user)
             .field("auth", &self.auth.as_ref().map(|_| "<redacted>"))
             .field("database", &self.database)
             .field("timeout", &self.timeout)
@@ -115,9 +145,21 @@ async fn get_inner(config: &RedisConfig, key: &str) -> Result<Option<Vec<u8>>, R
     let (read, mut write) = stream.into_split();
     let mut reader = BufReader::new(read);
 
-    if let Some(auth) = &config.auth {
-        write_command(&mut write, &["AUTH", auth.as_str()]).await?;
-        expect_ok(&mut reader).await?;
+    match (&config.user, &config.auth) {
+        // ACL auth (`AUTH user password`).
+        (Some(user), Some(auth)) => {
+            write_command(&mut write, &["AUTH", user.as_str(), auth.as_str()]).await?;
+            expect_ok(&mut reader).await?;
+        }
+        (Some(user), None) => {
+            write_command(&mut write, &["AUTH", user.as_str(), ""]).await?;
+            expect_ok(&mut reader).await?;
+        }
+        (None, Some(auth)) => {
+            write_command(&mut write, &["AUTH", auth.as_str()]).await?;
+            expect_ok(&mut reader).await?;
+        }
+        (None, None) => {}
     }
     if let Some(database) = config.database {
         let db = database.to_string();
@@ -219,6 +261,37 @@ mod tests {
     }
 
     #[test]
+    fn parses_userinfo_acl_credentials() {
+        let c = cfg("redis://alice:s3cret@redis:6380").unwrap();
+        assert_eq!(c.host, "redis");
+        assert_eq!(c.port, 6380);
+        assert_eq!(c.user.as_deref(), Some("alice"));
+        assert_eq!(c.auth.as_deref(), Some("s3cret"));
+    }
+
+    #[test]
+    fn parses_percent_encoded_userinfo_credentials() {
+        // Password is `p@ss:w/rd%` and user is `a:b@c` (URL-encoded).
+        let c = cfg("redis://a%3Ab%40c:p%40ss%3Aw%2Frd%25@redis:6379").unwrap();
+        assert_eq!(c.user.as_deref(), Some("a:b@c"));
+        assert_eq!(c.auth.as_deref(), Some("p@ss:w/rd%"));
+    }
+
+    #[test]
+    fn query_auth_takes_precedence_over_userinfo_password() {
+        let c = cfg("redis://alice:userinfo@redis:6379?auth=querysecret").unwrap();
+        assert_eq!(c.user.as_deref(), Some("alice"));
+        assert_eq!(c.auth.as_deref(), Some("querysecret"));
+    }
+
+    #[test]
+    fn parses_bracketed_ipv6_host() {
+        let c = cfg("redis://[::1]:6380").unwrap();
+        assert_eq!(c.host, "::1");
+        assert_eq!(c.port, 6380);
+    }
+
+    #[test]
     fn rejects_unix_sockets_and_empty_auth() {
         assert!(cfg("unix:///run/redis.sock").is_none());
         assert!(cfg("tcp://redis:6379?auth=").is_none());
@@ -227,7 +300,7 @@ mod tests {
 
     #[test]
     fn debug_does_not_leak_the_password() {
-        let c = cfg("tcp://redis:6379?auth=topsecret").unwrap();
+        let c = cfg("redis://alice:topsecret@redis:6379").unwrap();
         let rendered = format!("{c:?}");
         assert!(
             !rendered.contains("topsecret"),

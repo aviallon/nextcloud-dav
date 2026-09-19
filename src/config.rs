@@ -333,16 +333,13 @@ impl Config {
         // production, not in `config.php`, so it is passed through the same
         // `nextcloud_dav` extra config the harness already writes (the harness
         // copies it from the container's ini, so the secret is not duplicated).
-        let session_redis = app
-            .and_then(|a| a.get_str_at("session_redis_url"))
-            .filter(|url| !url.is_empty())
-            .and_then(|url| {
-                let timeout = app
-                    .and_then(|a| a.get_int_at("session_redis_timeout_ms"))
-                    .unwrap_or(500)
-                    .clamp(50, 5000) as u64;
-                RedisConfig::from_url(&url, Duration::from_millis(timeout))
-            });
+        let session_redis = session_redis_url(app, &raw).and_then(|url| {
+            let timeout = app
+                .and_then(|a| a.get_int_at("session_redis_timeout_ms"))
+                .unwrap_or(500)
+                .clamp(50, 5000) as u64;
+            RedisConfig::from_url(&url, Duration::from_millis(timeout))
+        });
 
         let allow_self_signed = app
             .and_then(|a| a.get_bool_at("allow_self_signed"))
@@ -463,6 +460,73 @@ impl<'a> AppConfig<'a> {
     }
 }
 
+/// The session-store URL: the explicit `nextcloud_dav.session_redis_url` wins,
+/// otherwise derive one from the same `redis` block PHP uses. `None` leaves
+/// session auth on PHP.
+fn session_redis_url(app: Option<AppConfig>, raw: &RawConfig) -> Option<String> {
+    app.and_then(|a| a.get_str_at("session_redis_url"))
+        .filter(|url| !url.is_empty())
+        .or_else(|| derive_session_redis_url(raw))
+}
+
+/// Builds `redis://[user[:password]@]host:port` from `$CONFIG['redis']`.
+/// Credentials are percent-encoded so `@`, `:`, `/`, `%` cannot corrupt the
+/// URL. Returns `None` (session auth stays on PHP) when the block or its host
+/// is missing. Never logs the password.
+fn derive_session_redis_url(raw: &RawConfig) -> Option<String> {
+    let redis = raw.get("redis")?;
+    let host = redis["host"].as_str().filter(|host| !host.is_empty())?;
+    let port = redis["port"].as_int().unwrap_or(6379);
+    let user = redis["user"].as_str().filter(|user| !user.is_empty());
+    let password = redis["password"]
+        .as_str()
+        .filter(|password| !password.is_empty());
+
+    let mut url = String::from("redis://");
+    match (user, password) {
+        (None, None) => {}
+        (Some(user), Some(password)) => {
+            url.push_str(&percent_encode(user));
+            url.push(':');
+            url.push_str(&percent_encode(password));
+            url.push('@');
+        }
+        (Some(user), None) => {
+            url.push_str(&percent_encode(user));
+            url.push('@');
+        }
+        (None, Some(password)) => {
+            url.push(':');
+            url.push_str(&percent_encode(password));
+            url.push('@');
+        }
+    }
+    if host.contains(':') && !host.starts_with('[') {
+        url.push('[');
+        url.push_str(host);
+        url.push(']');
+    } else {
+        url.push_str(host);
+    }
+    url.push(':');
+    url.push_str(&port.to_string());
+    Some(url)
+}
+
+/// Percent-encodes every byte that is not an RFC 3986 unreserved character.
+fn percent_encode(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for byte in input.bytes() {
+        let c = byte as char;
+        if c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_' | '~') {
+            out.push(c);
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
+}
+
 impl RawConfig {
     fn load(path: &Path, glob: bool) -> Result<Self> {
         let mut values: IndexMap<Key, Value> = IndexMap::new();
@@ -550,6 +614,13 @@ fn parse_php(path: &Path) -> Result<Value> {
 mod tests {
     use super::*;
 
+    fn raw_config(php: &str) -> RawConfig {
+        let value: Value = php_literal_parser::from_str(php).unwrap();
+        RawConfig {
+            values: value.into_map().unwrap(),
+        }
+    }
+
     #[test]
     fn normalizes_base_url() {
         assert_eq!(normalize_base_url("https://x"), "https://x/");
@@ -579,6 +650,86 @@ mod tests {
         let app = AppConfig(app);
         assert_eq!(app.get_str_at("listen").as_deref(), Some("127.0.0.1:9999"));
         assert_eq!(app.get_bool_at("record_bruteforce_attempts"), Some(true));
+    }
+
+    #[test]
+    fn derives_session_redis_from_the_redis_block() {
+        // host + port only.
+        let raw = raw_config(r#"['redis' => ['host' => 'redis.example', 'port' => 6380]]"#);
+        assert_eq!(
+            derive_session_redis_url(&raw).as_deref(),
+            Some("redis://redis.example:6380")
+        );
+        // Missing port defaults to 6379.
+        let raw = raw_config(r#"['redis' => ['host' => 'redis.example']]"#);
+        assert_eq!(
+            derive_session_redis_url(&raw).as_deref(),
+            Some("redis://redis.example:6379")
+        );
+        // host + password (no ACL user).
+        let raw = raw_config(r#"['redis' => ['host' => 'redis.example', 'password' => 's3cret']]"#);
+        let url = derive_session_redis_url(&raw).unwrap();
+        assert_eq!(url, "redis://:s3cret@redis.example:6379");
+        let parsed = RedisConfig::from_url(&url, Duration::from_millis(500)).unwrap();
+        assert_eq!(parsed.user, None);
+        assert_eq!(parsed.auth.as_deref(), Some("s3cret"));
+    }
+
+    #[test]
+    fn derives_session_redis_url_with_percent_encoded_credentials() {
+        let raw = raw_config(
+            r#"['redis' => ['host' => 'redis', 'user' => 'alice', 'password' => 'p@ss:w/rd%']]"#,
+        );
+        let url = derive_session_redis_url(&raw).unwrap();
+        assert_eq!(url, "redis://alice:p%40ss%3Aw%2Frd%25@redis:6379");
+        // The encoded URL round-trips through the parser used at runtime.
+        let parsed = RedisConfig::from_url(&url, Duration::from_millis(500)).unwrap();
+        assert_eq!(parsed.host, "redis");
+        assert_eq!(parsed.port, 6379);
+        assert_eq!(parsed.user.as_deref(), Some("alice"));
+        assert_eq!(parsed.auth.as_deref(), Some("p@ss:w/rd%"));
+    }
+
+    #[test]
+    fn session_redis_falls_back_to_the_redis_block() {
+        let raw = raw_config(
+            r#"['redis' => ['host' => 'redis', 'port' => 6380, 'password' => 's3cret']]"#,
+        );
+        assert_eq!(
+            session_redis_url(None, &raw).as_deref(),
+            Some("redis://:s3cret@redis:6380")
+        );
+    }
+
+    #[test]
+    fn explicit_session_redis_url_wins_over_the_redis_block() {
+        let raw = raw_config(
+            r#"[
+                'redis' => ['host' => 'redis', 'password' => 's3cret'],
+                'nextcloud_dav' => ['session_redis_url' => 'tcp://explicit:6379?auth=explicit'],
+            ]"#,
+        );
+        let app = AppConfig(raw.get("nextcloud_dav").unwrap());
+        assert_eq!(
+            session_redis_url(Some(app), &raw).as_deref(),
+            Some("tcp://explicit:6379?auth=explicit")
+        );
+    }
+
+    #[test]
+    fn no_session_redis_without_a_host() {
+        let raw = raw_config(r#"['redis' => ['port' => 6379]]"#);
+        assert_eq!(derive_session_redis_url(&raw), None);
+        assert_eq!(session_redis_url(None, &raw), None);
+        // An explicit empty string still falls back to the redis block.
+        let raw = raw_config(
+            r#"['redis' => ['host' => 'redis'], 'nextcloud_dav' => ['session_redis_url' => '']]"#,
+        );
+        let app = AppConfig(raw.get("nextcloud_dav").unwrap());
+        assert_eq!(
+            session_redis_url(Some(app), &raw).as_deref(),
+            Some("redis://redis:6379")
+        );
     }
 
     #[test]
