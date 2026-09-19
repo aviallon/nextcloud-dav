@@ -126,6 +126,43 @@ impl VisibleCalendar {
     }
 }
 
+/// One `oc_dav_shares` row for a calendar (`type = 'calendar'`), as
+/// `OCA\DAV\DAV\Sharing\Backend::getShares()` reads it. `access` is the
+/// `OCA\DAV\DAV\Sharing\Backend` level (2 read-write, 3 read-only, 4 public).
+/// `access == 5` (unshared tombstone) is filtered out by the query.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CalendarShare {
+    pub principaluri: String,
+    pub access: i16,
+}
+
+/// A row of `oc_calendarsubscriptions` (`CalDavBackend::getSubscriptionsForUser()`).
+///
+/// Subscriptions are children of the calendar home, after the calendars and the
+/// special children, in `calendarorder`. They have no `getctag`, `owner-principal`
+/// or `read-only`; `source` is exposed through `{calendarserver}source` as a
+/// `Href` and the strip flags through `{calendarserver}subscribed-strip-*`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CalendarSubscription {
+    pub id: i64,
+    pub uri: String,
+    pub principaluri: String,
+    pub displayname: Option<String>,
+    /// `oc_calendarsubscriptions.refreshrate`, an ISO8601 duration (`PT4H`).
+    pub refreshrate: Option<String>,
+    pub calendarorder: i64,
+    pub calendarcolor: Option<String>,
+    /// The three strip flags. Their value is irrelevant on the wire (`Sabre\CalDAV\Subscriptions\Plugin`
+    /// forces the element empty), only that the element is present.
+    pub striptodos: Option<i64>,
+    pub stripalarms: Option<i64>,
+    pub stripattachments: Option<i64>,
+    pub lastmodified: Option<i64>,
+    pub synctoken: i64,
+    /// The webcal URL (`{calendarserver}source`).
+    pub source: Option<String>,
+}
+
 /// A row of `oc_cards`, after `readBlob()` filtering has been applied.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Card {

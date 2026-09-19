@@ -223,6 +223,11 @@ impl MultiStatus {
 
     /// The CalDAV namespace map (`d`, `s`, `cal`, `cs`, `oc`, `nc`, `apple`),
     /// matching a Nextcloud CalDAV `PROPFIND` response.
+    ///
+    /// `card` is a candidate only: DAVx5's `queryCapabilities()` asks
+    /// `{carddav}max-resource-size` and `{carddav}supported-address-data` on
+    /// every collection, so a calendar PROPFIND can carry them (as a 404),
+    /// and the prefix must be declared or the document is invalid.
     pub const CALDAV_NAMESPACES: &'static [(&'static str, &'static str)] = &[
         ("d", NS_DAV),
         ("s", NS_SABREDAV),
@@ -231,6 +236,7 @@ impl MultiStatus {
         ("oc", NS_OWNCLOUD),
         ("nc", NS_NEXTCLOUD),
         ("apple", NS_APPLE),
+        ("card", NS_CARDDAV),
     ];
 
     pub fn to_xml(&self) -> String {

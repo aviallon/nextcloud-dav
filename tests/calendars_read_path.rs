@@ -8,7 +8,7 @@
 
 mod common;
 
-use common::{call, propfind, request, TestEnv};
+use common::{call, propfind, propfind_with_headers, request, TestEnv};
 use nextcloud_dav::xml::parse::{parse_document, XNode};
 use nextcloud_dav::xml::write::{
     NS_CALDAV, NS_CALENDARSERVER, NS_DAV, NS_NEXTCLOUD, NS_OWNCLOUD, NS_SABREDAV,
@@ -443,8 +443,8 @@ async fn property_gate_501_and_404_split() {
     let Some((_env, app, _work, _bob)) = fixture().await else {
         return;
     };
-    // A property PHP serves but the sidecar does not model -> 501.
-    let body = r#"<d:propfind xmlns:d="DAV:" xmlns:cs="http://calendarserver.org/ns/"><d:prop><cs:publish-url/></d:prop></d:propfind>"#;
+    // A property neither PHP nor the sidecar models -> 501 (delegate).
+    let body = r#"<d:propfind xmlns:d="DAV:" xmlns:x="http://example.com/ns"><d:prop><x:whatever/></d:prop></d:propfind>"#;
     let resp = propfind(
         &app,
         "/remote.php/dav/calendars/alice/work/",
@@ -456,6 +456,24 @@ async fn property_gate_501_and_404_split() {
     .await;
     assert_eq!(resp.status, 501);
     assert!(!attributed(&resp));
+
+    // `{cs}publish-url` is now modelled: unpublished -> a 404 propstat (207),
+    // served by the sidecar.
+    let body = r#"<d:propfind xmlns:d="DAV:" xmlns:cs="http://calendarserver.org/ns/"><d:prop><cs:publish-url/></d:prop></d:propfind>"#;
+    let resp = propfind(
+        &app,
+        "/remote.php/dav/calendars/alice/work/",
+        ALICE,
+        PASSWORD,
+        "0",
+        body,
+    )
+    .await;
+    assert_eq!(resp.status, 207);
+    assert!(attributed(&resp));
+    let doc = parse_xml(&resp.body);
+    let cal = response(&doc, "/remote.php/dav/calendars/alice/work/").unwrap();
+    assert!(is_404(cal, NS_CALENDARSERVER, "publish-url"));
 
     // A property PHP 404s -> a 404 propstat, not a 501.
     let body = r#"<d:propfind xmlns:d="DAV:"><d:prop><d:quota-used-bytes/><d:getlastmodified/><d:share-access/></d:prop></d:propfind>"#;
@@ -527,7 +545,7 @@ async fn other_principal_delegates() {
 }
 
 #[tokio::test]
-async fn trashed_calendar_subscription_and_federated_delegate() {
+async fn trashed_calendar_and_federated_delegate() {
     // Trashed calendar.
     let env = env_or_skip!();
     env.seed_user(ALICE, Some("Alice A")).await;
@@ -542,15 +560,6 @@ async fn trashed_calendar_subscription_and_federated_delegate() {
     assert_eq!(resp.status, 501, "trashed calendar must delegate");
     assert!(!attributed(&resp));
 
-    // Subscription.
-    let env = env_or_skip!();
-    env.seed_user(ALICE, Some("Alice A")).await;
-    env.seed_calendar_subscription("principals/users/alice", "webcal").await;
-    env.seed_token(ALICE, ALICE, PASSWORD, 1, 2).await;
-    let app = env.app_shared();
-    let resp = propfind(&app, "/remote.php/dav/calendars/alice/", ALICE, PASSWORD, "1", body).await;
-    assert_eq!(resp.status, 501, "subscription must delegate");
-
     // Federated calendar.
     let env = env_or_skip!();
     env.seed_user(ALICE, Some("Alice A")).await;
@@ -560,6 +569,149 @@ async fn trashed_calendar_subscription_and_federated_delegate() {
     let resp = propfind(&app, "/remote.php/dav/calendars/alice/", ALICE, PASSWORD, "1", body).await;
     assert_eq!(resp.status, 501, "federated calendar must delegate");
 }
+
+#[tokio::test]
+async fn subscription_listing_is_served() {
+    const SUB_PROPS: &str = r#"<?xml version="1.0"?>
+<d:propfind xmlns:d="DAV:" xmlns:cal="urn:ietf:params:xml:ns:caldav" xmlns:cs="http://calendarserver.org/ns/" xmlns:apple="http://apple.com/ns/ical/" xmlns:s="http://sabredav.org/ns" xmlns:oc="http://owncloud.org/ns">
+  <d:prop>
+    <d:resourcetype/><d:displayname/><d:owner/><d:getlastmodified/>
+    <cs:source/><cs:getctag/><cs:subscribed-strip-todos/><cs:subscribed-strip-alarms/>
+    <cs:subscribed-strip-attachments/><cal:supported-calendar-component-set/>
+    <cal:max-resource-size/><apple:refreshrate/><apple:calendar-color/>
+    <apple:calendar-order/><s:sync-token/><oc:owner-principal/><oc:read-only/>
+  </d:prop>
+</d:propfind>"#;
+    let env = env_or_skip!();
+    env.seed_user(ALICE, Some("Alice A")).await;
+    env.seed_calendar(
+        "principals/users/alice",
+        "work",
+        Some("Work"),
+        0,
+        None,
+        Some("VEVENT"),
+        false,
+        1,
+    )
+    .await;
+    env.seed_calendar_subscription_full(
+        "principals/users/alice",
+        "webcal",
+        Some("Work Webcal"),
+        Some("PT4H"),
+        20,
+        Some("#ff00ff"),
+        1,
+        0,
+        0,
+        Some(1_700_000_000),
+        5,
+        "https://example.com/work.ics",
+    )
+    .await;
+    env.seed_token(ALICE, ALICE, PASSWORD, 1, 2).await;
+    let app = env.app_shared();
+
+    let resp = propfind(
+        &app,
+        "/remote.php/dav/calendars/alice/",
+        ALICE,
+        PASSWORD,
+        "1",
+        SUB_PROPS,
+    )
+    .await;
+    assert_eq!(resp.status, 207, "subscription listing must be served");
+    assert!(
+        resp.header(nextcloud_dav::routes::SIDECAR_HEADER).as_deref() == Some("sidecar"),
+        "subscription listing must be attributed to the sidecar"
+    );
+    let doc = parse_xml(&resp.body);
+    let hrefs = hrefs(&doc);
+    assert_eq!(
+        hrefs,
+        vec![
+            "/remote.php/dav/calendars/alice/".to_string(),
+            "/remote.php/dav/calendars/alice/work/".to_string(),
+            "/remote.php/dav/calendars/alice/inbox/".to_string(),
+            "/remote.php/dav/calendars/alice/outbox/".to_string(),
+            "/remote.php/dav/calendars/alice/trashbin/".to_string(),
+            "/remote.php/dav/calendars/alice/webcal/".to_string(),
+        ],
+        "subscriptions come after the calendars and special children"
+    );
+
+    let sub = response(&doc, "/remote.php/dav/calendars/alice/webcal/").unwrap();
+    let resourcetype = prop_of(sub, NS_DAV, "resourcetype").unwrap();
+    assert!(
+        resourcetype
+            .children
+            .iter()
+            .any(|c| c.ns == NS_CALENDARSERVER && c.local == "subscribed"),
+        "resourcetype must carry {{cs}}subscribed"
+    );
+    let source = prop_of(sub, NS_CALENDARSERVER, "source").unwrap();
+    assert_eq!(
+        source.child(NS_DAV, "href").map(|h| h.text.as_str()),
+        Some("https://example.com/work.ics")
+    );
+    assert_eq!(prop_text(sub, NS_CALENDARSERVER, "getctag"), "5");
+    assert_eq!(prop_text(sub, NS_SABREDAV, "sync-token"), "5");
+    assert_eq!(prop_text(sub, APPLE, "refreshrate"), "PT4H");
+    assert!(is_404(sub, NS_OWNCLOUD, "owner-principal"));
+    assert!(is_404(sub, NS_OWNCLOUD, "read-only"));
+    assert!(is_404(sub, NS_CALDAV, "max-resource-size"));
+}
+
+#[tokio::test]
+async fn webcal_caching_delegates_subscription_listing() {
+    let env = env_or_skip!();
+    env.seed_user(ALICE, Some("Alice A")).await;
+    env.seed_calendar_subscription_full(
+        "principals/users/alice",
+        "webcal",
+        Some("Webcal"),
+        None,
+        1,
+        None,
+        0,
+        0,
+        0,
+        None,
+        1,
+        "https://example.com/w.ics",
+    )
+    .await;
+    env.seed_token(ALICE, ALICE, PASSWORD, 1, 2).await;
+    let app = env.app_shared();
+    let body = r#"<d:propfind xmlns:d="DAV:"><d:prop><d:resourcetype/></d:prop></d:propfind>"#;
+    let resp = propfind_with_headers(
+        &app,
+        "/remote.php/dav/calendars/alice/",
+        ALICE,
+        PASSWORD,
+        "1",
+        body,
+        &[("X-NC-CalDAV-Webcal-Caching", "On")],
+    )
+    .await;
+    assert_eq!(resp.status, 501, "the caching header must delegate");
+    assert!(!attributed(&resp));
+
+    let resp = propfind_with_headers(
+        &app,
+        "/remote.php/dav/calendars/alice/",
+        ALICE,
+        PASSWORD,
+        "1",
+        body,
+        &[("User-Agent", "KIO/5.0 (KDE)")],
+    )
+    .await;
+    assert_eq!(resp.status, 501, "a KIO user agent must delegate");
+}
+
 
 #[tokio::test]
 async fn missing_calendar_is_501_not_404() {

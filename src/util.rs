@@ -25,6 +25,12 @@ pub fn percent_decode(input: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// PHP's `urldecode()`: like [`percent_decode`] but `+` also decodes to a
+/// space (`Sabre\Uri\split` callers feed this to `getPrincipalByPath()`).
+pub fn urldecode(input: &str) -> String {
+    percent_decode(&input.replace('+', " "))
+}
+
 /// Percent-encodes one path segment the way `Sabre\HTTP\encodePathSegment()`
 /// does: `A-Za-z0-9_-~():@` are left alone, everything else is `%xx`
 /// (lower-case hex).
@@ -82,6 +88,13 @@ mod tests {
         assert_eq!(percent_decode("a%2Fb"), "a/b");
         assert_eq!(percent_decode("plain"), "plain");
         assert_eq!(percent_decode("%zz"), "%zz");
+    }
+
+    #[test]
+    fn urldecoding_matches_php() {
+        assert_eq!(urldecode("a+b"), "a b");
+        assert_eq!(urldecode("a%20b"), "a b");
+        assert_eq!(urldecode("parity-team"), "parity-team");
     }
 
     #[test]

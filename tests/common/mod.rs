@@ -393,18 +393,48 @@ impl TestEnv {
             .unwrap();
     }
 
-    pub async fn seed_calendar_subscription(&self, principaluri: &str, uri: &str) {
+    /// A fully-populated `oc_calendarsubscriptions` row, as the Calendar app
+    /// writes it. Returns the new id.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn seed_calendar_subscription_full(
+        &self,
+        principaluri: &str,
+        uri: &str,
+        displayname: Option<&str>,
+        refreshrate: Option<&str>,
+        calendarorder: i64,
+        calendarcolor: Option<&str>,
+        striptodos: i16,
+        stripalarms: i16,
+        stripattachments: i16,
+        lastmodified: Option<i64>,
+        synctoken: i64,
+        source: &str,
+    ) -> i64 {
         let sql = format!(
-            "INSERT INTO {}calendarsubscriptions (principaluri, uri, displayname, synctoken) \
-             VALUES (?, ?, 'Sub', 1)",
+            "INSERT INTO {}calendarsubscriptions \
+             (principaluri, uri, displayname, refreshrate, calendarorder, calendarcolor, \
+              striptodos, stripalarms, stripattachments, lastmodified, synctoken, source) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
             self.prefix
         );
         sqlx::query(safe(sql))
             .bind(principaluri)
             .bind(uri)
-            .execute(self.pool())
+            .bind(displayname)
+            .bind(refreshrate)
+            .bind(calendarorder)
+            .bind(calendarcolor)
+            .bind(striptodos)
+            .bind(stripalarms)
+            .bind(stripattachments)
+            .bind(lastmodified)
+            .bind(synctoken)
+            .bind(source)
+            .fetch_one(self.pool())
             .await
-            .unwrap();
+            .unwrap()
+            .get("id")
     }
 
     /// Inserts an `oc_calendarobjects` row exactly as PHP's
@@ -1443,6 +1473,32 @@ pub async fn propfind(
         .header(header::CONTENT_TYPE, "application/xml; charset=utf-8");
     if !depth.is_empty() {
         builder = builder.header("Depth", depth);
+    }
+    let request = builder.body(Body::from(body.to_string())).unwrap();
+    call(app, request).await
+}
+
+/// PROPFIND helper with a body, optional Depth and extra request headers (used
+/// to exercise the WebcalCaching user-agent / header switch).
+pub async fn propfind_with_headers(
+    app: &Router,
+    path: &str,
+    user: &str,
+    password: &str,
+    depth: &str,
+    body: &str,
+    extra: &[(&str, &str)],
+) -> Resp {
+    let mut builder = Request::builder()
+        .method("PROPFIND")
+        .uri(path)
+        .header(header::AUTHORIZATION, basic(user, password))
+        .header(header::CONTENT_TYPE, "application/xml; charset=utf-8");
+    if !depth.is_empty() {
+        builder = builder.header("Depth", depth);
+    }
+    for (name, value) in extra {
+        builder = builder.header(*name, *value);
     }
     let request = builder.body(Body::from(body.to_string())).unwrap();
     call(app, request).await

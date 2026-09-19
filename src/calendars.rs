@@ -1,17 +1,23 @@
 // SPDX-FileCopyrightText: 2026 Nextcloud GmbH and Nextcloud contributors
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! The CalDAV read surface, part 1: the calendar home listing and the
-//! per-calendar `PROPFIND`.
+//! The CalDAV read surface, part 1: the calendar home listing, the
+//! per-calendar `PROPFIND`, and the calendar-subscription children.
 //!
 //! Only `/remote.php/dav/calendars/<user>/` (`Depth: 0`/`1`) and
-//! `/remote.php/dav/calendars/<user>/<cal>/` (`Depth: 0`) are served. The path
-//! shape has **no `users/` segment**, unlike address books.
+//! `/remote.php/dav/calendars/<user>/<cal>/` (`Depth: 0`) are served, plus the
+//! caller's own subscriptions (`oc_calendarsubscriptions`) both as children of
+//! the home and at their own Depth: 0/1 paths. The path shape has **no
+//! `users/` segment**, unlike address books.
 //!
-//! Everything else in the tree — objects, `trashbin/`, subscriptions, federated
-//! and app-generated calendars, `calendar-query`, `calendar-multiget`,
+//! Everything else in the tree — objects, `trashbin/`, federated and
+//! app-generated calendars, `calendar-query`, `calendar-multiget`,
 //! `sync-collection`, `expand`, free-busy, writes — answers `501` so nginx
-//! replays the request to PHP.
+//! replays the request to PHP. A request that turns on Nextcloud's webcal
+//! caching (a KDE/Evolution/Windows user agent or the
+//! `X-NC-CalDAV-Webcal-Caching: On` header) is delegated too, because PHP then
+//! serves a `CachedSubscription` (a `{caldav}calendar` node with children)
+//! rather than the plain `Subscription` modelled here.
 //!
 //! ## The property gate
 //!
@@ -42,13 +48,13 @@ use crate::config::Config;
 use crate::db::Db;
 use crate::error::Result;
 use crate::l10n::{DavL10n, LocalizedDisplayname};
-use crate::model::{CalendarObject, VisibleCalendar};
+use crate::model::{CalendarObject, CalendarShare, CalendarSubscription, VisibleCalendar};
 use crate::sync::{self, CalendarSyncToken};
 use crate::util::{encode_path_segment, http_date, percent_decode};
 use crate::xml::parse::{self, PropList};
 use crate::xml::write::{
     DavResponse, MultiStatus, PropQName, PropStat, PropValue, XmlElement, NS_CALDAV,
-    NS_CALENDARSERVER, NS_DAV, NS_NEXTCLOUD, NS_OWNCLOUD, NS_SABREDAV,
+    NS_CALENDARSERVER, NS_CARDDAV, NS_DAV, NS_NEXTCLOUD, NS_OWNCLOUD, NS_SABREDAV,
 };
 use std::collections::HashMap;
 
@@ -57,6 +63,19 @@ pub const NS_APPLE: &str = "http://apple.com/ns/ical/";
 
 /// `http://sabre.io/ns/sync/` (`Sabre\DAV\Sync\Plugin::SYNCTOKEN_PREFIX`).
 const SYNCTOKEN_PREFIX: &str = "http://sabre.io/ns/sync/";
+
+/// `OCA\DAV\DAV\Sharing\Backend::ACCESS_READ` — a read-only share.
+const ACCESS_READ: i16 = 3;
+
+/// One `{oc}user` child of the `{oc}invite` property
+/// (`OCA\DAV\DAV\Sharing\Xml\Invite`).
+struct InviteUser {
+    /// `principal:<oc_dav_shares.principaluri>`.
+    href: String,
+    /// The sharee's `{DAV:}displayname`; omitted from the XML when empty.
+    common_name: String,
+    read_only: bool,
+}
 
 // The `oc_properties` override layer replaces these names (see
 // `CustomPropertiesBackend::propFind`): `{DAV:}displayname`,
@@ -166,6 +185,7 @@ fn is_implemented_calendar(ns: &str, local: &str) -> bool {
             | (NS_CALDAV, "supported-collation-set")
             | (NS_CALENDARSERVER, "getctag")
             | (NS_CALENDARSERVER, "allowed-sharing-modes")
+            | (NS_CALENDARSERVER, "publish-url")
             | (NS_SABREDAV, "sync-token")
             | (NS_OWNCLOUD, "owner-principal")
             | (NS_OWNCLOUD, "read-only")
@@ -223,6 +243,12 @@ fn is_known_404_calendar(ns: &str, local: &str) -> bool {
             | (NS_CALDAV, "schedule-default-calendar-URL")
             | (NS_CALDAV, "schedule-inbox-URL")
             | (NS_CALDAV, "schedule-outbox-URL")
+            // DAVx5's `BaseWebDavCollection.queryCapabilities()` asks these two
+            // on every collection (CalDAV included); PHP answers 404 on a
+            // calendar, so knowing them stops the gate delegating a whole
+            // request for a property PHP would not serve either.
+            | (NS_CARDDAV, "max-resource-size")
+            | (NS_CARDDAV, "supported-address-data")
     )
 }
 
@@ -257,6 +283,36 @@ fn is_implemented_special(ns: &str, local: &str) -> bool {
     )
 }
 
+/// The implemented (`200`) properties of a **calendar subscription** child
+/// (`Sabre\CalDAV\Subscriptions\Subscription`). Kept separate from the
+/// calendar set because the two disagree: a subscription has no `getctag`
+/// prefix, and `{caldav}supported-calendar-component-set` is hard-coded to
+/// `VTODO,VEVENT`.
+fn is_implemented_subscription(ns: &str, local: &str) -> bool {
+    matches!(
+        (ns, local),
+        (NS_DAV, "resourcetype")
+            | (NS_DAV, "displayname")
+            | (NS_DAV, "owner")
+            | (NS_DAV, "current-user-principal")
+            | (NS_DAV, "current-user-privilege-set")
+            | (NS_DAV, "acl")
+            | (NS_DAV, "supported-report-set")
+            | (NS_DAV, "supported-method-set")
+            | (NS_DAV, "getlastmodified")
+            | (NS_CALENDARSERVER, "getctag")
+            | (NS_CALENDARSERVER, "source")
+            | (NS_CALENDARSERVER, "subscribed-strip-todos")
+            | (NS_CALENDARSERVER, "subscribed-strip-alarms")
+            | (NS_CALENDARSERVER, "subscribed-strip-attachments")
+            | (NS_CALDAV, "supported-calendar-component-set")
+            | (NS_APPLE, "calendar-color")
+            | (NS_APPLE, "calendar-order")
+            | (NS_APPLE, "refreshrate")
+            | (NS_SABREDAV, "sync-token")
+    )
+}
+
 /// True when every explicitly requested property is one the sidecar either
 /// serves or knows PHP 404s. Anything else is delegated with 501.
 pub fn gate_ok(props: &PropList) -> bool {
@@ -269,6 +325,7 @@ pub fn gate_ok(props: &PropList) -> bool {
                 || is_known_404_calendar(ns, local)
                 || is_implemented_home(ns, local)
                 || is_implemented_special(ns, local)
+                || is_implemented_subscription(ns, local)
         }),
     }
 }
@@ -287,10 +344,20 @@ fn wants(props: &PropList, ns: &str, local: &str) -> bool {
 struct CalendarCtx {
     /// `<webroot>/remote.php/dav`.
     context: String,
+    /// The request's absolute origin (`scheme://host`), used to build the
+    /// absolute `{cs}publish-url` like `IURLGenerator::getAbsoluteURL()`.
+    origin: String,
     caller: String,
     caller_principal: String,
     caller_href: String,
     caller_displayname: String,
+    /// `WebcalCaching\Plugin::isCachingEnabledForThisRequest()` — true for the
+    /// KDE/Evolution/Windows UAs and the `X-NC-CalDAV-Webcal-Caching: On`
+    /// header. With caching on, PHP serves a subscription as a
+    /// `CachedSubscription` (a `{caldav}calendar` node with children), which
+    /// the sidecar does not model, so any request touching a subscription is
+    /// delegated instead.
+    cached_subscriptions: bool,
 }
 
 impl CalendarCtx {
@@ -309,6 +376,7 @@ impl CalendarCtx {
 // ---------------------------------------------------------------------------
 
 /// Serves a calendars `PROPFIND`, or returns `None` to delegate (501).
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_propfind(
     db: &Db,
     config: &Config,
@@ -316,6 +384,8 @@ pub async fn handle_propfind(
     parsed: &CalendarsPath,
     depth: i64,
     accept_language: Option<&str>,
+    origin: &str,
+    cached_subscriptions: bool,
     body: &[u8],
 ) -> Result<Option<MultiStatus>> {
     let request = parse::parse_propfind(body)?;
@@ -346,10 +416,12 @@ pub async fn handle_propfind(
         .unwrap_or_else(|| caller.to_string());
     let ctx = CalendarCtx {
         context: parsed.context.clone(),
+        origin: origin.to_string(),
         caller: caller.to_string(),
         caller_principal,
         caller_href,
         caller_displayname,
+        cached_subscriptions,
     };
     let l10n = DavL10n::resolve(db, config, caller, accept_language).await;
 
@@ -387,15 +459,14 @@ async fn handle_home(
         }));
     }
 
-    // The trashbin/subscription/federated guards: PHP's listing returns trashed
-    // calendars (with a `deleted-calendar` resourcetype) and subscription /
-    // federated children the subset model does not reproduce. Prefer a clean
-    // 501 over an approximate listing.
+    // The trashbin/federated guards: PHP's listing returns trashed calendars
+    // (with a `deleted-calendar` resourcetype) and accepted federated calendars
+    // the subset model does not reproduce. Prefer a clean 501 over an
+    // approximate listing. Subscriptions *are* modelled and served below.
     let groups = db.group_principals(&ctx.caller).await?;
     if db
         .has_trashed_calendars(&ctx.caller_principal, &groups)
         .await?
-        || db.has_calendar_subscriptions(&ctx.caller_principal).await?
         || db.has_federated_calendars(&ctx.caller_principal).await?
     {
         return Ok(None);
@@ -404,6 +475,21 @@ async fn handle_home(
     // The special children carry `acl`/`current-user-privilege-set` values the
     // sidecar does not model; delegate rather than emit a wrong 404.
     if wants(props, NS_DAV, "acl") || wants(props, NS_DAV, "current-user-privilege-set") {
+        return Ok(None);
+    }
+
+    // With webcal caching enabled PHP serves every subscription as a
+    // `CachedSubscription` (`{caldav}calendar` resourcetype, `{DAV:}sync-token`,
+    // children), a different node the sidecar does not model. Delegate the
+    // whole listing rather than emit the plain `Subscription` shape.
+    let subscriptions = db.visible_subscriptions(&ctx.caller_principal).await?;
+    // `Sabre\CalDAV\Subscriptions\Subscription::__construct()` throws on a
+    // NULL `source`, so PHP 500s the whole listing; delegate rather than serve
+    // an empty `{cs}source` href.
+    if subscriptions.iter().any(|sub| sub.source.is_none()) {
+        return Ok(None);
+    }
+    if ctx.cached_subscriptions && !subscriptions.is_empty() {
         return Ok(None);
     }
 
@@ -420,21 +506,40 @@ async fn handle_home(
         }
     }
 
-    // One bulk `oc_properties` lookup for every child calendar path, exactly
-    // like `CustomPropertiesBackend::cacheCalendars()`.
-    let paths: Vec<String> = calendars
+    // One bulk `oc_properties` lookup for every child path (calendars and
+    // subscriptions), exactly like `CustomPropertiesBackend::cacheCalendars()`.
+    let mut paths: Vec<String> = calendars
         .iter()
         .map(|calendar| property_path(ctx, &calendar.wire_uri))
         .collect();
+    paths.extend(
+        subscriptions
+            .iter()
+            .map(|subscription| property_path(ctx, &subscription.uri)),
+    );
     let overrides = db
         .user_properties_for_paths(&ctx.caller, &paths)
         .await?;
 
-    // `{oc}invite` is non-empty for an owned calendar with outgoing shares,
-    // which the sidecar does not reproduce.
-    if wants(props, NS_OWNCLOUD, "invite") && has_outgoing_shares(db, &ctx.caller_principal).await? {
-        return Ok(None);
-    }
+    // `{oc}invite` and `{cs}publish-url` are only queried when asked for. The
+    // invite is built from `Backend::getShares()` / `preloadShares()`; a share
+    // principal the sidecar cannot reproduce delegates the whole listing.
+    let calendar_ids: Vec<i64> = calendars.iter().map(|c| c.calendar.id).collect();
+    let invites = if wants(props, NS_OWNCLOUD, "invite") {
+        let shares = db.calendar_shares_for_ids(&calendar_ids).await?;
+        match resolve_invites(db, &calendars, &shares).await? {
+            Some(invites) => invites,
+            None => return Ok(None),
+        }
+    } else {
+        HashMap::new()
+    };
+    let publish_tokens = if wants(props, NS_CALENDARSERVER, "publish-url") {
+        db.calendar_publish_tokens(&calendar_ids).await?
+    } else {
+        HashMap::new()
+    };
+
     let mut responses = vec![build_home_response(&collection_href(href), ctx, props)];
     for calendar in &calendars {
         let cal_href = format!("{href}/{}", encode_path_segment(&calendar.wire_uri));
@@ -442,12 +547,19 @@ async fn handle_home(
         let override_props = overrides
             .get(&property_path(ctx, &calendar.wire_uri))
             .unwrap_or(&empty);
+        let invite = invites
+            .get(&calendar.calendar.id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let publish_token = publish_tokens.get(&calendar.calendar.id).map(String::as_str);
         responses.push(build_calendar_response(
             &collection_href(&cal_href),
             ctx,
             calendar,
             override_props,
             props,
+            invite,
+            publish_token,
             true,
         ));
     }
@@ -469,6 +581,22 @@ async fn handle_home(
         ctx,
         props,
     ));
+    // Subscriptions come after the calendars and special children, in
+    // `calendarorder` (`CalendarHome::getChildren()`).
+    for subscription in &subscriptions {
+        let sub_href = format!("{href}/{}", encode_path_segment(&subscription.uri));
+        let empty = HashMap::new();
+        let override_props = overrides
+            .get(&property_path(ctx, &subscription.uri))
+            .unwrap_or(&empty);
+        responses.push(build_subscription_response(
+            &collection_href(&sub_href),
+            ctx,
+            subscription,
+            override_props,
+            props,
+        ));
+    }
 
     Ok(Some(MultiStatus {
         responses,
@@ -476,8 +604,64 @@ async fn handle_home(
     }))
 }
 
-async fn has_outgoing_shares(db: &Db, principal: &str) -> Result<bool> {
-    db.calendar_has_outgoing_shares(principal).await
+/// Builds the `{oc}invite` value of every owned calendar in `calendars`.
+///
+/// Returns `Ok(None)` when any outgoing share has a principal the sidecar
+/// cannot reproduce, so the caller delegates the whole request. Shared
+/// calendars are skipped: `Calendar::getShares()` returns `[]` when
+/// `isShared()`, so their invite is always the empty element.
+async fn resolve_invites(
+    db: &Db,
+    calendars: &[VisibleCalendar],
+    shares_by_calendar: &HashMap<i64, Vec<CalendarShare>>,
+) -> Result<Option<HashMap<i64, Vec<InviteUser>>>> {
+    let mut principals: Vec<String> = Vec::new();
+    for calendar in calendars {
+        if calendar.owner_principal.is_none() {
+            if let Some(shares) = shares_by_calendar.get(&calendar.calendar.id) {
+                principals.extend(shares.iter().map(|share| share.principaluri.clone()));
+            }
+        }
+    }
+    principals.sort();
+    principals.dedup();
+    let resolved = db.resolve_share_principals(&principals).await?;
+
+    let mut invites = HashMap::new();
+    for calendar in calendars {
+        if calendar.owner_principal.is_some() {
+            continue;
+        }
+        let empty = Vec::new();
+        let shares = shares_by_calendar
+            .get(&calendar.calendar.id)
+            .unwrap_or(&empty);
+        match invite_users(shares, &resolved) {
+            Some(users) => {
+                invites.insert(calendar.calendar.id, users);
+            }
+            None => return Ok(None),
+        }
+    }
+    Ok(Some(invites))
+}
+
+/// One `Backend::getShares()` row list to the `{oc}invite` users, or `None`
+/// when a principal is not resolvable from the local tables.
+fn invite_users(
+    shares: &[CalendarShare],
+    resolved: &HashMap<String, Option<String>>,
+) -> Option<Vec<InviteUser>> {
+    let mut users = Vec::with_capacity(shares.len());
+    for share in shares {
+        let common_name = resolved.get(&share.principaluri)?.clone()?;
+        users.push(InviteUser {
+            href: format!("principal:{}", share.principaluri),
+            common_name,
+            read_only: share.access == ACCESS_READ,
+        });
+    }
+    Some(users)
 }
 
 // ---------------------------------------------------------------------------
@@ -499,11 +683,14 @@ async fn handle_calendar(
         return Ok(None);
     }
     let groups = db.group_principals(&ctx.caller).await?;
-    let Some(mut calendar) = db
+    let calendar = db
         .visible_calendar_by_uri(&ctx.caller_principal, &groups, cal_uri)
-        .await?
-    else {
-        return Ok(None);
+        .await?;
+    let Some(mut calendar) = calendar else {
+        // Not a calendar: it may be one of the caller's subscriptions
+        // (`CalendarHome::getChild()` checks calendars first, then
+        // subscriptions).
+        return handle_subscription(db, ctx, href, cal_uri, props).await;
     };
     calendar.wire_displayname =
         match l10n.localize_displayname(&calendar.wire_uri, calendar.wire_displayname.take()) {
@@ -533,16 +720,32 @@ async fn handle_calendar(
         }
     }
 
-    // `{oc}invite` is only non-empty for an owned calendar with outgoing
-    // shares, which the sidecar does not reproduce.
-    if wants(props, NS_OWNCLOUD, "invite")
-        && calendar.owner_principal.is_none()
-        && db
-            .calendar_id_has_outgoing_shares(calendar.calendar.id)
+    // `{oc}invite` (non-empty for an owned calendar with outgoing shares) and
+    // `{cs}publish-url` (present only for a published calendar). A share
+    // principal the sidecar cannot reproduce delegates the whole request.
+    let ids = [calendar.calendar.id];
+    let invite_users = if wants(props, NS_OWNCLOUD, "invite") {
+        let shares = db.calendar_shares_for_ids(&ids).await?;
+        match resolve_invites(
+            db,
+            std::slice::from_ref(&calendar),
+            &shares,
+        )
+        .await?
+        {
+            Some(mut invites) => invites.remove(&calendar.calendar.id).unwrap_or_default(),
+            None => return Ok(None),
+        }
+    } else {
+        Vec::new()
+    };
+    let publish_token = if wants(props, NS_CALENDARSERVER, "publish-url") {
+        db.calendar_publish_tokens(&ids)
             .await?
-    {
-        return Ok(None);
-    }
+            .remove(&calendar.calendar.id)
+    } else {
+        None
+    };
 
     let path = property_path(ctx, &calendar.wire_uri);
     let overrides = db
@@ -557,12 +760,212 @@ async fn handle_calendar(
         &calendar,
         override_props,
         props,
+        &invite_users,
+        publish_token.as_deref(),
         depth_one,
     );
     Ok(Some(MultiStatus {
         responses: vec![response],
         sync_token: None,
     }))
+}
+
+// ---------------------------------------------------------------------------
+// Subscription (child of the home)
+// ---------------------------------------------------------------------------
+
+/// Serves one calendar subscription (`Depth: 0`/`1`), or delegates.
+///
+/// A plain `Subscription` has no children, so `Depth: 1` returns the same
+/// single response. With webcal caching enabled PHP would serve a
+/// `CachedSubscription` instead, so the request is delegated.
+async fn handle_subscription(
+    db: &Db,
+    ctx: &CalendarCtx,
+    href: &str,
+    sub_uri: &str,
+    props: &PropList,
+) -> Result<Option<MultiStatus>> {
+    if ctx.cached_subscriptions {
+        return Ok(None);
+    }
+    let Some(subscription) = db
+        .subscription_by_uri(&ctx.caller_principal, sub_uri)
+        .await?
+    else {
+        return Ok(None);
+    };
+    // See `handle_home`: a NULL source makes PHP throw.
+    if subscription.source.is_none() {
+        return Ok(None);
+    }
+    let path = property_path(ctx, &subscription.uri);
+    let overrides = db
+        .user_properties_for_paths(&ctx.caller, std::slice::from_ref(&path))
+        .await?;
+    let empty = HashMap::new();
+    let override_props = overrides.get(&path).unwrap_or(&empty);
+    let response = build_subscription_response(
+        &collection_href(href),
+        ctx,
+        &subscription,
+        override_props,
+        props,
+    );
+    Ok(Some(MultiStatus {
+        responses: vec![response],
+        sync_token: None,
+    }))
+}
+
+/// Builds the `{calendarserver}source` `Href` and the strip flags exactly like
+/// `Sabre\CalDAV\Subscriptions\Subscription::getProperties()` plus
+/// `Subscriptions\Plugin::propFind()`, which forces the three strip elements
+/// empty.
+fn build_subscription_response(
+    href: &str,
+    ctx: &CalendarCtx,
+    subscription: &CalendarSubscription,
+    overrides: &HashMap<String, String>,
+    props: &PropList,
+) -> DavResponse {
+    let owner_href = ctx.principal_href(&subscription.principaluri);
+    let token = if subscription.synctoken == 0 {
+        "0".to_string()
+    } else {
+        subscription.synctoken.to_string()
+    };
+    assemble(href, NodeKind::Subscription, props, |qname| {
+        let ns = qname.ns.as_str();
+        let local = qname.local.as_str();
+        match (ns, local) {
+            (NS_DAV, "resourcetype") => Some(PropValue::Elements(vec![
+                XmlElement::new("d:collection"),
+                XmlElement::new("cs:subscribed"),
+            ])),
+            // `rowToSubscription()` always sets the `subscriptionPropertyMap`
+            // keys, so a NULL column is a 200 with an empty element, not a 404.
+            (NS_DAV, "displayname") => Some(PropValue::Text(
+                overrides
+                    .get("{DAV:}displayname")
+                    .cloned()
+                    .or_else(|| subscription.displayname.clone())
+                    .unwrap_or_default(),
+            )),
+            (NS_DAV, "owner") => Some(href_prop(&owner_href)),
+            (NS_DAV, "current-user-principal") => Some(href_prop(&ctx.caller_href)),
+            (NS_DAV, "current-user-privilege-set") => {
+                Some(privilege_set(subscription_privileges()))
+            }
+            (NS_DAV, "acl") => Some(subscription_acl(&owner_href)),
+            (NS_DAV, "supported-report-set") => Some(report_set(&[
+                "d:expand-property",
+                "d:principal-match",
+                "d:principal-property-search",
+                "d:principal-search-property-set",
+                "oc:filter-comments",
+                "oc:filter-files",
+            ])),
+            (NS_DAV, "supported-method-set") => Some(method_set(false)),
+            // `CorePlugin::propFind` returns the header only for a truthy
+            // `getLastModified()`, and `Subscription::getLastModified()`
+            // returns NULL when the column is not set.
+            (NS_DAV, "getlastmodified") => subscription
+                .lastmodified
+                .filter(|ts| *ts != 0)
+                .map(|ts| PropValue::Text(http_date(ts))),
+            // No `http://sabre.io/ns/sync/` prefix on a subscription:
+            // `CorePlugin::propFindLate` returns the raw `{sabredav}sync-token`.
+            (NS_CALENDARSERVER, "getctag") => Some(PropValue::Text(token.clone())),
+            (NS_CALENDARSERVER, "source") => Some(href_prop(subscription.source.as_deref().unwrap_or_default())),
+            (NS_CALENDARSERVER, "subscribed-strip-todos")
+            | (NS_CALENDARSERVER, "subscribed-strip-alarms")
+            | (NS_CALENDARSERVER, "subscribed-strip-attachments") => Some(PropValue::Empty),
+            // Hard-coded `['VTODO', 'VEVENT']` in `getSubscriptionsForUser()`.
+            (NS_CALDAV, "supported-calendar-component-set") => {
+                Some(PropValue::Elements(vec![
+                    XmlElement::new("cal:comp").attr("name", "VTODO"),
+                    XmlElement::new("cal:comp").attr("name", "VEVENT"),
+                ]))
+            }
+            (NS_APPLE, "calendar-color") => Some(PropValue::Text(
+                overrides
+                    .get("{http://apple.com/ns/ical/}calendar-color")
+                    .cloned()
+                    .or_else(|| subscription.calendarcolor.clone())
+                    .unwrap_or_default(),
+            )),
+            (NS_APPLE, "calendar-order") => Some(PropValue::Text(
+                overrides
+                    .get("{http://apple.com/ns/ical/}calendar-order")
+                    .cloned()
+                    .unwrap_or_else(|| subscription.calendarorder.to_string()),
+            )),
+            (NS_APPLE, "refreshrate") => Some(PropValue::Text(
+                subscription.refreshrate.clone().unwrap_or_default(),
+            )),
+            (NS_SABREDAV, "sync-token") => Some(PropValue::Text(token.clone())),
+            // The shared override layer (`CustomPropertiesBackend`) applies to
+            // the subscription's own `calendars/<user>/<uri>` path too.
+            (NS_CALDAV, "calendar-description") => overrides
+                .get("{urn:ietf:params:xml:ns:caldav}calendar-description")
+                .cloned()
+                .map(PropValue::Text),
+            (NS_CALDAV, "calendar-timezone") => overrides
+                .get("{urn:ietf:params:xml:ns:caldav}calendar-timezone")
+                .cloned()
+                .map(PropValue::Text),
+            (NS_CALDAV, "schedule-calendar-transp") => overrides
+                .get("{urn:ietf:params:xml:ns:caldav}schedule-calendar-transp")
+                .cloned()
+                .map(|value| {
+                    PropValue::Elements(vec![XmlElement::new(if value.contains("transparent") {
+                        "cal:transparent"
+                    } else {
+                        "cal:opaque"
+                    })])
+                }),
+            (NS_OWNCLOUD, "calendar-enabled") | (NS_OWNCLOUD, "enabled") => overrides
+                .get(&format!("{{{ns}}}{local}"))
+                .cloned()
+                .map(PropValue::Text),
+            (NS_NEXTCLOUD, "disable-alarm-notifications") => overrides
+                .get("{http://nextcloud.com/ns}disable-alarm-notifications")
+                .cloned()
+                .map(PropValue::Text),
+            _ => None,
+        }
+    })
+}
+
+/// `Subscription::getACL()`: `{DAV:}all` for the owner and the proxy-write
+/// principal, `{DAV:}read` for proxy-read.
+fn subscription_acl(owner_href: &str) -> PropValue {
+    let proxy_write = format!("{owner_href}calendar-proxy-write/");
+    let proxy_read = format!("{owner_href}calendar-proxy-read/");
+    PropValue::Elements(vec![
+        ace(owner_href, "d:all"),
+        ace(&proxy_write, "d:all"),
+        ace(&proxy_read, "d:read"),
+    ])
+}
+
+/// The expanded `{DAV:}current-user-privilege-set` of `Subscription::getACL()`
+/// (live 33.0.5 capture; note the absence of `cal:read-free-busy`).
+fn subscription_privileges() -> &'static [&'static str] {
+    &[
+        "d:all",
+        "d:read",
+        "d:write",
+        "d:write-properties",
+        "d:write-content",
+        "d:unlock",
+        "d:bind",
+        "d:unbind",
+        "d:write-acl",
+        "d:read-acl",
+        "d:read-current-user-privilege-set",
+    ]
 }
 
 // ---------------------------------------------------------------------------
@@ -925,6 +1328,7 @@ enum NodeKind {
     Home,
     Calendar,
     Special,
+    Subscription,
 }
 
 /// Sabre's `allprop` result for these nodes: only `{DAV:}resourcetype` (the
@@ -1101,6 +1505,8 @@ fn build_calendar_response(
     calendar: &VisibleCalendar,
     overrides: &HashMap<String, String>,
     props: &PropList,
+    invite: &[InviteUser],
+    publish_token: Option<&str>,
     depth_one: bool,
 ) -> DavResponse {
     let owner_principal = calendar
@@ -1209,6 +1615,14 @@ fn build_calendar_response(
             } else {
                 PropValue::Empty
             }),
+            // `PublishPlugin::propFind()` returns the absolute URL only for a
+            // published calendar; an unpublished one is a 404 propstat.
+            (NS_CALENDARSERVER, "publish-url") => publish_token.map(|token| {
+                PropValue::Elements(vec![XmlElement::new("d:href").text(format!(
+                    "{}{}/public-calendars/{}",
+                    ctx.origin, ctx.context, token
+                ))])
+            }),
             (NS_SABREDAV, "sync-token") => Some(PropValue::Text(token.to_string())),
             (NS_OWNCLOUD, "owner-principal") => {
                 // `getCalendarByUri()` (owned Depth 0) does not set it.
@@ -1221,7 +1635,7 @@ fn build_calendar_response(
             (NS_OWNCLOUD, "read-only") => calendar.owner_principal.as_ref().map(|_| {
                 PropValue::Text(if read_only { "1".to_string() } else { String::new() })
             }),
-            (NS_OWNCLOUD, "invite") => Some(PropValue::Empty),
+            (NS_OWNCLOUD, "invite") => Some(invite_prop(invite)),
             (NS_OWNCLOUD, "calendar-enabled") | (NS_OWNCLOUD, "enabled") => {
                 overrides.get(&format!("{{{ns}}}{local}")).cloned().map(PropValue::Text)
             }
@@ -1251,6 +1665,37 @@ fn build_calendar_response(
 
 fn href_prop(href: &str) -> PropValue {
     PropValue::Elements(vec![XmlElement::new("d:href").text(href.to_string())])
+}
+
+/// `Invite::xmlSerialize()`: one `<oc:user>` per share, in the order
+/// `Backend::getShares()` returned them. `common-name` is omitted when empty
+/// (PHP's `if ($user['commonName'])`); `oc:invite-accepted` and the
+/// `oc:access` choice are always written.
+fn invite_prop(users: &[InviteUser]) -> PropValue {
+    if users.is_empty() {
+        return PropValue::Empty;
+    }
+    PropValue::Elements(
+        users
+            .iter()
+            .map(|user| {
+                let access = XmlElement::new("oc:access").child(XmlElement::new(if user.read_only {
+                    "oc:read"
+                } else {
+                    "oc:read-write"
+                }));
+                let mut element = XmlElement::new("oc:user")
+                    .child(XmlElement::new("d:href").text(user.href.clone()));
+                if !user.common_name.is_empty() {
+                    element = element
+                        .child(XmlElement::new("oc:common-name").text(user.common_name.clone()));
+                }
+                element
+                    .child(XmlElement::new("oc:invite-accepted"))
+                    .child(access)
+            })
+            .collect(),
+    )
 }
 
 fn report_set(reports: &[&str]) -> PropValue {
@@ -1428,13 +1873,33 @@ mod tests {
         }
     }
 
+    fn test_subscription() -> CalendarSubscription {
+        CalendarSubscription {
+            id: 9,
+            uri: "webcal".to_string(),
+            principaluri: "principals/users/alice".to_string(),
+            displayname: Some("Webcal".to_string()),
+            refreshrate: Some("PT4H".to_string()),
+            calendarorder: 20,
+            calendarcolor: Some("#ff00ff".to_string()),
+            striptodos: Some(1),
+            stripalarms: Some(0),
+            stripattachments: Some(0),
+            lastmodified: Some(1_700_000_000),
+            synctoken: 5,
+            source: Some("https://example.com/work.ics".to_string()),
+        }
+    }
+
     fn ctx() -> CalendarCtx {
         CalendarCtx {
             context: "/remote.php/dav".to_string(),
+            origin: "https://cloud.example.com".to_string(),
             caller: "alice".to_string(),
             caller_principal: "principals/users/alice".to_string(),
             caller_href: "/remote.php/dav/principals/users/alice/".to_string(),
             caller_displayname: "Alice".to_string(),
+            cached_subscriptions: false,
         }
     }
 
@@ -1470,11 +1935,15 @@ mod tests {
         let ok = PropList::Props(vec![
             PropQName::dav("displayname"),
             PropQName::new(NS_CALENDARSERVER, "getctag"),
+            PropQName::new(NS_CALENDARSERVER, "publish-url"),
             PropQName::new(NS_DAV, "quota-used-bytes"),
             PropQName::new(NS_CALDAV, "supported-calendar-component-set"),
+            // DAVx5's `queryCapabilities()` asks these on a calendar; PHP 404s.
+            PropQName::new(NS_CARDDAV, "max-resource-size"),
+            PropQName::new(NS_CARDDAV, "supported-address-data"),
         ]);
         assert!(gate_ok(&ok));
-        let bad = PropList::Props(vec![PropQName::new(NS_CALENDARSERVER, "publish-url")]);
+        let bad = PropList::Props(vec![PropQName::new("http://example.com/ns", "whatever")]);
         assert!(!gate_ok(&bad));
     }
 
@@ -1500,6 +1969,8 @@ mod tests {
             &cal,
             &HashMap::new(),
             &props,
+            &[],
+            None,
             true,
         );
         let values = props_map(&response);
@@ -1541,6 +2012,8 @@ mod tests {
             &cal,
             &overrides,
             &props,
+            &[],
+            None,
             true,
         );
         let values = props_map(&response);
@@ -1559,9 +2032,27 @@ mod tests {
     fn owned_depth0_has_no_owner_principal() {
         let cal = test_calendar("work", false);
         let props = PropList::Props(vec![PropQName::new(NS_OWNCLOUD, "owner-principal")]);
-        let d0 = build_calendar_response("/x/", &ctx(), &cal, &HashMap::new(), &props, false);
+        let d0 = build_calendar_response(
+            "/x/",
+            &ctx(),
+            &cal,
+            &HashMap::new(),
+            &props,
+            &[],
+            None,
+            false,
+        );
         assert_eq!(d0.propstats[0].status, 404);
-        let d1 = build_calendar_response("/x/", &ctx(), &cal, &HashMap::new(), &props, true);
+        let d1 = build_calendar_response(
+            "/x/",
+            &ctx(),
+            &cal,
+            &HashMap::new(),
+            &props,
+            &[],
+            None,
+            true,
+        );
         assert_eq!(d1.propstats[0].status, 200);
     }
 
@@ -1573,7 +2064,16 @@ mod tests {
             PropQName::new(NS_CALDAV, "schedule-calendar-transp"),
             PropQName::new(NS_NEXTCLOUD, "owner-displayname"),
         ]);
-        let response = build_calendar_response("/x/", &ctx(), &cal, &HashMap::new(), &props, true);
+        let response = build_calendar_response(
+            "/x/",
+            &ctx(),
+            &cal,
+            &HashMap::new(),
+            &props,
+            &[],
+            None,
+            true,
+        );
         let values = props_map(&response);
         assert_eq!(values["{http://owncloud.org/ns}read-only"], PropValue::Text("1".into()));
         assert_eq!(values["{http://nextcloud.com/ns}owner-displayname"], PropValue::Text("Bob Builder".into()));
@@ -1592,11 +2092,193 @@ mod tests {
             &cal,
             &HashMap::new(),
             &PropList::AllProp,
+            &[],
+            None,
             true,
         );
         assert_eq!(response.propstats.len(), 1);
         assert_eq!(response.propstats[0].props.len(), 1);
         assert_eq!(response.propstats[0].props[0].0, PropQName::dav("resourcetype"));
+    }
+
+    #[test]
+    fn publish_url_uses_absolute_origin_and_404s_unpublished() {
+        let cal = test_calendar("work", false);
+        let props = PropList::Props(vec![PropQName::new(NS_CALENDARSERVER, "publish-url")]);
+        let published = build_calendar_response(
+            "/x/",
+            &ctx(),
+            &cal,
+            &HashMap::new(),
+            &props,
+            &[],
+            Some("PUBTOKEN"),
+            true,
+        );
+        let value = &published.propstats[0].props[0].1;
+        let PropValue::Elements(children) = value else {
+            panic!("expected an href");
+        };
+        assert_eq!(children[0].name, "d:href");
+        assert_eq!(
+            children[0].text.as_deref(),
+            Some("https://cloud.example.com/remote.php/dav/public-calendars/PUBTOKEN")
+        );
+        let unpublished = build_calendar_response(
+            "/x/",
+            &ctx(),
+            &cal,
+            &HashMap::new(),
+            &props,
+            &[],
+            None,
+            true,
+        );
+        assert_eq!(unpublished.propstats[0].status, 404);
+    }
+
+    #[test]
+    fn invite_lists_users_with_access_and_omits_empty_names() {
+        let users = vec![
+            InviteUser {
+                href: "principal:principals/users/alice".to_string(),
+                common_name: "Alice E2E".to_string(),
+                read_only: false,
+            },
+            InviteUser {
+                href: "principal:principals/groups/parity-team".to_string(),
+                common_name: String::new(),
+                read_only: true,
+            },
+        ];
+        let PropValue::Elements(children) = invite_prop(&users) else {
+            panic!("expected invite children");
+        };
+        assert_eq!(children.len(), 2);
+        let first = &children[0];
+        assert_eq!(first.children[0].name, "d:href");
+        assert_eq!(first.children[1].name, "oc:common-name");
+        assert_eq!(first.children[2].name, "oc:invite-accepted");
+        assert_eq!(first.children[3].name, "oc:access");
+        assert_eq!(first.children[3].children[0].name, "oc:read-write");
+        // An empty common-name is omitted, exactly like `Invite::xmlSerialize`.
+        assert_eq!(children[1].children[1].name, "oc:invite-accepted");
+        assert_eq!(children[1].children[2].children[0].name, "oc:read");
+        assert_eq!(invite_prop(&[]), PropValue::Empty);
+    }
+
+    #[test]
+    fn subscription_resourcetype_source_and_raw_ctag() {
+        let sub = test_subscription();
+        let props = PropList::Props(vec![
+            PropQName::dav("resourcetype"),
+            PropQName::new(NS_CALENDARSERVER, "source"),
+            PropQName::new(NS_CALENDARSERVER, "getctag"),
+            PropQName::new(NS_CALENDARSERVER, "subscribed-strip-todos"),
+            PropQName::new(NS_SABREDAV, "sync-token"),
+            PropQName::new(NS_CALDAV, "supported-calendar-component-set"),
+            PropQName::new(NS_APPLE, "refreshrate"),
+            PropQName::new(NS_DAV, "getlastmodified"),
+        ]);
+        let response = build_subscription_response("/x/", &ctx(), &sub, &HashMap::new(), &props);
+        let values = props_map(&response);
+        let PropValue::Elements(resourcetype) = &values["{DAV:}resourcetype"] else {
+            panic!("expected elements");
+        };
+        assert_eq!(resourcetype[0].name, "d:collection");
+        assert_eq!(resourcetype[1].name, "cs:subscribed");
+        let PropValue::Elements(source) = &values["{http://calendarserver.org/ns/}source"] else {
+            panic!("expected an href");
+        };
+        assert_eq!(source[0].name, "d:href");
+        assert_eq!(source[0].text.as_deref(), Some("https://example.com/work.ics"));
+        // No `http://sabre.io/ns/sync/` prefix on a subscription.
+        assert_eq!(
+            values["{http://calendarserver.org/ns/}getctag"],
+            PropValue::Text("5".into())
+        );
+        assert_eq!(
+            values["{http://sabredav.org/ns}sync-token"],
+            PropValue::Text("5".into())
+        );
+        assert_eq!(
+            values["{http://calendarserver.org/ns/}subscribed-strip-todos"],
+            PropValue::Empty
+        );
+        assert_eq!(
+            values["{http://apple.com/ns/ical/}refreshrate"],
+            PropValue::Text("PT4H".into())
+        );
+        assert!(values["{DAV:}getlastmodified"].clone() != PropValue::Empty);
+        let PropValue::Elements(comps) = &values["{urn:ietf:params:xml:ns:caldav}supported-calendar-component-set"] else {
+            panic!("expected components");
+        };
+        assert_eq!(comps[0].attributes[0].1.as_str(), "VTODO");
+        assert_eq!(comps[1].attributes[0].1.as_str(), "VEVENT");
+    }
+
+    #[test]
+    fn subscription_null_fields_are_200_empty_and_owner_fields_404() {
+        let mut sub = test_subscription();
+        sub.displayname = None;
+        sub.calendarcolor = None;
+        sub.refreshrate = None;
+        sub.lastmodified = None;
+        let props = PropList::Props(vec![
+            PropQName::dav("displayname"),
+            PropQName::new(NS_APPLE, "calendar-color"),
+            PropQName::new(NS_APPLE, "refreshrate"),
+            PropQName::new(NS_DAV, "getlastmodified"),
+            PropQName::new(NS_OWNCLOUD, "owner-principal"),
+            PropQName::new(NS_OWNCLOUD, "read-only"),
+        ]);
+        let response = build_subscription_response("/x/", &ctx(), &sub, &HashMap::new(), &props);
+        let values = props_map(&response);
+        assert_eq!(values["{DAV:}displayname"], PropValue::Text(String::new()));
+        assert_eq!(
+            values["{http://apple.com/ns/ical/}calendar-color"],
+            PropValue::Text(String::new())
+        );
+        assert_eq!(
+            values["{http://apple.com/ns/ical/}refreshrate"],
+            PropValue::Text(String::new())
+        );
+        assert_eq!(response.propstats.len(), 2);
+        assert_eq!(response.propstats[1].status, 404);
+    }
+
+    #[test]
+    fn subscription_acl_and_privileges() {
+        let sub = test_subscription();
+        let props = PropList::Props(vec![
+            PropQName::dav("acl"),
+            PropQName::dav("current-user-privilege-set"),
+        ]);
+        let response = build_subscription_response("/x/", &ctx(), &sub, &HashMap::new(), &props);
+        let values = props_map(&response);
+        let PropValue::Elements(aces) = &values["{DAV:}acl"] else {
+            panic!("expected aces");
+        };
+        assert_eq!(aces.len(), 3);
+        let PropValue::Elements(privileges) = &values["{DAV:}current-user-privilege-set"] else {
+            panic!("expected privileges");
+        };
+        assert_eq!(privileges.len(), 11);
+        assert_eq!(privileges[0].children[0].name, "d:all");
+    }
+
+    #[test]
+    fn subscription_gate_accepts_live_set() {
+        let ok = PropList::Props(vec![
+            PropQName::new(NS_CALENDARSERVER, "source"),
+            PropQName::new(NS_CALENDARSERVER, "subscribed-strip-alarms"),
+            PropQName::new(NS_CALENDARSERVER, "subscribed-strip-attachments"),
+            PropQName::new(NS_CALENDARSERVER, "getctag"),
+            PropQName::new(NS_APPLE, "refreshrate"),
+            PropQName::dav("getlastmodified"),
+            PropQName::new(NS_SABREDAV, "sync-token"),
+        ]);
+        assert!(gate_ok(&ok));
     }
 
     fn test_object() -> CalendarObject {

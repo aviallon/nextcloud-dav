@@ -16,8 +16,9 @@
 
 use crate::error::{Error, Result};
 use crate::model::{
-    AddressBook, AuthToken, Calendar, CalendarChange, CalendarObject, Card, CardIdUri, ChangeRow,
-    FileCacheRow, ShareRow, VisibleBook, VisibleCalendar,
+    AddressBook, AuthToken, Calendar, CalendarChange, CalendarObject, CalendarShare,
+    CalendarSubscription, Card, CardIdUri, ChangeRow, FileCacheRow, ShareRow, VisibleBook,
+    VisibleCalendar,
 };
 use crate::vcard;
 use md5::{Digest, Md5};
@@ -28,6 +29,9 @@ use std::collections::{HashMap, HashSet};
 
 /// `OCA\DAV\DAV\Sharing\Backend` access levels.
 const ACCESS_READ: i16 = 3;
+/// `CalDavBackend::ACCESS_PUBLIC` — the `oc_dav_shares` row `setPublishStatus()`
+/// writes for a published calendar.
+const ACCESS_PUBLIC: i16 = 4;
 const ACCESS_UNSHARED: i16 = 5;
 
 /// `CardDavBackend::INDEXED_PROPERTIES` (`CardDavBackend.php:47-50`). Only these
@@ -455,6 +459,45 @@ impl Db {
             .find(|calendar| calendar.wire_uri == wire_uri))
     }
 
+    /// Every calendar subscription of the principal, in `calendarorder`
+    /// (`CalDavBackend::getSubscriptionsForUser()`). Missing table (an older
+    /// instance) is an empty list.
+    pub async fn visible_subscriptions(
+        &self,
+        principal: &str,
+    ) -> Result<Vec<CalendarSubscription>> {
+        if !self.table_exists("calendarsubscriptions").await? {
+            return Ok(Vec::new());
+        }
+        // PHP has no tie-breaker; `id` makes equal `calendarorder` rows
+        // deterministic (declared as `calendars-subscriptions-listing-order`).
+        let sql = self.render(&format!(
+            "SELECT id, uri, principaluri, displayname, refreshrate, calendarorder, calendarcolor, \
+                    striptodos, stripalarms, stripattachments, lastmodified, synctoken, source \
+             FROM {}calendarsubscriptions WHERE principaluri = ? \
+             ORDER BY calendarorder ASC, id ASC",
+            self.prefix
+        ));
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(principal)
+            .fetch_all(&self.pool)
+            .await?;
+        rows.iter().map(subscription_from_row).collect()
+    }
+
+    /// The caller's subscription served under `wire_uri`, or `None`.
+    pub async fn subscription_by_uri(
+        &self,
+        principal: &str,
+        wire_uri: &str,
+    ) -> Result<Option<CalendarSubscription>> {
+        Ok(self
+            .visible_subscriptions(principal)
+            .await?
+            .into_iter()
+            .find(|subscription| subscription.uri == wire_uri))
+    }
+
     /// True when the caller can see a calendar in the trashbin (owned or
     /// shared). PHP's listing returns those with a `deleted-calendar`
     /// resourcetype, which the subset model does not reproduce, so the caller
@@ -490,24 +533,6 @@ impl Db {
         Ok(query.fetch_optional(&self.pool).await?.is_some())
     }
 
-    /// True when the principal has a calendar subscription
-    /// (`oc_calendarsubscriptions`), which is a child the sidecar does not
-    /// model. Missing table (older instance) is `false`.
-    pub async fn has_calendar_subscriptions(&self, principal: &str) -> Result<bool> {
-        if !self.table_exists("calendarsubscriptions").await? {
-            return Ok(false);
-        }
-        let sql = self.render(&format!(
-            "SELECT 1 FROM {}calendarsubscriptions WHERE principaluri = ? LIMIT 1",
-            self.prefix
-        ));
-        Ok(sqlx::query(sqlx::AssertSqlSafe(sql))
-            .bind(principal)
-            .fetch_optional(&self.pool)
-            .await?
-            .is_some())
-    }
-
     /// True when the principal has an accepted federated calendar
     /// (`oc_calendars_federated`), which is a child the sidecar does not model.
     /// Missing table is `false`; the `state` column only exists on 36-dev, so
@@ -527,38 +552,169 @@ impl Db {
             .is_some())
     }
 
-    /// True when the principal owns at least one calendar that has an outgoing
-    /// share (`oc_dav_shares`, `type='calendar'`, not unshared). `{oc}invite`
-    /// is non-empty for those, so the request is delegated.
-    pub async fn calendar_has_outgoing_shares(&self, principal: &str) -> Result<bool> {
+    /// The publish token (`oc_dav_shares.publicuri`, `access = 4`) of every
+    /// requested calendar, keyed by calendar id. Mirrors
+    /// `CalDavBackend::preloadPublishStatuses()`.
+    pub async fn calendar_publish_tokens(
+        &self,
+        calendar_ids: &[i64],
+    ) -> Result<HashMap<i64, String>> {
+        let mut tokens = HashMap::new();
+        if calendar_ids.is_empty() {
+            return Ok(tokens);
+        }
+        let in_list = self.in_list(calendar_ids.len(), 2);
         let sql = self.render(&format!(
-            "SELECT 1 FROM {p}dav_shares s JOIN {p}calendars c ON c.id = s.resourceid \
-             WHERE c.principaluri = ? AND s.type = 'calendar' AND s.access <> ? \
-             LIMIT 1",
-            p = self.prefix
+            "SELECT resourceid, publicuri FROM {p}dav_shares \
+             WHERE type = 'calendar' AND access = ? AND resourceid IN ({in_list})",
+            p = self.prefix,
         ));
-        Ok(sqlx::query(sqlx::AssertSqlSafe(sql))
-            .bind(principal)
-            .bind(ACCESS_UNSHARED)
-            .fetch_optional(&self.pool)
-            .await?
-            .is_some())
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql)).bind(ACCESS_PUBLIC);
+        for id in calendar_ids {
+            query = query.bind(id);
+        }
+        for row in query.fetch_all(&self.pool).await? {
+            let resourceid: i64 = row.try_get("resourceid")?;
+            if let Some(publicuri) = row.try_get::<Option<String>, _>("publicuri")? {
+                tokens.insert(resourceid, publicuri);
+            }
+        }
+        Ok(tokens)
     }
 
-    /// True when the calendar has an outgoing share (`oc_dav_shares`,
-    /// `type='calendar'`, not unshared). `{oc}invite` is non-empty for those, so
-    /// the request is delegated.
-    pub async fn calendar_id_has_outgoing_shares(&self, calendar_id: i64) -> Result<bool> {
+    /// The `oc_dav_shares` rows `Backend::getShares()` returns for each
+    /// requested calendar, keyed by calendar id: every row with
+    /// `access <> 5`, grouped by `(principaluri, access)` exactly like
+    /// `SharingMapper::getSharesForIds()`. A calendar with no rows is absent
+    /// from the map (the empty `{oc}invite`).
+    pub async fn calendar_shares_for_ids(
+        &self,
+        calendar_ids: &[i64],
+    ) -> Result<HashMap<i64, Vec<CalendarShare>>> {
+        let mut shares: HashMap<i64, Vec<CalendarShare>> = HashMap::new();
+        if calendar_ids.is_empty() {
+            return Ok(shares);
+        }
+        let in_list = self.in_list(calendar_ids.len(), 2);
         let sql = self.render(&format!(
-            "SELECT 1 FROM {p}dav_shares WHERE resourceid = ? AND type = 'calendar' AND access <> ? LIMIT 1",
-            p = self.prefix
+            "SELECT resourceid, principaluri, access FROM {p}dav_shares \
+             WHERE type = 'calendar' AND access <> ? AND resourceid IN ({in_list}) \
+             GROUP BY resourceid, principaluri, access \
+             ORDER BY resourceid, principaluri",
+            p = self.prefix,
         ));
-        Ok(sqlx::query(sqlx::AssertSqlSafe(sql))
-            .bind(calendar_id)
-            .bind(ACCESS_UNSHARED)
-            .fetch_optional(&self.pool)
-            .await?
-            .is_some())
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql)).bind(ACCESS_UNSHARED);
+        for id in calendar_ids {
+            query = query.bind(id);
+        }
+        for row in query.fetch_all(&self.pool).await? {
+            let resourceid: i64 = row.try_get("resourceid")?;
+            shares.entry(resourceid).or_default().push(CalendarShare {
+                principaluri: row.try_get("principaluri")?,
+                access: row.try_get("access")?,
+            });
+        }
+        Ok(shares)
+    }
+
+    /// Resolves each `oc_dav_shares.principaluri` to the `{DAV:}displayname`
+    /// `Principal::getPrincipalByPath()` returns for it.
+    ///
+    /// `Some(name)` is the exact value (an empty displayname falls back to the
+    /// user/group name, like `User::getDisplayName()` / `Group::getDisplayName()`).
+    /// `None` marks a principal the sidecar cannot reproduce: a circle or a
+    /// federated (`principals/remote-users/`) share, or a user/group absent from
+    /// the local tables (it may live in LDAP, where the displayname is backend
+    /// state the sidecar cannot read).
+    pub async fn resolve_share_principals(
+        &self,
+        principals: &[String],
+    ) -> Result<HashMap<String, Option<String>>> {
+        let mut resolved = HashMap::new();
+        let mut user_lookup: Vec<(String, String)> = Vec::new();
+        let mut group_lookup: Vec<(String, String)> = Vec::new();
+        for principal in principals {
+            if let Some(rest) = principal.strip_prefix("principals/users/") {
+                user_lookup.push((principal.clone(), crate::util::urldecode(rest)));
+            } else if let Some(rest) = principal.strip_prefix("principals/groups/") {
+                group_lookup.push((principal.clone(), crate::util::urldecode(rest)));
+            } else {
+                resolved.insert(principal.clone(), None);
+            }
+        }
+        if !user_lookup.is_empty() {
+            let uids: Vec<&str> = user_lookup.iter().map(|(_, uid)| uid.as_str()).collect();
+            let names = self.user_common_names(&uids).await?;
+            for (principal, uid) in user_lookup {
+                resolved.insert(principal, names.get(&uid).cloned());
+            }
+        }
+        if !group_lookup.is_empty() {
+            let gids: Vec<&str> = group_lookup.iter().map(|(_, gid)| gid.as_str()).collect();
+            let names = self.group_common_names(&gids).await?;
+            for (principal, gid) in group_lookup {
+                resolved.insert(principal, names.get(&gid).cloned());
+            }
+        }
+        Ok(resolved)
+    }
+
+    /// `uid -> displayname (or uid)`, for the uids present in `oc_users`.
+    async fn user_common_names(&self, uids: &[&str]) -> Result<HashMap<String, String>> {
+        let mut names = HashMap::new();
+        if uids.is_empty() {
+            return Ok(names);
+        }
+        let in_list = self.in_list(uids.len(), 1);
+        let sql = self.render(&format!(
+            "SELECT uid, displayname FROM {}users WHERE uid IN ({in_list})",
+            self.prefix
+        ));
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql));
+        for uid in uids {
+            query = query.bind(*uid);
+        }
+        for row in query.fetch_all(&self.pool).await? {
+            let uid: String = row.try_get("uid")?;
+            let displayname: Option<String> =
+                row.try_get::<Option<String>, _>("displayname")?;
+            let name = displayname.filter(|name| !name.is_empty()).unwrap_or(uid.clone());
+            names.insert(uid, name);
+        }
+        Ok(names)
+    }
+
+    /// `gid -> displayname (or gid)`, for the gids present in `oc_groups`.
+    async fn group_common_names(&self, gids: &[&str]) -> Result<HashMap<String, String>> {
+        let mut names = HashMap::new();
+        if gids.is_empty() {
+            return Ok(names);
+        }
+        let in_list = self.in_list(gids.len(), 1);
+        let sql = self.render(&format!(
+            "SELECT gid, displayname FROM {}groups WHERE gid IN ({in_list})",
+            self.prefix
+        ));
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql));
+        for gid in gids {
+            query = query.bind(*gid);
+        }
+        for row in query.fetch_all(&self.pool).await? {
+            let gid: String = row.try_get("gid")?;
+            let displayname: Option<String> =
+                row.try_get::<Option<String>, _>("displayname")?;
+            let name = displayname.filter(|name| !name.is_empty()).unwrap_or(gid.clone());
+            names.insert(gid, name);
+        }
+        Ok(names)
+    }
+
+    /// `"$first, $second, ..."` starting at placeholder `$start`.
+    fn in_list(&self, count: usize, start: usize) -> String {
+        (0..count)
+            .map(|i| self.ph(start + i))
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 
     /// The user's `oc_properties` rows for a set of paths, keyed by path then
@@ -2272,6 +2428,28 @@ fn calendar_from_row(row: &AnyRow) -> Result<Calendar> {
         transparent: row.try_get::<Option<i16>, _>("transparent")?.unwrap_or(0) != 0,
         synctoken: row.try_get("synctoken")?,
         deleted_at: row.try_get("deleted_at")?,
+    })
+}
+
+fn subscription_from_row(row: &AnyRow) -> Result<CalendarSubscription> {
+    Ok(CalendarSubscription {
+        id: row.try_get("id")?,
+        uri: row.try_get::<Option<String>, _>("uri")?.unwrap_or_default(),
+        principaluri: row
+            .try_get::<Option<String>, _>("principaluri")?
+            .unwrap_or_default(),
+        displayname: row.try_get("displayname")?,
+        refreshrate: row.try_get("refreshrate")?,
+        calendarorder: row.try_get::<Option<i64>, _>("calendarorder")?.unwrap_or(0),
+        calendarcolor: row.try_get("calendarcolor")?,
+        striptodos: row.try_get::<Option<i16>, _>("striptodos")?.map(i64::from),
+        stripalarms: row.try_get::<Option<i16>, _>("stripalarms")?.map(i64::from),
+        stripattachments: row
+            .try_get::<Option<i16>, _>("stripattachments")?
+            .map(i64::from),
+        lastmodified: row.try_get("lastmodified")?,
+        synctoken: row.try_get::<Option<i64>, _>("synctoken")?.unwrap_or(1),
+        source: row.try_get("source")?,
     })
 }
 

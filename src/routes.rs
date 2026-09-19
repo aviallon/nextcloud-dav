@@ -279,6 +279,8 @@ async fn handle_calendars(state: Arc<AppState>, request: Request) -> Result<Resp
     let accept_language = headers
         .get(header::ACCEPT_LANGUAGE)
         .and_then(|value| value.to_str().ok());
+    let origin = request_origin(&headers, &state.config.nextcloud_url);
+    let cached_subscriptions = webcal_caching_enabled(&headers);
     match crate::calendars::handle_propfind(
         &state.db,
         &state.config,
@@ -286,6 +288,8 @@ async fn handle_calendars(state: Arc<AppState>, request: Request) -> Result<Resp
         &parsed,
         depth,
         accept_language,
+        &origin,
+        cached_subscriptions,
         &body,
     )
     .await?
@@ -634,6 +638,46 @@ fn client_ip(headers: &HeaderMap) -> IpAddr {
         }
     }
     IpAddr::V4(Ipv4Addr::LOCALHOST)
+}
+
+/// The absolute origin (`scheme://host`) PHP's `URLGenerator::getAbsoluteURL()`
+/// sees, used for the CalDAV `{cs}publish-url`. The sidecar sits behind nginx,
+/// which preserves `Host` and sets `X-Forwarded-Proto`; the scheme falls back to
+/// `http` and the authority to the configured Nextcloud URL.
+fn request_origin(headers: &HeaderMap, fallback: &str) -> String {
+    let scheme = headers
+        .get("x-forwarded-proto")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(',').next())
+        .map(str::trim)
+        .filter(|scheme| !scheme.is_empty())
+        .unwrap_or("http");
+    match headers.get(header::HOST).and_then(|value| value.to_str().ok()) {
+        Some(host) if !host.is_empty() => format!("{scheme}://{host}"),
+        _ => fallback.trim_end_matches('/').to_string(),
+    }
+}
+
+/// `OCA\DAV\CalDAV\WebcalCaching\Plugin`: true when the request asks for cached
+/// subscriptions (a known client user agent or the explicit header). With
+/// caching on, PHP serves a subscription as a `CachedSubscription`, a node the
+/// sidecar does not model, so the CalDAV router delegates such requests.
+fn webcal_caching_enabled(headers: &HeaderMap) -> bool {
+    if headers
+        .get("x-nc-caldav-webcal-caching")
+        .and_then(|value| value.to_str().ok())
+        == Some("On")
+    {
+        return true;
+    }
+    let user_agent = headers
+        .get(header::USER_AGENT)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    // `ENABLE_FOR_CLIENTS = ['/^MSFT-WIN-3/', '/Evolution/', '/KIO/']`.
+    user_agent.starts_with("MSFT-WIN-3")
+        || user_agent.contains("Evolution")
+        || user_agent.contains("KIO")
 }
 
 fn unauthorized() -> Response {
@@ -2086,5 +2130,23 @@ mod tests {
         assert!(query_requires_php("photo&size=64"));
         assert!(query_requires_php("export"));
         assert!(!query_requires_php(""));
+    }
+
+    #[test]
+    fn webcal_caching_switch_matches_the_plugin() {
+        let mut headers = HeaderMap::new();
+        assert!(!webcal_caching_enabled(&headers));
+        headers.insert(
+            "x-nc-caldav-webcal-caching",
+            HeaderValue::from_static("On"),
+        );
+        assert!(webcal_caching_enabled(&headers));
+        headers.remove("x-nc-caldav-webcal-caching");
+        for ua in ["KIO/5.0", "Evolution/3.44", "MSFT-WIN-3/10.0"] {
+            headers.insert(header::USER_AGENT, HeaderValue::from_str(ua).unwrap());
+            assert!(webcal_caching_enabled(&headers), "{ua}");
+        }
+        headers.insert(header::USER_AGENT, HeaderValue::from_static("Mozilla/5.0"));
+        assert!(!webcal_caching_enabled(&headers));
     }
 }

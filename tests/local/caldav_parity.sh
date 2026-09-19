@@ -46,6 +46,10 @@ exec > >(tee -a "$EVIDENCE_FILE") 2>&1
 CURLRC="$STATE_DIR/curlrc"
 PHP_BASE="$NC_URL/remote.php/dav/calendars"
 SIDE_BASE="$SIDECAR_URL/remote.php/dav/calendars"
+# The sidecar is driven directly at :$SIDECAR_PORT, but production reaches it
+# through nginx which preserves `Host`. Sending the Nextcloud authority makes
+# the absolute `{cs}publish-url` identical to PHP's.
+NC_HOST="${NC_URL#*://}"
 PARITY_OK=1
 
 sec() { printf '\n===== %s =====\n' "$*"; }
@@ -73,6 +77,8 @@ q "DELETE FROM oc_properties WHERE propertypath LIKE 'calendars/%'" >/dev/null
 q "DELETE FROM oc_dav_shares WHERE type = 'calendar'" >/dev/null
 q "DELETE FROM oc_calendarchanges WHERE calendarid IN (SELECT id FROM oc_calendars WHERE principaluri IN ('principals/users/alice','principals/users/bob'))" >/dev/null
 q "DELETE FROM oc_calendarobjects WHERE calendarid IN (SELECT id FROM oc_calendars WHERE principaluri IN ('principals/users/alice','principals/users/bob'))" >/dev/null
+q "DELETE FROM oc_calendarobjects WHERE calendarid IN (SELECT id FROM oc_calendarsubscriptions WHERE principaluri IN ('principals/users/alice','principals/users/bob'))" >/dev/null
+q "DELETE FROM oc_calendarsubscriptions WHERE principaluri IN ('principals/users/alice','principals/users/bob')" >/dev/null
 q "DELETE FROM oc_calendars WHERE principaluri IN ('principals/users/alice','principals/users/bob')" >/dev/null
 q "INSERT INTO oc_calendars (principaluri, uri, displayname, calendarorder, calendarcolor, components, transparent, synctoken)
    VALUES ('principals/users/alice','home','Home',1,NULL,'VEVENT,VTODO',1,1),
@@ -82,14 +88,43 @@ q "INSERT INTO oc_calendars (principaluri, uri, displayname, calendarorder, cale
           ('principals/users/bob','bobcal','Bob Cal',5,'#ff0000','VEVENT',0,3)" >/dev/null
 BOB_CAL=$(q "SELECT id FROM oc_calendars WHERE principaluri='principals/users/bob' AND uri='bobcal'")
 WORK_CAL=$(q "SELECT id FROM oc_calendars WHERE principaluri='principals/users/alice' AND uri='work'")
+HOME_CAL=$(q "SELECT id FROM oc_calendars WHERE principaluri='principals/users/alice' AND uri='home'")
 q "INSERT INTO oc_dav_shares (principaluri, type, access, resourceid)
    VALUES ('principals/users/alice','calendar',3,$BOB_CAL)" >/dev/null
+# Two published calendars (`access = 4`), mirroring production's two rows for
+# the test account, so both `{cs}publish-url` branches are testable against
+# real PHP. `work` also carries outgoing shares - a read-write direct user
+# share and a read-only group share - which make `{oc}invite` non-empty on an
+# owned calendar (PHP's `CalDavBackend::setPublishStatus` writes the owner as
+# an `access=4` row, so the published calendars' own invite is non-empty too).
+q "INSERT INTO oc_groups (gid, displayname) VALUES ('parity-team','Parity Team')
+   ON CONFLICT (gid) DO UPDATE SET displayname='Parity Team'" >/dev/null
+q "INSERT INTO oc_dav_shares (principaluri, type, access, resourceid, publicuri)
+   VALUES ('principals/users/alice','calendar',4,$WORK_CAL,'pubtoken-work'),
+          ('principals/users/alice','calendar',4,$HOME_CAL,'pubtoken-home'),
+          ('principals/users/bob','calendar',2,$WORK_CAL,NULL),
+          ('principals/groups/parity-team','calendar',3,$WORK_CAL,NULL)" >/dev/null
 q "INSERT INTO oc_properties (userid, propertypath, propertyname, propertyvalue, valuetype)
    VALUES ('alice','calendars/alice/bobcal_shared_by_bob','{DAV:}displayname','My Bob Cal',1),
           ('alice','calendars/alice/bobcal_shared_by_bob','{http://apple.com/ns/ical/}calendar-color','#123456',1),
           ('alice','calendars/alice/work','{http://owncloud.org/ns}calendar-enabled','0',1)" >/dev/null
 q "UPDATE oc_users SET displayname='Alice E2E' WHERE uid='alice'" >/dev/null
 q "UPDATE oc_users SET displayname='Bob Shared' WHERE uid='bob'" >/dev/null
+
+# Three subscriptions (the production test account has three), with the full
+# column set `CalDavBackend::getSubscriptionsForUser()` reads. The first carries
+# an `oc_properties` override on its own path so the override layer is compared
+# against PHP for a subscription, not just a calendar. The third has NULL
+# displayname / refreshrate / color (the 200-empty-element branch).
+q "INSERT INTO oc_calendarsubscriptions
+   (uri, principaluri, displayname, refreshrate, calendarorder, calendarcolor,
+    striptodos, stripalarms, stripattachments, lastmodified, synctoken, source)
+   VALUES ('webcal-work','principals/users/alice','Work Webcal','PT4H',20,'#00679e',1,0,0,1700000000,5,'https://example.com/work.ics'),
+          ('webcal-holidays','principals/users/alice','Holidays','PT12H',21,NULL,0,1,1,1700000001,3,'https://example.com/holidays.ics'),
+          ('webcal-null','principals/users/alice',NULL,NULL,22,NULL,0,0,0,NULL,1,'webcal://example.com/null.ics')" >/dev/null
+q "INSERT INTO oc_properties (userid, propertypath, propertyname, propertyvalue, valuetype)
+   VALUES ('alice','calendars/alice/webcal-work','{DAV:}displayname','Overridden Webcal',1),
+          ('alice','calendars/alice/webcal-work','{http://apple.com/ns/ical/}calendar-color','#123456',1)" >/dev/null
 
 # Two throwaway calendar objects in `work`, with the pre-increment change
 # convention: both logged at token 7, the calendar token becomes 8.
@@ -101,7 +136,7 @@ q "INSERT INTO oc_calendarobjects (calendarid, uri, calendardata, lastmodified, 
 q "INSERT INTO oc_calendarchanges (uri, synctoken, calendarid, operation, calendartype, created_at)
    VALUES ('p1.ics',7,$WORK_CAL,1,0,1700000000),('p2.ics',7,$WORK_CAL,1,0,1700000001)" >/dev/null
 q "UPDATE oc_calendars SET synctoken=8 WHERE id=$WORK_CAL" >/dev/null
-echo "seeded $(q "SELECT count(*) FROM oc_calendars WHERE principaluri LIKE 'principals/users/%'") calendars, $(q "SELECT count(*) FROM oc_calendarobjects WHERE calendarid=$WORK_CAL") objects"
+echo "seeded $(q "SELECT count(*) FROM oc_calendars WHERE principaluri LIKE 'principals/users/%'") calendars, $(q "SELECT count(*) FROM oc_calendarobjects WHERE calendarid=$WORK_CAL") objects, $(q "SELECT count(*) FROM oc_calendarsubscriptions") subscriptions"
 
 # --- request bodies ----------------------------------------------------------
 HOME_PROPS='<?xml version="1.0"?>
@@ -140,6 +175,24 @@ printf '%s' "$CAL_PROPS" >"$STATE_DIR/pf-caldav-cal.xml"
 DISPLAY_PROPS='<?xml version="1.0"?>
 <d:propfind xmlns:d="DAV:">
   <d:prop><d:displayname/></d:prop>
+</d:propfind>'
+
+# The real home Depth:1 set (calendar properties + the subscription-specific
+# ones), without `acl`/`current-user-privilege-set` (those delegate the listing
+# because the special children's ACLs are not modelled).
+HOME_SUBS_PROPS='<?xml version="1.0"?>
+<d:propfind xmlns:d="DAV:" xmlns:cal="urn:ietf:params:xml:ns:caldav" xmlns:cs="http://calendarserver.org/ns/" xmlns:oc="http://owncloud.org/ns" xmlns:nc="http://nextcloud.com/ns" xmlns:apple="http://apple.com/ns/ical/" xmlns:s="http://sabredav.org/ns">
+  <d:prop>
+    <d:resourcetype/><d:displayname/><d:owner/><d:supported-report-set/><d:supported-method-set/>
+    <cs:getctag/><cs:source/><cs:subscribed-strip-todos/><cs:subscribed-strip-alarms/>
+    <cs:subscribed-strip-attachments/>
+    <cal:supported-calendar-component-set/><cal:schedule-calendar-transp/>
+    <cal:calendar-description/><cal:calendar-timezone/><cal:max-resource-size/>
+    <cal:supported-calendar-data/><cal:supported-collation-set/>
+    <oc:owner-principal/><oc:read-only/><oc:calendar-enabled/>
+    <nc:owner-displayname/><nc:trash-bin-retention-duration/>
+    <apple:calendar-color/><apple:calendar-order/><apple:refreshrate/><s:sync-token/>
+  </d:prop>
 </d:propfind>'
 
 # assert_attribution NAME KIND: the sidecar stamps `x-nextcloud-dav: sidecar`
@@ -182,6 +235,7 @@ run_case() {
 	local side_out side_time side_code
 	side_out=$(curl -s -K "$CURLRC" -X PROPFIND -H "Depth: $depth" \
 		-H 'Content-Type: application/xml; charset=utf-8' \
+		-H "Host: $NC_HOST" \
 		--data-binary "$body" -D "$STATE_DIR/sidecar-caldav-$name.headers" \
 		-o "$side_xml" -w '%{http_code} %{time_total}' "$SIDE_BASE/$rel")
 	side_code=${side_out%% *}; side_time=${side_out##* }
@@ -238,6 +292,228 @@ run_case home-d1 1 "alice/" "$HOME_PROPS"
 run_case cal-owned-d0 0 "alice/work/" "$CAL_PROPS"
 run_case cal-owned-home-d0 0 "alice/home/" "$CAL_PROPS"
 run_case cal-shared-d0 0 "alice/bobcal_shared_by_bob/" "$CAL_PROPS"
+
+# --- the REAL client per-calendar property sets ------------------------------
+# Extracted from the clients' own source (2026-09-19 revisions in
+# docs/recon/caldav-traffic.md) - not a hand-written approximation. Each list is
+# the exact union a client's `getPropFindList()` produces for a calendar
+# collection. The harness passed 23/23 with a synthetic list while the web UI
+# delegated on two of these properties.
+#
+# Nextcloud web UI - `@nextcloud/cdav-library` 2.8.0 (dist/index.mjs):
+#   davObject.js getPropFindList  -> getcontenttype, getetag, resourcetype
+#   davCollection.js getPropFindList
+#     -> displayname, owner, resourcetype, sync-token, current-user-privilege-set
+#   calendar.js getPropFindList
+#     -> apple calendar-order/color, cs getctag, caldav calendar-description,
+#        calendar-timezone, supported-calendar-component-set,
+#        supported-calendar-data, max-resource-size, min-date-time,
+#        max-date-time, max-instances, max-attendees-per-instance,
+#        supported-collation-set, calendar-free-busy-set,
+#        schedule-calendar-transp, schedule-default-calendar-URL,
+#        oc calendar-enabled, nc default-alarm-part-day/full-day,
+#        disable-alarm-notifications, owner-displayname,
+#        trash-bin-retention-duration, deleted-at
+#   davCollectionShareable.js -> oc invite, cs allowed-sharing-modes
+#   davCollectionPublishable.js -> cs publish-url
+WEBUI_SET=(
+	'DAV:|getcontenttype' 'DAV:|getetag' 'DAV:|resourcetype' 'DAV:|displayname'
+	'DAV:|owner' 'DAV:|sync-token' 'DAV:|current-user-privilege-set'
+	'http://apple.com/ns/ical/|calendar-order' 'http://apple.com/ns/ical/|calendar-color'
+	'http://calendarserver.org/ns/|getctag' 'http://calendarserver.org/ns/|allowed-sharing-modes'
+	'http://calendarserver.org/ns/|publish-url'
+	'urn:ietf:params:xml:ns:caldav|calendar-description'
+	'urn:ietf:params:xml:ns:caldav|calendar-timezone'
+	'urn:ietf:params:xml:ns:caldav|supported-calendar-component-set'
+	'urn:ietf:params:xml:ns:caldav|supported-calendar-data'
+	'urn:ietf:params:xml:ns:caldav|max-resource-size'
+	'urn:ietf:params:xml:ns:caldav|min-date-time'
+	'urn:ietf:params:xml:ns:caldav|max-date-time'
+	'urn:ietf:params:xml:ns:caldav|max-instances'
+	'urn:ietf:params:xml:ns:caldav|max-attendees-per-instance'
+	'urn:ietf:params:xml:ns:caldav|supported-collation-set'
+	'urn:ietf:params:xml:ns:caldav|calendar-free-busy-set'
+	'urn:ietf:params:xml:ns:caldav|schedule-calendar-transp'
+	'urn:ietf:params:xml:ns:caldav|schedule-default-calendar-URL'
+	'http://owncloud.org/ns|calendar-enabled' 'http://owncloud.org/ns|invite'
+	'http://nextcloud.com/ns|default-alarm-part-day'
+	'http://nextcloud.com/ns|default-alarm-full-day'
+	'http://nextcloud.com/ns|disable-alarm-notifications'
+	'http://nextcloud.com/ns|owner-displayname'
+	'http://nextcloud.com/ns|trash-bin-retention-duration'
+	'http://nextcloud.com/ns|deleted-at'
+)
+
+# Thunderbird 154 (`CalDavCalendar.sys.mjs`, renamed from
+# `CalDavRequestHandlers.sys.mjs`) `checkDavResourceType()` initial per-calendar
+# PROPFIND (Depth: 0).
+THUNDERBIRD_SET=(
+	'DAV:|resourcetype' 'DAV:|owner' 'DAV:|current-user-principal'
+	'DAV:|current-user-privilege-set' 'DAV:|supported-report-set'
+	'urn:ietf:params:xml:ns:caldav|supported-calendar-component-set'
+	'http://calendarserver.org/ns/|getctag'
+)
+
+# DAVx5 4.5.x (`BaseWebDavCollection.queryCapabilities()`, dav4jvm
+# `CalDAV.GetCTag` = the calendarserver namespace): the same collection
+# capability probe is sent for calendars and address books, so the two CardDAV
+# properties appear on a calendar too (PHP answers them 404).
+DAVX5_SET=(
+	'DAV:|supported-report-set' 'DAV:|sync-token'
+	'http://calendarserver.org/ns/|getctag'
+	'urn:ietf:params:xml:ns:caldav|max-resource-size'
+	'urn:ietf:params:xml:ns:carddav|max-resource-size'
+	'urn:ietf:params:xml:ns:carddav|supported-address-data'
+)
+
+# A calendar-subscription property set: every property PHP serves on a
+# `Sabre\CalDAV\Subscriptions\Subscription` (resourcetype `{cs}subscribed`,
+# source, the strip flags, refreshrate, the hard-coded VTODO,VEVENT component
+# set, the **raw** `{cs}getctag`/`{sabredav}sync-token`) plus the calendar
+# properties a subscription 404s. Captured live from 33.0.5.
+SUB_SET=(
+	'DAV:|resourcetype' 'DAV:|displayname' 'DAV:|owner' 'DAV:|current-user-principal'
+	'DAV:|current-user-privilege-set' 'DAV:|acl' 'DAV:|supported-report-set'
+	'DAV:|supported-method-set' 'DAV:|getlastmodified' 'DAV:|sync-token'
+	'http://calendarserver.org/ns/|getctag' 'http://calendarserver.org/ns/|source'
+	'http://calendarserver.org/ns/|subscribed-strip-todos'
+	'http://calendarserver.org/ns/|subscribed-strip-alarms'
+	'http://calendarserver.org/ns/|subscribed-strip-attachments'
+	'http://calendarserver.org/ns/|allowed-sharing-modes'
+	'http://calendarserver.org/ns/|publish-url'
+	'urn:ietf:params:xml:ns:caldav|supported-calendar-component-set'
+	'urn:ietf:params:xml:ns:caldav|schedule-calendar-transp'
+	'urn:ietf:params:xml:ns:caldav|calendar-description'
+	'urn:ietf:params:xml:ns:caldav|calendar-timezone'
+	'urn:ietf:params:xml:ns:caldav|max-resource-size'
+	'urn:ietf:params:xml:ns:caldav|supported-calendar-data'
+	'urn:ietf:params:xml:ns:caldav|supported-collation-set'
+	'http://owncloud.org/ns|owner-principal' 'http://owncloud.org/ns|read-only'
+	'http://owncloud.org/ns|invite' 'http://owncloud.org/ns|calendar-enabled'
+	'http://owncloud.org/ns|enabled'
+	'http://nextcloud.com/ns|owner-displayname'
+	'http://nextcloud.com/ns|disable-alarm-notifications'
+	'http://apple.com/ns/ical/|calendar-color' 'http://apple.com/ns/ical/|calendar-order'
+	'http://apple.com/ns/ical/|refreshrate'
+	'http://sabredav.org/ns|sync-token'
+)
+
+prefix_for() {
+	case "$1" in
+		"DAV:") echo d ;;
+		"urn:ietf:params:xml:ns:caldav") echo cal ;;
+		"urn:ietf:params:xml:ns:carddav") echo card ;;
+		"http://calendarserver.org/ns/") echo cs ;;
+		"http://owncloud.org/ns") echo oc ;;
+		"http://nextcloud.com/ns") echo nc ;;
+		"http://apple.com/ns/ical/") echo apple ;;
+		"http://sabredav.org/ns") echo s ;;
+		*) echo z ;;
+	esac
+}
+
+# One `<d:propfind>` from `ns|local` lines on stdin.
+propfind_from_set() {
+	local out='<?xml version="1.0"?><d:propfind xmlns:d="DAV:" xmlns:cal="urn:ietf:params:xml:ns:caldav" xmlns:card="urn:ietf:params:xml:ns:carddav" xmlns:cs="http://calendarserver.org/ns/" xmlns:oc="http://owncloud.org/ns" xmlns:nc="http://nextcloud.com/ns" xmlns:apple="http://apple.com/ns/ical/" xmlns:s="http://sabredav.org/ns"><d:prop>'
+	local ns prop
+	while IFS='|' read -r ns prop; do
+		[ -z "$ns" ] && continue
+		out+="<$(prefix_for "$ns"):$prop/>"
+	done
+	out+='</d:prop></d:propfind>'
+	printf '%s' "$out"
+}
+
+# run_property SET REL NS LOCAL: the property ALONE, one per request. Fails
+# unless the sidecar served it (attribution header) and the canonical propstat
+# matches PHP's (status, and the value for `{cs}publish-url`).
+run_property() {
+	local set="$1" rel="$2" ns="$3" prop="$4"
+	local label="$set-$(prefix_for "$ns")-$prop"
+	local name="prop-$label"
+	local body; body=$(printf '%s|%s\n' "$ns" "$prop" | propfind_from_set)
+	local php_xml="$STATE_DIR/php-caldav-$name.xml"
+	local side_xml="$STATE_DIR/sidecar-caldav-$name.xml"
+	local php_code side_code
+	php_code=$(curl -s -K "$CURLRC" -X PROPFIND -H 'Depth: 0' \
+		-H 'Content-Type: application/xml; charset=utf-8' \
+		--data-binary "$body" -o "$php_xml" -w '%{http_code}' "$PHP_BASE/$rel")
+	q "UPDATE oc_authtoken SET last_check = extract(epoch from now())::bigint WHERE uid='alice'" >/dev/null
+	side_code=$(curl -s -K "$CURLRC" -X PROPFIND -H 'Depth: 0' \
+		-H 'Content-Type: application/xml; charset=utf-8' -H "Host: $NC_HOST" \
+		--data-binary "$body" -D "$STATE_DIR/sidecar-caldav-$name.headers" \
+		-o "$side_xml" -w '%{http_code}' "$SIDE_BASE/$rel")
+	if ! grep -qi '^x-nextcloud-dav:[[:space:]]*sidecar' "$STATE_DIR/sidecar-caldav-$name.headers" 2>/dev/null; then
+		echo "RESULT|CALDAV-PROP-$label|FAIL|sidecar delegated (no attribution header); sidecar=$side_code"
+		PARITY_OK=0
+		return
+	fi
+	python3 "$LOCAL_DIR/canonicalize_propfind.py" "$php_xml" >"$STATE_DIR/php-caldav-$name.canon" 2>/dev/null
+	python3 "$LOCAL_DIR/canonicalize_propfind.py" "$side_xml" >"$STATE_DIR/sidecar-caldav-$name.canon" 2>/dev/null
+	if [ "$php_code" = "$side_code" ] \
+		&& diff -q "$STATE_DIR/php-caldav-$name.canon" "$STATE_DIR/sidecar-caldav-$name.canon" >/dev/null; then
+		echo "RESULT|CALDAV-PROP-$label|PASS|sidecar served; canonical propstat matches PHP ($side_code)"
+	else
+		echo "RESULT|CALDAV-PROP-$label|FAIL|php=$php_code sidecar=$side_code or propstat differs"
+		diff -u "$STATE_DIR/php-caldav-$name.canon" "$STATE_DIR/sidecar-caldav-$name.canon" | head -20
+		PARITY_OK=0
+	fi
+}
+
+run_property_set() {
+	local set="$1" rel="$2"; shift 2
+	local entry ns prop
+	for entry in "$@"; do
+		ns="${entry%%|*}"
+		prop="${entry#*|}"
+		run_property "$set" "$rel" "$ns" "$prop"
+	done
+}
+
+sec "real client sets: per-property attribution"
+run_property_set webui "alice/work/" "${WEBUI_SET[@]}"
+run_property_set webui-unpub "alice/personal/" \
+	'http://calendarserver.org/ns/|publish-url'
+run_property_set thunderbird "alice/work/" "${THUNDERBIRD_SET[@]}"
+run_property_set davx5 "alice/work/" "${DAVX5_SET[@]}"
+# Subscription child: every property alone, one request each.
+run_property_set webcal "alice/webcal-work/" "${SUB_SET[@]}"
+
+sec "real client sets: full-set parity"
+run_case real-webui-cal 0 "alice/work/" "$(printf '%s\n' "${WEBUI_SET[@]}" | propfind_from_set)"
+# The unpublished branch of `{cs}publish-url` (404 propstat) must match too.
+run_case real-webui-cal-unpublished 0 "alice/personal/" "$(printf '%s\n' "${WEBUI_SET[@]}" | propfind_from_set)"
+run_case real-thunderbird-cal 0 "alice/work/" "$(printf '%s\n' "${THUNDERBIRD_SET[@]}" | propfind_from_set)"
+run_case real-davx5-cal 0 "alice/work/" "$(printf '%s\n' "${DAVX5_SET[@]}" | propfind_from_set)"
+# The subscription child (a `{cs}subscribed` node, not a calendar) and the home
+# listing that now contains subscriptions.
+run_case real-webcal-sub-d0 0 "alice/webcal-work/" "$(printf '%s\n' "${SUB_SET[@]}" | propfind_from_set)"
+run_case real-webcal-holidays-d0 0 "alice/webcal-holidays/" "$(printf '%s\n' "${SUB_SET[@]}" | propfind_from_set)"
+run_case real-webcal-null-d0 0 "alice/webcal-null/" "$(printf '%s\n' "${SUB_SET[@]}" | propfind_from_set)"
+run_case real-home-subs-d1 1 "alice/" "$HOME_SUBS_PROPS"
+
+# With webcal caching on, PHP returns a `CachedSubscription` (a `{caldav}calendar`
+# node) instead of a plain `Subscription`; the sidecar must delegate, not serve
+# the wrong node shape. Both triggers are checked (the magic header and a KDE
+# `KIO` user agent, which is what the production home traffic uses).
+sec "webcal caching must delegate the subscription listing"
+for trigger in header kio; do
+	q "UPDATE oc_authtoken SET last_check = extract(epoch from now())::bigint WHERE uid='alice'" >/dev/null
+	case "$trigger" in
+		header) extra=(-H 'X-NC-CalDAV-Webcal-Caching: On') ;;
+		kio) extra=(-H 'User-Agent: Mozilla/5.0 (X11; Linux x86_64) KIO/5.116') ;;
+	esac
+	code=$(curl -s -K "$CURLRC" -X PROPFIND -H 'Depth: 1' \
+		-H 'Content-Type: application/xml; charset=utf-8' "${extra[@]}" \
+		--data-binary "$HOME_SUBS_PROPS" -D "$STATE_DIR/sidecar-caldav-webcal-$trigger.headers" \
+		-o /dev/null -w '%{http_code}' "$SIDE_BASE/alice/")
+	if [ "$code" = "501" ] && ! grep -qi '^x-nextcloud-dav:' "$STATE_DIR/sidecar-caldav-webcal-$trigger.headers" 2>/dev/null; then
+		echo "RESULT|CALDAV-WEBCAL-CACHING-$trigger|PASS|501 with no sidecar header"
+	else
+		echo "RESULT|CALDAV-WEBCAL-CACHING-$trigger|FAIL|expected a bare 501, got $code"
+		PARITY_OK=0
+	fi
+done
 
 # PHP localizes the `personal` and `contact_birthdays` displaynames
 # (`Calendar::__construct`). With core/lang=fr they must be `Personnel` and
