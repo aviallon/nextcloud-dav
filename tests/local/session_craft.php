@@ -10,7 +10,7 @@
  *
  * Usage: php session_craft.php <mode> <in_key> <out_key> [value]
  *   modes: copy | tamper | truncate | set_user_id | strip_dav_flag |
- *          strip_app_password
+ *          strip_app_password | set_number_app_password | set_number_dav_flag
  */
 
 require '/var/www/html/lib/base.php';
@@ -67,6 +67,8 @@ switch ($mode) {
 	case 'set_user_id':
 	case 'strip_dav_flag':
 	case 'strip_app_password':
+	case 'set_number_app_password':
+	case 'set_number_dav_flag':
 		$json = $crypto->decrypt($blob, urldecode($passphrase));
 		$data = json_decode($json, true);
 		if (!is_array($data)) {
@@ -79,6 +81,10 @@ switch ($mode) {
 			unset($data['AUTHENTICATED_TO_DAV_BACKEND']);
 		} elseif ($mode === 'strip_app_password') {
 			unset($data['app_password']);
+		} elseif ($mode === 'set_number_app_password') {
+			$data['app_password'] = 1234567890123456789012345678;
+		} elseif ($mode === 'set_number_dav_flag') {
+			$data['AUTHENTICATED_TO_DAV_BACKEND'] = 42;
 		}
 		$newBlob = $crypto->encrypt(json_encode($data), urldecode($passphrase));
 		$out = str_replace($blob, $newBlob, $raw);

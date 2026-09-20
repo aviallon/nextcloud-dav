@@ -200,6 +200,10 @@ pub struct AuthToken {
     pub password_is_null: bool,
     pub last_check: i64,
     pub last_activity: i64,
+    /// Raw `oc_authtoken.scope` JSON (or `NULL`). `LockdownManager::setToken()`
+    /// reads this on every token validation and uses it to decide whether the
+    /// filesystem may be set up at all.
+    pub scope: Option<String>,
 }
 
 /// A row of `oc_addressbookchanges`.

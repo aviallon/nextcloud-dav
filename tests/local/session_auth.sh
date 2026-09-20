@@ -87,7 +87,8 @@ rewrite_jar() { # out new_sid new_passphrase
 }
 
 # Craft a session-store fixture. Modes: copy|tamper|truncate|set_user_id|
-# strip_dav_flag|strip_app_password. Writes PHPREDIS_SESSION:<out_id>.
+# strip_dav_flag|strip_app_password|set_number_app_password|set_number_dav_flag.
+# Writes PHPREDIS_SESSION:<out_id>.
 craft_session() { # mode out_id [value]
 	local mode="$1" out_id="$2" value="${3:-}"
 	docker exec -i -e REDIS_PASSWORD -e SESSION_PASSPHRASE \
@@ -259,6 +260,58 @@ if diff -u "$TMP/php-a3.canon" "$TMP/a3.canon" >"$TMP/a3.diff"; then
 else
 	check A3.4 "REPORT canonical body identical to PHP" "identical" "different ($(wc -l <"$TMP/a3.diff") diff lines)"
 fi
+
+# ---------------------------------------------------------------------------
+sec "5. review follow-ups (F3 app_password type, F4 scope, F5 requesttoken)"
+
+# T1/F3: a present, non-string app_password is a parse failure in PHP and must
+# now be one in the sidecar too (previously: 2FA skipped, session id revalidated).
+NUMAPP_ID=$(new_sid)
+craft_session set_number_app_password "$NUMAPP_ID"
+rewrite_jar "$TMP/numapp.jar" "$NUMAPP_ID" "$ENC_PASS"
+php_code=$(curl -s -o /dev/null -w '%{http_code}' -b "$TMP/numapp.jar" \
+	-X PROPFIND -H 'Depth: 0' -H 'Content-Type: application/xml' \
+	--data-binary "$PF_BODY" "$NC_URL/remote.php/dav/files/alice/")
+check T1.1 "PHP rejects a numeric app_password" "401" "$php_code"
+st=$(curl -s -o /dev/null -D "$TMP/t1.hdr" -w '%{http_code}' -b "$TMP/numapp.jar" \
+	-X PROPFIND -H 'Depth: 0' -H 'Content-Type: application/xml' \
+	--data-binary "$PF_BODY" "$ALICE_FILES")
+check T1.2 "numeric app_password -> 501" "501" "$st"
+check T1.3 "numeric app_password -> no sidecar header" "no" "$(has_any_sidecar_header t1)"
+
+# T2/F4: mint a real filesystem-scoped app password (occ), flip its scope, and
+# prove the files tree now delegates instead of serving DB metadata.
+SC_F2_PW=$(occ user:auth-tokens:add alice --name scoped-f2 --no-interaction 2>/dev/null | tail -n 1)
+check T2.0 "scoped app password minted" "yes" "$([ ${#SC_F2_PW} -ge 32 ] && echo yes || echo no)"
+q "UPDATE oc_authtoken SET scope='{\"filesystem\":false}', last_check=extract(epoch from now())::bigint, last_activity=extract(epoch from now())::bigint WHERE name='scoped-f2'" >/dev/null
+st=$(curl -s -o /dev/null -D "$TMP/t2.hdr" -w '%{http_code}' \
+	-u "alice:$SC_F2_PW" -X PROPFIND -H 'Depth: 0' -H 'Content-Type: application/xml' \
+	--data-binary "$PF_BODY" "$ALICE_FILES")
+check T2.1 "filesystem-scoped token -> 501" "501" "$st"
+check T2.2 "filesystem-scoped token -> no sidecar header" "no" "$(has_any_sidecar_header t2)"
+# PHP's own answer for the same credential: lockdown replaces the home with a
+# NullStorage, so PHP still returns 207 but with no children (Depth 1).
+php_code=$(curl -s -o "$TMP/t2-php.xml" -w '%{http_code}' -u "alice:$SC_F2_PW" \
+	-X PROPFIND -H 'Depth: 1' -H 'Content-Type: application/xml' \
+	--data-binary "$PF_BODY" "$NC_URL/remote.php/dav/files/alice/")
+php_entries=$(grep -o '<d:response>' "$TMP/t2-php.xml" | wc -l)
+check T2.3 "PHP serves an empty scoped listing" "1" "$php_entries"
+q "DELETE FROM oc_authtoken WHERE name='scoped-f2'" >/dev/null
+unset SC_F2_PW
+
+# T3/F5: PHP prefers the GET param over the requesttoken header. A valid header
+# plus a bogus query param fails PHP's CSRF check, so the sidecar must delegate.
+php_code=$(curl -s -o /dev/null -w '%{http_code}' -b "$FORM_JAR" \
+	-H "requesttoken: $FORM_RT" -X PROPFIND -H 'Depth: 0' \
+	-H 'Content-Type: application/xml' --data-binary "$PF_BODY" \
+	"$NC_URL/remote.php/dav/files/alice/?requesttoken=not-the-token")
+check T3.1 "PHP: query param wins over header" "401" "$php_code"
+st=$(curl -s -o /dev/null -D "$TMP/t3.hdr" -w '%{http_code}' -b "$FORM_JAR" \
+	-H "requesttoken: $FORM_RT" -X PROPFIND -H 'Depth: 0' \
+	-H 'Content-Type: application/xml' --data-binary "$PF_BODY" \
+	"$ALICE_FILES?requesttoken=not-the-token")
+check T3.2 "query param wins over header -> 501" "501" "$st"
+check T3.3 "query param wins over header -> no sidecar header" "no" "$(has_any_sidecar_header t3)"
 
 # ---------------------------------------------------------------------------
 sec "4. delegate cases (501, no sidecar header)"

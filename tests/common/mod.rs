@@ -1233,6 +1233,56 @@ impl TestEnv {
             .unwrap();
     }
 
+    /// Inserts a valid app-password token row carrying an explicit `scope`.
+    /// `scope` is the raw JSON stored in `oc_authtoken.scope` (`None` = NULL).
+    pub async fn seed_token_with_scope(
+        &self,
+        uid: &str,
+        login_name: &str,
+        password: &str,
+        token_type: i64,
+        version: i64,
+        scope: Option<&str>,
+    ) {
+        let now = now();
+        let hash = hash_token(password, &self.secret);
+        let sql = format!(
+            "INSERT INTO {}authtoken \
+             (uid, login_name, name, token, type, remember, last_activity, last_check, scope, expires, version, password_invalid) \
+             VALUES (?, ?, '', ?, ?, 0, ?, ?, ?, NULL, ?, false)",
+            self.prefix
+        );
+        sqlx::query(safe(sql))
+            .bind(uid)
+            .bind(login_name)
+            .bind(&hash)
+            .bind(token_type as i16)
+            .bind(now)
+            .bind(now)
+            .bind(scope)
+            .bind(version as i16)
+            .execute(self.pool())
+            .await
+            .unwrap();
+    }
+
+    /// Sets an arbitrary `oc_preferences` row (e.g. `core/enabled`).
+    pub async fn set_user_preference(&self, uid: &str, app: &str, key: &str, value: &str) {
+        let sql = format!(
+            "INSERT INTO {}preferences (userid, appid, configkey, configvalue) \
+             VALUES (?, ?, ?, ?)",
+            self.prefix
+        );
+        sqlx::query(safe(sql))
+            .bind(uid)
+            .bind(app)
+            .bind(key)
+            .bind(value)
+            .execute(self.pool())
+            .await
+            .unwrap();
+    }
+
     // ------------------------------------------------------------------
     // App / requests
     // ------------------------------------------------------------------

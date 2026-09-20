@@ -1002,3 +1002,61 @@ async fn share_properties_come_from_one_bulk_query() {
         Some("31")
     );
 }
+
+/// F2: a token scoped with `filesystem: false` never has its files metadata
+/// served by the sidecar. PHP's `LockdownManager::canAccessFilesystem()` gates
+/// `SetupManager`, so the sidecar delegates (`501`, no sidecar header).
+#[tokio::test]
+async fn filesystem_scoped_token_delegates_the_files_tree() {
+    let Some(env) = TestEnv::new().await else {
+        eprintln!("SKIP: PostgreSQL (initdb/pg_ctl) not available on $PATH");
+        return;
+    };
+    env.seed_user(USER, None).await;
+    env.seed_token_with_scope(USER, USER, PASSWORD, 1, 2, Some("{\"filesystem\":false}"))
+        .await;
+    let app = env.app_shared();
+
+    let body = prop_body(WEB_PROPS);
+    let resp = propfind(&app, FILES, USER, PASSWORD, "0", &body).await;
+    assert_eq!(
+        resp.status, 501,
+        "a filesystem-scoped token must delegate the files tree, got body: {}",
+        resp.text()
+    );
+
+    // The same token on the addressbooks tree, which PHP does not filesystem-gate,
+    // is still evaluated natively: a missing book is a 404, never a delegate
+    // (501/502).
+    let resp = propfind(
+        &app,
+        "/remote.php/dav/addressbooks/users/alice/contacts",
+        USER,
+        PASSWORD,
+        "0",
+        &body,
+    )
+    .await;
+    assert_eq!(
+        resp.status, 404,
+        "the addressbooks tree is not filesystem-gated and must not delegate"
+    );
+}
+
+/// F2: an unparseable scope also delegates the files tree (fail closed), even
+/// though PHP's `json_decode` would default to full access.
+#[tokio::test]
+async fn unparseable_scope_delegates_the_files_tree() {
+    let Some(env) = TestEnv::new().await else {
+        eprintln!("SKIP: PostgreSQL (initdb/pg_ctl) not available on $PATH");
+        return;
+    };
+    env.seed_user(USER, None).await;
+    env.seed_token_with_scope(USER, USER, PASSWORD, 1, 2, Some("not-json"))
+        .await;
+    let app = env.app_shared();
+
+    let body = prop_body("<d:displayname/>");
+    let resp = propfind(&app, FILES, USER, PASSWORD, "0", &body).await;
+    assert_eq!(resp.status, 501, "got body: {}", resp.text());
+}

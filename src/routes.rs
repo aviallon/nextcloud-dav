@@ -257,6 +257,7 @@ async fn handle_calendars(state: Arc<AppState>, request: Request) -> Result<Resp
         &method,
         query.as_deref(),
         target_user.as_deref(),
+        false,
     )
     .await
     {
@@ -353,6 +354,7 @@ async fn handle_discovery(state: Arc<AppState>, request: Request) -> Result<Resp
         "PROPFIND",
         query.as_deref(),
         target_user.as_deref(),
+        false,
     )
     .await
     {
@@ -399,6 +401,7 @@ async fn handle_files(state: Arc<AppState>, request: Request) -> Result<Response
         "PROPFIND",
         query.as_deref(),
         Some(parsed.uid.as_str()),
+        true,
     )
     .await
     {
@@ -458,12 +461,13 @@ async fn authenticate_dav(
     method: &str,
     query: Option<&str>,
     target_user: Option<&str>,
+    filesystem_required: bool,
 ) -> AuthOutcome {
     if let Some((username, password)) = parse_basic_auth(headers.get(header::AUTHORIZATION)) {
         let client_ip = client_ip(headers);
         return match state
             .auth
-            .authenticate(&username, &password, client_ip)
+            .authenticate(&username, &password, client_ip, filesystem_required)
             .await
         {
             Ok(user) => AuthOutcome::User(user),
@@ -475,7 +479,7 @@ async fn authenticate_dav(
     }
     match state
         .auth
-        .authenticate_session(headers, method, query)
+        .authenticate_session(headers, method, query, filesystem_required)
         .await
     {
         Some(user) => {
@@ -518,6 +522,7 @@ async fn handle(state: Arc<AppState>, request: Request) -> Result<Response> {
         method.as_str(),
         Some(&query),
         target_user.as_deref(),
+        false,
     )
     .await
     {
@@ -792,6 +797,9 @@ fn auth_error_response(error: AuthError) -> Response {
             "Nextcloud is in maintenance mode.\n",
         )
             .into_response(),
+        // The scoped token (or another condition PHP owns) must be replayed by
+        // nginx to PHP, never served by the sidecar.
+        AuthError::Delegate => not_implemented(),
         AuthError::Upstream(message) => {
             log::warn!("authentication upstream error: {message}");
             (

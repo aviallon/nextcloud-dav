@@ -43,6 +43,8 @@ pub enum AuthError {
     Throttled { retry_after_secs: u64 },
     #[error("instance is in maintenance mode")]
     Maintenance,
+    #[error("request delegated to PHP")]
+    Delegate,
     #[error("authentication backend error: {0}")]
     Upstream(String),
 }
@@ -55,13 +57,88 @@ pub fn now_unix() -> i64 {
         .unwrap_or_default()
 }
 
+/// PHP truthiness of a JSON value (`(bool) $value` on the decoded value).
+/// Used for the `filesystem` entry, which `canAccessFilesystem()` returns
+/// directly into a boolean context.
+fn php_truthy(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Null => false,
+        serde_json::Value::Bool(b) => *b,
+        serde_json::Value::Number(n) => n.as_f64().is_some_and(|n| n != 0.0),
+        serde_json::Value::String(s) => !s.is_empty() && s != "0",
+        serde_json::Value::Array(a) => !a.is_empty(),
+        serde_json::Value::Object(o) => !o.is_empty(),
+    }
+}
+
+/// Mirrors `PublicKeyToken::getScopeAsArray()` +
+/// `LockdownManager::canAccessFilesystem()`: whether the token's stored scope
+/// permits the filesystem to be set up.
+///
+/// * `Some(true)` - filesystem access allowed (scope absent/empty/default, or
+///   `filesystem` truthy).
+/// * `Some(false)` - scope restricts the filesystem (e.g.
+///   `{"filesystem": false}`).
+/// * `None` - the scope cannot be evaluated exactly (a truthy non-array JSON
+///   scalar, or unparseable JSON). The caller must delegate, never guess.
+///
+/// Note this is deliberately *stricter* than PHP for unparseable scope:
+/// `json_decode()` would return `null` and PHP would default to full access,
+/// but the sidecar refuses to invent a decision.
+pub fn scope_allows_filesystem(scope: Option<&str>) -> Option<bool> {
+    // `getScope()` returns `''` for a NULL column; `json_decode('')` is null
+    // and `!$scope` defaults to `[filesystem => true]`.
+    let Some(scope) = scope else {
+        return Some(true);
+    };
+    if scope.is_empty() {
+        return Some(true);
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(scope) else {
+        return None;
+    };
+    match value {
+        // Falsy scalars: `!$scope` is true -> default filesystem access.
+        serde_json::Value::Null => Some(true),
+        serde_json::Value::Bool(false) => Some(true),
+        serde_json::Value::Number(n) if n.as_f64() == Some(0.0) => Some(true),
+        serde_json::Value::String(ref s) if s.is_empty() || s == "0" => Some(true),
+        // Truthy non-array JSON: `getScopeAsArray(): array` would throw a
+        // TypeError. Delegate rather than invent a decision.
+        serde_json::Value::Bool(true)
+        | serde_json::Value::Number(_)
+        | serde_json::Value::String(_) => None,
+        // `[]` is falsy -> default; a non-empty list has no `filesystem` key.
+        serde_json::Value::Array(a) => Some(a.is_empty()),
+        serde_json::Value::Object(map) => {
+            if map.is_empty() {
+                return Some(true);
+            }
+            match map.get("filesystem") {
+                Some(v) => Some(php_truthy(v)),
+                // `$scope['filesystem']` on a non-empty assoc array without the
+                // key is an undefined-index warning evaluating to null -> false.
+                None => Some(false),
+            }
+        }
+    }
+}
+
 /// The pure part of the fast-path decision, factored out so the gates can be
 /// unit-tested without a database.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TokenDecision {
     Accept(String),
     Reject,
+    /// The sidecar cannot decide and PHP must **authenticate** (the native
+    /// backend / credential re-check lives there); the request is still served
+    /// natively once PHP authenticates.
     Fallback,
+    /// The whole request must go back to PHP (`501`): PHP owns the result
+    /// (e.g. a token scoped away from the filesystem, where PHP's lockdown
+    /// replaces the home with a `NullStorage`). The sidecar must not
+    /// re-authenticate and serve the real data.
+    Delegate,
 }
 
 /// Evaluates the `checkToken()` / `validateTokenLoginName()` / native-backend
@@ -72,7 +149,15 @@ pub fn classify_token_state(
     now: i64,
     native_user_exists: bool,
     user_disabled: bool,
+    filesystem_required: bool,
 ) -> TokenDecision {
+    // A token scoped away from the filesystem makes PHP refuse to set the
+    // filesystem up at all (`LockdownManager::canAccessFilesystem()` gates
+    // `SetupManager`). The sidecar cannot re-authenticate and serve, so the
+    // whole request goes back to PHP.
+    if filesystem_required && scope_allows_filesystem(row.scope.as_deref()) != Some(true) {
+        return TokenDecision::Delegate;
+    }
     // `IToken::WIPE_TOKEN` is a revocation marker and never authenticates.
     if row.token_type == 2 {
         return TokenDecision::Reject;
@@ -129,7 +214,15 @@ pub fn classify_session_token_state(
     session_uid: &str,
     now: i64,
     user_disabled: bool,
+    filesystem_required: bool,
 ) -> TokenDecision {
+    // Same lockdown rule as the fast path: `validateToken()` ends with
+    // `lockdownManager->setToken($dbToken)`. The session path already maps every
+    // non-`Accept` to `None` (a `501`), so `Delegate` and `Fallback` are
+    // equivalent here; use `Delegate` for symmetry and to keep the intent clear.
+    if filesystem_required && scope_allows_filesystem(row.scope.as_deref()) != Some(true) {
+        return TokenDecision::Delegate;
+    }
     // `getToken()` throws `WipeTokenException`; never authenticate a marker.
     if row.token_type == 2 {
         return TokenDecision::Reject;
@@ -208,6 +301,7 @@ impl Authenticator {
         username: &str,
         password: &str,
         ip: IpAddr,
+        filesystem_required: bool,
     ) -> std::result::Result<AuthenticatedUser, AuthError> {
         let now = now_unix();
 
@@ -240,7 +334,10 @@ impl Authenticator {
             }
         }
 
-        match self.fast_path(username, password, now).await {
+        match self
+            .fast_path(username, password, now, filesystem_required)
+            .await
+        {
             Ok(Some(user)) => return Ok(user),
             Ok(None) => {}
             Err(AuthError::Invalid) => {
@@ -264,6 +361,7 @@ impl Authenticator {
         headers: &HeaderMap,
         method: &str,
         query: Option<&str>,
+        filesystem_required: bool,
     ) -> Option<AuthenticatedUser> {
         let redis = self.session_redis.as_ref()?;
         if self.instance_id.is_empty() {
@@ -325,7 +423,13 @@ impl Authenticator {
         }
         let hash = token::hash_token(token, &self.secret);
         let row = self.db.authtoken_by_hash(&hash).await.ok()??;
-        match classify_session_token_state(&row, &uid, now_unix(), disabled) {
+        match classify_session_token_state(
+            &row,
+            &uid,
+            now_unix(),
+            disabled,
+            filesystem_required,
+        ) {
             TokenDecision::Accept(token_uid) if token_uid == uid => {}
             _ => {
                 log::debug!("session token failed revalidation; delegating");
@@ -357,6 +461,7 @@ impl Authenticator {
         username: &str,
         password: &str,
         now: i64,
+        filesystem_required: bool,
     ) -> std::result::Result<Option<AuthenticatedUser>, AuthError> {
         let hash = token::hash_token(password, &self.secret);
         let mut row = self.db.authtoken_by_hash(&hash).await.map_err(upstream)?;
@@ -384,12 +489,23 @@ impl Authenticator {
             false
         };
 
-        match classify_token_state(&row, username, now, native, disabled) {
+        match classify_token_state(
+            &row,
+            username,
+            now,
+            native,
+            disabled,
+            filesystem_required,
+        ) {
             TokenDecision::Accept(uid) => Ok(Some(AuthenticatedUser {
                 uid,
                 method: AuthMethod::FastPath,
             })),
             TokenDecision::Reject => Err(AuthError::Invalid),
+            // A restricted scope must go back to PHP as a `501`; it must not
+            // fall through to `php_fallback`, which would re-authenticate and
+            // then serve the files natively.
+            TokenDecision::Delegate => Err(AuthError::Delegate),
             TokenDecision::Fallback => Ok(None),
         }
     }
@@ -483,7 +599,73 @@ mod tests {
             password_is_null: false,
             last_check,
             last_activity: last_check,
+            scope: None,
         }
+    }
+
+    #[test]
+    fn scope_allows_filesystem_matches_php() {
+        // Absent/empty scope and the default shapes grant filesystem access.
+        assert_eq!(scope_allows_filesystem(None), Some(true));
+        assert_eq!(scope_allows_filesystem(Some("")), Some(true));
+        assert_eq!(scope_allows_filesystem(Some("null")), Some(true));
+        assert_eq!(scope_allows_filesystem(Some("false")), Some(true));
+        assert_eq!(scope_allows_filesystem(Some("0")), Some(true));
+        assert_eq!(scope_allows_filesystem(Some("\"0\"")), Some(true));
+        assert_eq!(scope_allows_filesystem(Some("[]")), Some(true));
+        assert_eq!(scope_allows_filesystem(Some("{}")), Some(true));
+        // A filesystem scope is evaluated exactly, including PHP truthiness.
+        assert_eq!(scope_allows_filesystem(Some("{\"filesystem\":true}")), Some(true));
+        assert_eq!(scope_allows_filesystem(Some("{\"filesystem\":false}")), Some(false));
+        assert_eq!(scope_allows_filesystem(Some("{\"filesystem\":0}")), Some(false));
+        assert_eq!(scope_allows_filesystem(Some("{\"filesystem\":1}")), Some(true));
+        assert_eq!(
+            scope_allows_filesystem(Some("{\"filesystem\":\"false\"}")),
+            Some(true)
+        );
+        assert_eq!(scope_allows_filesystem(Some("{\"filesystem\":null}")), Some(false));
+        // A non-empty scope without the key is a false lookup, like PHP.
+        assert_eq!(scope_allows_filesystem(Some("{\"other\":1}")), Some(false));
+        assert_eq!(scope_allows_filesystem(Some("[1,2]")), Some(false));
+        // Unevaluable shapes delegate (truthy scalars, garbage JSON).
+        assert_eq!(scope_allows_filesystem(Some("5")), None);
+        assert_eq!(scope_allows_filesystem(Some("true")), None);
+        assert_eq!(scope_allows_filesystem(Some("\"x\"")), None);
+        assert_eq!(scope_allows_filesystem(Some("not-json")), None);
+    }
+
+    #[test]
+    fn filesystem_scoped_token_delegates_on_both_paths() {
+        // F2: a token scoped away from the filesystem must never have its file
+        // metadata served by the sidecar.
+        let mut row = token_row(1, "alice", "alice", 1_000);
+        row.scope = Some("{\"filesystem\":false}".to_string());
+        assert_eq!(
+            classify_token_state(&row, "alice", 1_100, true, false, true),
+            TokenDecision::Delegate
+        );
+        assert_eq!(
+            classify_session_token_state(&row, "alice", 1_100, false, true),
+            TokenDecision::Delegate
+        );
+        // The calendars/addressbooks trees are not filesystem-gated, so the same
+        // token is still accepted for them.
+        assert!(matches!(
+            classify_token_state(&row, "alice", 1_100, true, false, false),
+            TokenDecision::Accept(_)
+        ));
+        // Without the scope, the files tree accepts again.
+        row.scope = None;
+        assert!(matches!(
+            classify_token_state(&row, "alice", 1_100, true, false, true),
+            TokenDecision::Accept(_)
+        ));
+        // An unevaluable scope also delegates for files (fail closed).
+        row.scope = Some("garbage".to_string());
+        assert_eq!(
+            classify_token_state(&row, "alice", 1_100, true, false, true),
+            TokenDecision::Delegate
+        );
     }
 
     #[test]
@@ -494,23 +676,23 @@ mod tests {
         let mut row = token_row(0, "alice", "alice", 1_000);
         row.password_is_null = true;
         assert_eq!(
-            classify_session_token_state(&row, "alice", 1_100, false),
+            classify_session_token_state(&row, "alice", 1_100, false, false),
             TokenDecision::Accept("alice".to_string())
         );
         // Stale last_check: still accepted because it is passwordless.
         assert_eq!(
-            classify_session_token_state(&row, "alice", 1_301, false),
+            classify_session_token_state(&row, "alice", 1_301, false, false),
             TokenDecision::Accept("alice".to_string())
         );
         // Exactly at the boundary: the fresh check is false, but passwordless
         // makes it valid anyway.
         assert_eq!(
-            classify_session_token_state(&row, "alice", 1_300, false),
+            classify_session_token_state(&row, "alice", 1_300, false, false),
             TokenDecision::Accept("alice".to_string())
         );
         // One second before the boundary the fresh check alone accepts.
         assert!(matches!(
-            classify_session_token_state(&row, "alice", 1_299, false),
+            classify_session_token_state(&row, "alice", 1_299, false, false),
             TokenDecision::Accept(_)
         ));
     }
@@ -521,15 +703,15 @@ mod tests {
         // cannot re-check the password it does not have, so it must delegate.
         let row = token_row(1, "alice", "alice", 1_000);
         assert_eq!(
-            classify_session_token_state(&row, "alice", 1_100, false),
+            classify_session_token_state(&row, "alice", 1_100, false, false),
             TokenDecision::Accept("alice".to_string())
         );
         assert_eq!(
-            classify_session_token_state(&row, "alice", 1_301, false),
+            classify_session_token_state(&row, "alice", 1_301, false, false),
             TokenDecision::Fallback
         );
         assert_eq!(
-            classify_session_token_state(&row, "alice", 1_300, false),
+            classify_session_token_state(&row, "alice", 1_300, false, false),
             TokenDecision::Fallback
         );
     }
@@ -538,13 +720,13 @@ mod tests {
     fn session_rejects_a_different_uid_and_wipe_token() {
         let mut row = token_row(2, "bob", "bob", 1_000);
         assert_eq!(
-            classify_session_token_state(&row, "alice", 1_100, false),
+            classify_session_token_state(&row, "alice", 1_100, false, false),
             TokenDecision::Reject
         );
         row.token_type = 0;
         row.password_is_null = true;
         assert_eq!(
-            classify_session_token_state(&row, "alice", 1_100, false),
+            classify_session_token_state(&row, "alice", 1_100, false, false),
             TokenDecision::Reject
         );
     }
@@ -553,7 +735,7 @@ mod tests {
     fn accepts_a_valid_permanent_token() {
         let row = token_row(1, "alice", "alice@example.com", 1_000);
         assert_eq!(
-            classify_token_state(&row, "alice@example.com", 1_100, true, false),
+            classify_token_state(&row, "alice@example.com", 1_100, true, false, false),
             TokenDecision::Accept("alice".to_string())
         );
     }
@@ -562,7 +744,7 @@ mod tests {
     fn rejects_wipe_token() {
         let row = token_row(2, "alice", "alice", 1_000);
         assert_eq!(
-            classify_token_state(&row, "alice", 1_100, true, false),
+            classify_token_state(&row, "alice", 1_100, true, false, false),
             TokenDecision::Reject
         );
     }
@@ -571,7 +753,7 @@ mod tests {
     fn delegates_temporary_tokens() {
         let row = token_row(0, "alice", "alice", 1_000);
         assert_eq!(
-            classify_token_state(&row, "alice", 1_100, true, false),
+            classify_token_state(&row, "alice", 1_100, true, false, false),
             TokenDecision::Fallback
         );
     }
@@ -580,12 +762,12 @@ mod tests {
     fn rejects_wrong_login_name() {
         let row = token_row(1, "alice", "alice@example.com", 1_000);
         assert_eq!(
-            classify_token_state(&row, "bob@example.com", 1_100, true, false),
+            classify_token_state(&row, "bob@example.com", 1_100, true, false, false),
             TokenDecision::Reject
         );
         // Case-insensitive match is fine.
         assert!(matches!(
-            classify_token_state(&row, "ALICE@EXAMPLE.COM", 1_100, true, false),
+            classify_token_state(&row, "ALICE@EXAMPLE.COM", 1_100, true, false, false),
             TokenDecision::Accept(_)
         ));
     }
@@ -595,7 +777,7 @@ mod tests {
         let mut row = token_row(1, "alice", "alice", 1_000);
         row.password_invalid = true;
         assert_eq!(
-            classify_token_state(&row, "alice", 1_100, true, false),
+            classify_token_state(&row, "alice", 1_100, true, false, false),
             TokenDecision::Reject
         );
     }
@@ -605,13 +787,13 @@ mod tests {
         let mut row = token_row(1, "alice", "alice", 1_000);
         row.expires = Some(1_050);
         assert_eq!(
-            classify_token_state(&row, "alice", 1_100, true, false),
+            classify_token_state(&row, "alice", 1_100, true, false, false),
             TokenDecision::Fallback
         );
         // A future expiry is still valid.
         row.expires = Some(2_000);
         assert!(matches!(
-            classify_token_state(&row, "alice", 1_100, true, false),
+            classify_token_state(&row, "alice", 1_100, true, false, false),
             TokenDecision::Accept(_)
         ));
     }
@@ -620,7 +802,7 @@ mod tests {
     fn delegates_non_native_users() {
         let row = token_row(1, "ldapuser", "ldapuser", 1_000);
         assert_eq!(
-            classify_token_state(&row, "ldapuser", 1_100, false, false),
+            classify_token_state(&row, "ldapuser", 1_100, false, false, false),
             TokenDecision::Fallback
         );
     }
@@ -629,7 +811,7 @@ mod tests {
     fn rejects_disabled_users() {
         let row = token_row(1, "alice", "alice", 1_000);
         assert_eq!(
-            classify_token_state(&row, "alice", 1_100, true, true),
+            classify_token_state(&row, "alice", 1_100, true, true, false),
             TokenDecision::Reject
         );
     }
@@ -639,12 +821,12 @@ mod tests {
         let row = token_row(1, "alice", "alice", 1_000);
         // last_check is older than 300 s.
         assert_eq!(
-            classify_token_state(&row, "alice", 1_301, true, false),
+            classify_token_state(&row, "alice", 1_301, true, false, false),
             TokenDecision::Fallback
         );
         // Exactly at the boundary is still accepted.
         assert!(matches!(
-            classify_token_state(&row, "alice", 1_300, true, false),
+            classify_token_state(&row, "alice", 1_300, true, false, false),
             TokenDecision::Accept(_)
         ));
     }

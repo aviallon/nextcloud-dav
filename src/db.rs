@@ -1109,7 +1109,7 @@ impl Db {
         // must too; a mismatch only means we fall back to PHP, never that we
         // accept a token Nextcloud would reject.
         let sql = self.render(&format!(
-            "SELECT uid, login_name, type, expires, last_check, last_activity, \
+            "SELECT uid, login_name, type, expires, last_check, last_activity, scope, \
                     CASE WHEN password_invalid THEN '1' ELSE '0' END AS password_invalid_flag, \
                     CASE WHEN password IS NULL THEN '1' ELSE '0' END AS password_is_null_flag \
              FROM {}authtoken WHERE token = ? AND version = 2 LIMIT 1",
@@ -1135,19 +1135,26 @@ impl Db {
         Ok(row.try_get::<i64, _>("c")? > 0)
     }
 
-    /// True when `core/enabled = false` is set for the user.
+    /// True when the user is disabled, mirroring `OC\User\User::isEnabled()`:
+    /// `UserConfig::getValueBool($uid, 'core', 'enabled', true)`, which is true
+    /// only when the stored value lower-cased is one of `1`/`true`/`yes`/`on`.
+    /// An absent preference row defaults to enabled. A present-but-garbage value
+    /// (e.g. `'0'`, `''`, `'off'`) is therefore **disabled**, not enabled.
     pub async fn user_is_disabled(&self, uid: &str) -> Result<bool> {
         let sql = self.render(&format!(
-            "SELECT COUNT(*) AS c FROM {}preferences \
-             WHERE userid = ? AND appid = 'core' AND configkey = 'enabled' \
-               AND configvalue = 'false'",
+            "SELECT configvalue FROM {}preferences \
+             WHERE userid = ? AND appid = 'core' AND configkey = 'enabled' LIMIT 1",
             self.prefix
         ));
         let row = sqlx::query(sqlx::AssertSqlSafe(sql))
             .bind(uid)
-            .fetch_one(&self.pool)
+            .fetch_optional(&self.pool)
             .await?;
-        Ok(row.try_get::<i64, _>("c")? > 0)
+        let value = match row {
+            Some(row) => row.try_get::<Option<String>, _>("configvalue")?,
+            None => None,
+        };
+        Ok(!enabled_value_is_true(value.as_deref()))
     }
 
     /// The display name from `oc_users` (`NULL`/empty falls back to the uid).
@@ -2580,7 +2587,20 @@ fn auth_token_from_row(row: &AnyRow) -> Result<AuthToken> {
         last_activity: row
             .try_get::<Option<i64>, _>("last_activity")?
             .unwrap_or_default(),
+        scope: row.try_get::<Option<String>, _>("scope")?,
     })
+}
+
+/// `UserConfig::getValueBool` with a `true` default: only the four documented
+/// truthy spellings (case-insensitive) are enabled; `None` (no row) is enabled.
+fn enabled_value_is_true(value: Option<&str>) -> bool {
+    match value {
+        None => true,
+        Some(value) => matches!(
+            value.to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
+    }
 }
 
 // Keep the `Any`/`Error` imports obviously used in case of refactors.
@@ -2609,6 +2629,19 @@ mod tests {
             "SELECT * FROM x WHERE a = ?"
         );
         assert_eq!(placeholder(3, false), "?");
+    }
+
+    #[test]
+    fn enabled_value_follows_php_get_value_bool() {
+        // Absent row -> `getValueBool(..., true)` -> enabled.
+        assert!(enabled_value_is_true(None));
+        for truthy in ["1", "true", "TRUE", "yes", "YES", "on", "On"] {
+            assert!(enabled_value_is_true(Some(truthy)), "{truthy} is truthy");
+        }
+        // A present non-truthy value (including garbage) means disabled.
+        for falsy in ["0", "false", "off", "no", "", "garbage", " true"] {
+            assert!(!enabled_value_is_true(Some(falsy)), "{falsy} is disabled");
+        }
     }
 
     #[test]

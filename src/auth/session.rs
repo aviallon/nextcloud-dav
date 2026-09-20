@@ -54,8 +54,9 @@ pub struct SessionPayload {
 
 impl SessionPayload {
     /// Parses the decrypted JSON. `user_id` must be a non-empty string; every
-    /// other key is optional. A payload without `user_id` is rejected so the
-    /// caller delegates.
+    /// other key is optional. A payload without `user_id`, or one whose
+    /// `app_password` / `AUTHENTICATED_TO_DAV_BACKEND` is present, non-null and
+    /// not a string, is rejected so the caller delegates.
     pub fn parse(json: &[u8]) -> Option<Self> {
         let value: serde_json::Value = serde_json::from_slice(json).ok()?;
         let user_id = value.get("user_id")?.as_str()?.to_string();
@@ -63,24 +64,29 @@ impl SessionPayload {
             return None;
         }
         let str_at = |key: &str| value.get(key).and_then(|v| v.as_str()).map(str::to_string);
-        let has_app_password = value
-            .get("app_password")
-            .map(|v| !v.is_null())
-            .unwrap_or(false);
-        let app_password = if has_app_password {
-            value
-                .get("app_password")
-                .and_then(|v| v.as_str())
-                .map(str::to_string)
-        } else {
-            None
+        // A key that is *present, non-null and not a string* is a parse failure:
+        // PHP never authenticates such a session (the value reaches
+        // `validateSession()` / `isDavAuthenticated()` as an int/array and the
+        // token lookup or the `=== uid` comparison fails), and the sidecar
+        // must not silently reinterpret it as "absent" (which would skip the
+        // 2FA gate and swap the revalidated token). `None` here delegates.
+        let optional_string = |key: &str| -> Option<Option<String>> {
+            match value.get(key) {
+                None => Some(None),
+                Some(v) if v.is_null() => Some(None),
+                Some(serde_json::Value::String(s)) => Some(Some(s.clone())),
+                Some(_) => None,
+            }
         };
+        let app_password = optional_string("app_password")?;
+        let has_app_password = app_password.is_some();
+        let dav_authenticated = optional_string(DAV_AUTHENTICATED)?;
         Some(Self {
             user_id,
             loginname: str_at("loginname"),
             app_password,
             has_app_password,
-            dav_authenticated: str_at(DAV_AUTHENTICATED),
+            dav_authenticated,
             two_factor_auth_passed: str_at(TWO_FACTOR_PASSED),
             requesttoken: str_at("requesttoken"),
         })
@@ -265,7 +271,11 @@ pub fn decision_after_token(payload: &SessionPayload, facts: &RequestFacts) -> O
                 return None;
             }
             let session_token = payload.requesttoken.as_deref()?;
-            let presented = facts.requesttoken_header.or(facts.requesttoken_param)?;
+            // PHP's `Request::passesCSRFCheck()` order: GET param, then POST
+            // param, then the `requesttoken` header. A bogus query param wins
+            // over a valid header, so PHP fails the check and the sidecar must
+            // delegate.
+            let presented = facts.requesttoken_param.or(facts.requesttoken_header)?;
             let presented = decrypt_requesttoken(presented)?;
             if constant_time_eq(session_token, &presented) {
                 Some(uid.to_string())
@@ -292,7 +302,13 @@ pub fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
                 continue;
             };
             if key == name {
-                return Some(crate::util::urldecode(raw));
+                // `percent_decode`, NOT `urldecode`: a `+` is a literal character
+                // in a cookie. PHP's `$_COOKIE` preserves it (the `+` -> space
+                // substitution belongs to form/query encoding), and the session
+                // passphrase is 128 chars over `A-Za-z0-9+/`, so roughly seven in
+                // eight browsers carry a `+` - decoding it as a space made the HMAC
+                // fail and silently delegated every session request to PHP.
+                return Some(crate::util::percent_decode(raw));
             }
         }
     }
@@ -392,6 +408,53 @@ mod tests {
         assert!(SessionPayload::parse(b"{\"user_id\":\"\"}").is_none());
         assert!(SessionPayload::parse(b"{\"loginname\":\"alice\"}").is_none());
         assert!(SessionPayload::parse(b"not json").is_none());
+    }
+
+    #[test]
+    fn non_string_app_password_is_a_parse_failure() {
+        // PHP never authenticates a session whose `app_password` is not a
+        // string: the value becomes the token, the lookup fails and the user is
+        // logged out. The sidecar must delegate, never reinterpret it as
+        // "absent" (which would skip 2FA and revalidate the session id).
+        for value in [
+            "1234567890123456789012345678",
+            "[\"app\",\"password\"]",
+            "true",
+        ] {
+            let json = format!("{{\"user_id\":\"alice\",\"app_password\":{value}}}");
+            assert!(
+                SessionPayload::parse(json.as_bytes()).is_none(),
+                "app_password = {value} must fail the parse"
+            );
+        }
+        // Absent and null stay "no app password".
+        let absent = SessionPayload::parse(b"{\"user_id\":\"alice\"}").unwrap();
+        assert!(!absent.has_app_password && absent.app_password.is_none());
+        let null = SessionPayload::parse(b"{\"user_id\":\"alice\",\"app_password\":null}").unwrap();
+        assert!(!null.has_app_password && null.app_password.is_none());
+        let empty = SessionPayload::parse(b"{\"user_id\":\"alice\",\"app_password\":\"\"}").unwrap();
+        assert!(empty.has_app_password && empty.app_password.as_deref() == Some(""));
+    }
+
+    #[test]
+    fn non_string_dav_authenticated_is_a_parse_failure() {
+        // PHP's strict `=== uid` comparison never matches a non-string, so the
+        // sidecar must not fold it into branch 1 (absent).
+        for value in ["42", "[\"alice\"]", "false"] {
+            let json =
+                format!("{{\"user_id\":\"alice\",\"{DAV_AUTHENTICATED}\":{value}}}");
+            assert!(
+                SessionPayload::parse(json.as_bytes()).is_none(),
+                "{DAV_AUTHENTICATED} = {value} must fail the parse"
+            );
+        }
+        let absent = SessionPayload::parse(b"{\"user_id\":\"alice\"}").unwrap();
+        assert!(absent.dav_authenticated.is_none());
+        let null = SessionPayload::parse(
+            format!("{{\"user_id\":\"alice\",\"{DAV_AUTHENTICATED}\":null}}").as_bytes(),
+        )
+        .unwrap();
+        assert!(null.dav_authenticated.is_none());
     }
 
     fn payload(user_id: &str) -> SessionPayload {
@@ -494,6 +557,36 @@ mod tests {
     }
 
     #[test]
+    fn requesttoken_query_param_wins_over_header() {
+        // PHP: `$this->items['get']['requesttoken']` is consulted before
+        // `HTTP_REQUESTTOKEN`. With a valid header and a bogus `?requesttoken=`,
+        // PHP's CSRF check fails -> 401, so the sidecar must refuse too.
+        let valid = obfuscate("tok", b"abc");
+        let mut f = facts("PROPFIND");
+        f.strict_cookie = true;
+        f.lax_cookie = true;
+        f.requesttoken_header = Some(&valid);
+        f.requesttoken_param = Some("not-the-token");
+        assert!(decision_after_token(&payload("alice"), &f).is_none());
+
+        // The query param alone, valid, is accepted.
+        f.requesttoken_header = None;
+        f.requesttoken_param = Some(&valid);
+        assert_eq!(
+            decision_after_token(&payload("alice"), &f).as_deref(),
+            Some("alice")
+        );
+
+        // The header alone, valid, is accepted.
+        f.requesttoken_header = Some(&valid);
+        f.requesttoken_param = None;
+        assert_eq!(
+            decision_after_token(&payload("alice"), &f).as_deref(),
+            Some("alice")
+        );
+    }
+
+    #[test]
     fn decrypt_requesttoken_matches_php() {
         let presented = obfuscate("the-value", b"nine-byte");
         assert_eq!(decrypt_requesttoken(&presented).as_deref(), Some("the-value"));
@@ -524,5 +617,35 @@ mod tests {
             Some("")
         );
         assert!(query_param(None, "requesttoken").is_none());
+    }
+
+    /// A `+` in a cookie is a literal `+`, not a space.
+    ///
+    /// PHP's `$_COOKIE` preserves it, and the session passphrase is 128 chars
+    /// over `A-Za-z0-9+/`, so most browsers carry one. Decoding it as a space
+    /// made the HMAC fail and silently delegated every session request to PHP
+    /// (an adversarial review found this live; the curl-based tests missed it
+    /// because curl percent-encodes `+`).
+    #[test]
+    fn cookie_values_keep_a_literal_plus() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::COOKIE,
+            "oc_sessionPassphrase=ab+cd/ef==; other=1".parse().unwrap(),
+        );
+        assert_eq!(
+            cookie_value(&headers, "oc_sessionPassphrase").as_deref(),
+            Some("ab+cd/ef=="),
+            "a `+` must survive cookie decoding"
+        );
+        // Percent-escapes are still decoded, and a genuinely escaped space too.
+        headers.insert(
+            axum::http::header::COOKIE,
+            "oc_sessionPassphrase=ab%2Bcd%20ef".parse().unwrap(),
+        );
+        assert_eq!(
+            cookie_value(&headers, "oc_sessionPassphrase").as_deref(),
+            Some("ab+cd ef")
+        );
     }
 }

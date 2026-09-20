@@ -121,6 +121,13 @@ invalidates the comparison). Transcript: `tests/local/state/evidence/session-aut
   non-string `AUTHENTICATED_TO_DAV_BACKEND` (PHP: neither branch → 401;
   Rust's `Option<String>` maps it to branch 1), though that one additionally
   needs the full CSRF proof to matter.
+* **Status: FIXED (2026-09-21).** `SessionPayload::parse` returns `None`
+  (delegate) when `app_password` or `AUTHENTICATED_TO_DAV_BACKEND` is present,
+  non-null and not a string. Unit tests
+  `auth::session::tests::non_string_app_password_is_a_parse_failure` and
+  `auth::session::tests::non_string_dav_authenticated_is_a_parse_failure`
+  (number, array, bool per key; absent/null stay absent). Harness `T1-F3`
+  below (`set_number_app_password` → sidecar **501**, PHP **401**).
 
 ### F4 — MEDIUM — token scope / lockdown is ignored (code-confirmed; not reproduced live)
 * **Where:** `src/auth/mod.rs:127-197` (`classify_session_token_state`) and
@@ -140,6 +147,26 @@ invalidates the comparison). Transcript: `tests/local/state/evidence/session-aut
   predates session auth; session auth adds a second route to it.
 * **Minimal fix:** select `scope` in `authtoken_by_hash` and delegate when it
   is non-empty (or reproduce `canAccessFilesystem()`).
+* **Status: FIXED (2026-09-21).** `authtoken_by_hash` now selects
+  `oc_authtoken.scope`; `auth::scope_allows_filesystem()` reproduces
+  `PublicKeyToken::getScopeAsArray()` + `LockdownManager::canAccessFilesystem()`
+  (including PHP truthiness and the absent-key/empty/default cases) and returns
+  `None` for shapes it cannot evaluate. Both the session path and the Basic
+  fast path return `TokenDecision::Delegate` when the files tree is requested
+  and the scope restricts it; the fast path maps that to `AuthError::Delegate`
+  → `501`, so it can no longer re-authenticate through PHP and then serve.
+  Unit tests `auth::tests::scope_allows_filesystem_matches_php` and
+  `auth::tests::filesystem_scoped_token_delegates_on_both_paths`; integration
+  tests `files_read_path::filesystem_scoped_token_delegates_the_files_tree`
+  and `files_read_path::unparseable_scope_delegates_the_files_tree`. Harness
+  `T2/F4` (a real `occ` app password with `scope` flipped to
+  `{"filesystem":false}`): sidecar **501** / no sidecar header, while PHP still
+  answers 207 but with the home replaced by a `NullStorage` — its Depth-1
+  listing contains only the root response (no children), where the unscoped
+  control lists real files. The sidecar must not serve the real DB metadata.
+  **Calendars/addressbooks:** `apps/dav` never consults the lockdown manager
+  and CalDAV/CardDAV read the database, not the filesystem, so those trees are
+  intentionally *not* scope-gated (the unit test pins that).
 
 ### F5 — LOW — requesttoken source precedence differs: header wins over query param (confirmed)
 * **Where:** `src/auth/mod.rs:340` (`requesttoken_header.or(requesttoken_param)`),
@@ -154,6 +181,12 @@ invalidates the comparison). Transcript: `tests/local/state/evidence/session-aut
   but it is a literal accept-where-PHP-rejects.
 * **Minimal fix:** evaluate the query param first (like PHP), or delegate when
   both are present and only one is valid.
+* **Status: FIXED (2026-09-21).** `decision_after_token` now evaluates
+  `requesttoken_param` before `requesttoken_header`, matching
+  `Request::passesCSRFCheck()`. Unit test
+  `auth::session::tests::requesttoken_query_param_wins_over_header`. Harness
+  `T3-F5` below (valid header + bogus `?requesttoken=` → sidecar **501**, PHP
+  **401**).
 
 ### F6 — LOW — `user_is_disabled` is a blacklist; PHP's `isEnabled` is a whitelist (confirmed)
 * **Where:** `src/db.rs:1138-1151` vs `User/User.php:472-486` +
@@ -167,6 +200,13 @@ invalidates the comparison). Transcript: `tests/local/state/evidence/session-aut
   or a foreign writer.
 * **Minimal fix:** invert — disabled unless the value is one of
   `1/true/yes/on` (absent row = enabled).
+* **Status: FIXED (2026-09-21).** `Db::user_is_disabled` now mirrors
+  `UserConfig::getValueBool(uid, 'core', 'enabled', true)`: enabled only for
+  `1`/`true`/`yes`/`on` (case-insensitive), an absent row is enabled, and any
+  other present value (including garbage) is disabled. Unit test
+  `db::tests::enabled_value_follows_php_get_value_bool`; integration coverage
+  in `db_read_path::user_display_name_and_enabled_flag` (`enabled='0'` and
+  `enabled='garbage'`).
 
 ### F7 — LOW — same-site cookie accepted under both the plain and `__Host-` names
 * **Where:** `src/auth/session.rs:305-318` vs `Request.php:474-487`
@@ -311,10 +351,12 @@ invalidates the comparison). Transcript: `tests/local/state/evidence/session-aut
 
 ## Could not verify
 
-* **F4 (token scope) end-to-end** — no scoped token could be created in the
-  disposable harness without hand-writing a token row; the divergence rests
-  on code reading of both sides (`LockdownManager::canAccessFilesystem`
-  gating `SetupManager`, which the sidecar never consults).
+* **F4 (token scope) end-to-end** — the follow-up fix mints a real scoped app
+  password with `occ user:auth-tokens:add` and flips `oc_authtoken.scope`
+  (harness T2). Observed PHP side: 207 with an **empty** Depth-1 listing
+  (home is a `NullStorage` under lockdown), versus a populated control; the
+  sidecar now delegates (`501`, no sidecar header) instead of serving real DB
+  metadata.
 * **phpredis TTL-on-read behaviour** (F13) — would need a time-accelerated
   harness.
 * **PHP's unequal-length string XOR** in `CsrfToken::getDecryptedValue`

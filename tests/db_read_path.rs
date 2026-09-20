@@ -290,6 +290,12 @@ async fn user_display_name_and_enabled_flag() {
     env.seed_user("bob", None).await;
     env.seed_user("carol", Some("Carol")).await;
     env.disable_user("carol").await;
+    // F4: PHP's `getValueBool(..., true)` treats any present non-truthy value
+    // (`'0'`, garbage) as disabled, not just `'false'`.
+    env.seed_user("dave", None).await;
+    env.set_user_preference("dave", "core", "enabled", "0").await;
+    env.seed_user("erin", None).await;
+    env.set_user_preference("erin", "core", "enabled", "garbage").await;
 
     assert_eq!(
         env.db.user_display_name("alice").await.unwrap().as_deref(),
@@ -301,6 +307,8 @@ async fn user_display_name_and_enabled_flag() {
     assert!(!env.db.native_user_exists("ghost").await.unwrap());
     assert!(!env.db.user_is_disabled("alice").await.unwrap());
     assert!(env.db.user_is_disabled("carol").await.unwrap());
+    assert!(env.db.user_is_disabled("dave").await.unwrap());
+    assert!(env.db.user_is_disabled("erin").await.unwrap());
 }
 
 #[tokio::test]

@@ -25,6 +25,7 @@ fn token(token_type: i64, uid: &str, login_name: &str, last_check: i64) -> AuthT
         password_is_null: false,
         last_check,
         last_activity: last_check,
+        scope: None,
     }
 }
 
@@ -32,7 +33,7 @@ fn token(token_type: i64, uid: &str, login_name: &str, last_check: i64) -> AuthT
 fn accepts_valid_permanent_token() {
     let row = token(1, "alice", "alice@example.com", NOW);
     assert_eq!(
-        classify_token_state(&row, "alice@example.com", NOW, true, false),
+        classify_token_state(&row, "alice@example.com", NOW, true, false, false),
         TokenDecision::Accept("alice".to_string())
     );
 }
@@ -42,7 +43,7 @@ fn accepts_onetime_token() {
     // IToken::ONETIME == 3.
     let row = token(3, "alice", "alice", NOW);
     assert!(matches!(
-        classify_token_state(&row, "alice", NOW, true, false),
+        classify_token_state(&row, "alice", NOW, true, false, false),
         TokenDecision::Accept(_)
     ));
 }
@@ -52,7 +53,7 @@ fn wipe_token_is_rejected() {
     // IToken::WIPE_TOKEN == 2 is a revocation marker and must never pass.
     let row = token(2, "alice", "alice", NOW);
     assert_eq!(
-        classify_token_state(&row, "alice", NOW, true, false),
+        classify_token_state(&row, "alice", NOW, true, false, false),
         TokenDecision::Reject
     );
 }
@@ -62,12 +63,12 @@ fn unknown_token_type_delegates_to_php() {
     // Temporary (0) and anything unexpected: PHP owns the exact semantics.
     let row = token(0, "alice", "alice", NOW);
     assert_eq!(
-        classify_token_state(&row, "alice", NOW, true, false),
+        classify_token_state(&row, "alice", NOW, true, false, false),
         TokenDecision::Fallback
     );
     let row = token(7, "alice", "alice", NOW);
     assert_eq!(
-        classify_token_state(&row, "alice", NOW, true, false),
+        classify_token_state(&row, "alice", NOW, true, false, false),
         TokenDecision::Fallback
     );
 }
@@ -77,12 +78,12 @@ fn expired_token_delegates_not_rejects() {
     let mut row = token(1, "alice", "alice", NOW);
     row.expires = Some(NOW - 1);
     assert_eq!(
-        classify_token_state(&row, "alice", NOW, true, false),
+        classify_token_state(&row, "alice", NOW, true, false, false),
         TokenDecision::Fallback
     );
     row.expires = Some(NOW + 1);
     assert!(matches!(
-        classify_token_state(&row, "alice", NOW, true, false),
+        classify_token_state(&row, "alice", NOW, true, false, false),
         TokenDecision::Accept(_)
     ));
 }
@@ -92,7 +93,7 @@ fn password_invalid_is_rejected() {
     let mut row = token(1, "alice", "alice", NOW);
     row.password_invalid = true;
     assert_eq!(
-        classify_token_state(&row, "alice", NOW, true, false),
+        classify_token_state(&row, "alice", NOW, true, false, false),
         TokenDecision::Reject
     );
 }
@@ -101,11 +102,11 @@ fn password_invalid_is_rejected() {
 fn login_name_must_match_case_insensitively() {
     let row = token(1, "alice", "alice@example.com", NOW);
     assert_eq!(
-        classify_token_state(&row, "bob@example.com", NOW, true, false),
+        classify_token_state(&row, "bob@example.com", NOW, true, false, false),
         TokenDecision::Reject
     );
     assert!(matches!(
-        classify_token_state(&row, "ALICE@EXAMPLE.COM", NOW, true, false),
+        classify_token_state(&row, "ALICE@EXAMPLE.COM", NOW, true, false, false),
         TokenDecision::Accept(_)
     ));
     assert!(login_name_matches("Alice@Example.com", "alice@example.COM"));
@@ -116,7 +117,7 @@ fn login_name_must_match_case_insensitively() {
 fn empty_stored_uid_is_rejected() {
     let row = token(1, "", "alice", NOW);
     assert_eq!(
-        classify_token_state(&row, "alice", NOW, true, false),
+        classify_token_state(&row, "alice", NOW, true, false, false),
         TokenDecision::Reject
     );
 }
@@ -125,7 +126,7 @@ fn empty_stored_uid_is_rejected() {
 fn non_native_ldap_user_delegates_to_php() {
     let row = token(1, "ldapuser", "ldapuser", NOW);
     assert_eq!(
-        classify_token_state(&row, "ldapuser", NOW, false, false),
+        classify_token_state(&row, "ldapuser", NOW, false, false, false),
         TokenDecision::Fallback
     );
 }
@@ -134,7 +135,7 @@ fn non_native_ldap_user_delegates_to_php() {
 fn disabled_user_is_rejected() {
     let row = token(1, "alice", "alice", NOW);
     assert_eq!(
-        classify_token_state(&row, "alice", NOW, true, true),
+        classify_token_state(&row, "alice", NOW, true, true, false),
         TokenDecision::Reject
     );
 }
@@ -144,12 +145,12 @@ fn stale_last_check_delegates_at_300s_boundary() {
     let row = token(1, "alice", "alice", NOW - 300);
     // Exactly at the boundary is still fresh.
     assert!(matches!(
-        classify_token_state(&row, "alice", NOW, true, false),
+        classify_token_state(&row, "alice", NOW, true, false, false),
         TokenDecision::Accept(_)
     ));
     let stale = token(1, "alice", "alice", NOW - 301);
     assert_eq!(
-        classify_token_state(&stale, "alice", NOW, true, false),
+        classify_token_state(&stale, "alice", NOW, true, false, false),
         TokenDecision::Fallback
     );
 }
@@ -160,16 +161,16 @@ fn session_passwordless_temporary_token_is_accepted_in_and_beyond_the_window() {
     row.password_is_null = true;
     // Within the 300 s window.
     assert!(matches!(
-        classify_session_token_state(&row, "alice", NOW, false),
+        classify_session_token_state(&row, "alice", NOW, false, false),
         TokenDecision::Accept(_)
     ));
     // Beyond it: passwordless still validates.
     assert!(matches!(
-        classify_session_token_state(&row, "alice", NOW + 1, false),
+        classify_session_token_state(&row, "alice", NOW + 1, false, false),
         TokenDecision::Accept(_)
     ));
     assert!(matches!(
-        classify_session_token_state(&row, "alice", NOW + 3600, false),
+        classify_session_token_state(&row, "alice", NOW + 3600, false, false),
         TokenDecision::Accept(_)
     ));
 }
@@ -180,14 +181,14 @@ fn session_stale_password_bearing_token_delegates() {
     // sidecar cannot re-run checkPassword, so it delegates.
     let row = token(1, "alice", "alice", NOW - 301);
     assert_eq!(
-        classify_session_token_state(&row, "alice", NOW, false),
+        classify_session_token_state(&row, "alice", NOW, false, false),
         TokenDecision::Fallback
     );
     // A passwordless token with the same stale check is accepted.
     let mut passwordless = token(1, "alice", "alice", NOW - 301);
     passwordless.password_is_null = true;
     assert!(matches!(
-        classify_session_token_state(&passwordless, "alice", NOW, false),
+        classify_session_token_state(&passwordless, "alice", NOW, false, false),
         TokenDecision::Accept(_)
     ));
 }
