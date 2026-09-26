@@ -336,6 +336,9 @@ ETag quoted. Verified byte-identical to PHP for 40/40 sampled cards.
 - `addressbook-query` — RFC 6352 §10.5 filters evaluated in Rust over the
   fetched vCards. `oc_cards_properties` is **not** used as the source of truth
   (it only truncates to 254 bytes and indexes a fixed property list).
+- both REPORTs render `address-data` through `convertVCard` semantics
+  (`src/vobject.rs`): negotiated vCard 3/4/jCard output and the `<card:prop>`
+  filter; a plain same-version request returns the stored bytes.
 - `sync-collection` — RFC 6578, below.
 
 ---
@@ -764,8 +767,10 @@ are rejected before any query, and every query is scoped to
   served (see below).
 - jCard (`[`-prefixed) bodies → `415` rather than being converted to vCard, so
   the stored bytes stay byte-identical to what was uploaded.
-- vCard 3↔4 negotiation for `address-data`, conditional GET, `allprop`
-  completeness → not implemented.
+- `allprop` completeness → not implemented (a curated set is returned).
+  `address-data` negotiation (vCard 3↔4, jCard, the `<card:prop>` filter) and
+  conditional `GET` **are** implemented; their deliberate divergences from
+  Sabre are declared in `tests/deviations.toml`.
 - Brute-force attempt recording → off by default.
 
 ### 11.1 Shared and group address books

@@ -36,8 +36,9 @@ fast path, the sync-token scheme, the data model, and the operational traps.
 | `PROPFIND` discovery | DAV root and the caller's own principal, `Depth 0`, fixed property sets; an unknown requested property answers `501`, never `404` |
 | `PROPFIND` files | `/remote.php/dav/files/<uid>/**` `Depth 0`/`1` from `oc_filecache` + `oc_mounts`: mount entries, listings inside local/shared/groupfolder mounts (groupfolder ACL engine included), the synthetic parent etag/size/mtime, quota, `Prefer: minimal` |
 | Shared / group books | `oc_dav_shares` user + database-group books served as `<uri>_shared_by_<owner>` with the sharing properties (`owner-principal`, `read-only`, owner's `{DAV:}owner`); read-only shares are `404` on write (never `403`), read-write writes land in the owner's book |
-| `GET` / `HEAD` a card | `text/vcard; charset=utf-8`, quoted ETag, `Last-Modified` |
+| `GET` / `HEAD` a card | `text/vcard; charset=utf-8`, quoted ETag, `Last-Modified`; conditional `If-None-Match`/`If-Modified-Since` → `304` (RFC 7232 semantics) |
 | `REPORT addressbook-multiget` | hrefs resolved, missing hrefs get a 404 propstat |
+| `address-data` negotiation | vCard 3↔4 conversion, jCard (`content-type="application/vcard+json"`) and the child `<card:prop>` filter (honoured in **both** reports), via a faithful VObject port; plain same-version requests stay byte-verbatim |
 | `REPORT addressbook-query` | RFC 6352 §10.5 filters evaluated in Rust, `limit` honoured |
 | `REPORT sync-collection` | exact `oc_addressbooks.synctoken` / `http://sabre.io/ns/sync/<n>` scheme, `init_<lastID>_<tok>` paging, `507` on truncation |
 | CalDAV `PROPFIND` | the calendar home (`Depth 0`/`1`), one owned calendar (`Depth 0`) and calendar subscriptions from `oc_calendars` + `oc_calendarsubscriptions` + `oc_dav_shares` + the `oc_properties` override layer; the web UI's `{cs}publish-url` and the `{oc}`/`{DAV:}invite` share lists are reproduced |
@@ -322,11 +323,11 @@ as an unprivileged user, keep its config unreadable, and bind it to loopback.
   rather than the CardDAV `s.id` bug, and a shared write's activity is
   attributed to the owner (the outbox has no actor column). See
   `tests/deviations.toml`.
-- **No vCard version negotiation.** `address-data` is returned as stored
-  (typically vCard 3.0); the `version`/`content-type` attributes are parsed but
-  ignored, and the `address-data` child `prop` filter is not applied.
-- **No conditional GET.** `ETag`/`Last-Modified` are sent, but
-  `If-None-Match`/`If-Modified-Since` are not evaluated (clients re-download).
+- **No vCard version negotiation for `PROPFIND`.** A `PROPFIND` `address-data`
+  is always the stored bytes (PHP ignores the attributes there too); the
+  REPORT paths negotiate fully.
+- **`2.1` is never a negotiation target** (matching PHP): a `version="2.1"`
+  request converts to 3.0; stored 2.1 cards are upgraded to 3.0.
 - **`allprop`** returns a curated property set rather than every live property.
 - **`?photo` / `?export`** return `501` and are delegated to PHP.
 - **Brute-force recording is opt-in** (`record_bruteforce_attempts`, default

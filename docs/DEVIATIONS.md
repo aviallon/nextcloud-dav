@@ -44,8 +44,8 @@ Status vocabulary:
 | `jcard-rejected` | writes | intentional | jCard (`[`-prefixed) `PUT` bodies → `415` instead of being converted to vCard |
 | `vcard-2.1-rejected` | writes | intentional | a `VERSION` other than 3.0/4.0 (incl. 2.1) → `415` |
 | `allprop-curated` | propfind | intentional | `allprop`/`propname` return a curated property set |
-| `vcard-version-negotiation-missing` | report | intentional | `address-data` returned as stored; version/prop filters ignored |
-| `conditional-get-missing` | get | intentional | `If-None-Match`/`If-Modified-Since` not evaluated |
+| `vcard-version-negotiation-missing` | report | resolved | `address-data` negotiates version/content-type and applies the `<card:prop>` filter (in **both** reports, case-insensitively — more standards-conformant than Sabre) |
+| `conditional-get-missing` | get | resolved | conditional `GET` is implemented (`304`) per RFC 7232, with three deliberate corrections to Sabre's evaluation (`HEAD` → `304`, weak etag comparison, `304` always carries `ETag`) |
 | `max-resource-size-wrong` | propfind | resolved | returns `10000000` like Sabre (the `5242880` write limit is enforced separately) |
 | `supported-address-data-missing-json` | propfind | resolved | advertises all three types incl. `application/vcard+json` |
 | `supported-collation-element-name` | propfind | resolved | emits `<card:supported-collation>`, matching Sabre |
@@ -124,9 +124,25 @@ nginx intercepts it, so a real client never sees it.
 **`allprop-curated`** — `allprop` and `propname` return the curated per-node
 set in `src/routes.rs::default_props`, not every live property.
 
-**`vcard-version-negotiation-missing`** — `address-data` is returned exactly as
-stored. `content-type`, `version` and the child `<card:prop>` filter are parsed
-but ignored; a client asking for vCard 4.0 gets the stored (usually 3.0) bytes.
+**`vcard-version-negotiation-missing` (resolved)** — `address-data` in a
+REPORT is now produced by `src/vobject.rs`, a port of VObject 4.5.6's
+MimeDir reader/writer, `VCardConverter` and jCard output (the behavioural
+contract with source citations is
+[`../research/address-data-negotiation-spec.md`](../research/address-data-negotiation-spec.md)).
+Same-version requests without a filter stay **byte-verbatim**; `version=` /
+`content-type=` negotiate to vCard 3, vCard 4 or jCard
+(`application/vcard+json`) and convert through the converter's exact rules
+(3.0↔4.0, the Apple `X-ABDATE`/`X-APPLE-OMIT-YEAR` anniversary handling, the
+`PRODID:-//Sabre//Sabre VObject 4.5.6//EN` rewrite); a `<card:prop>` filter
+re-serialises with `UID`/`VERSION`/`FN` always kept, `VERSION` hoisted first
+and vobject's fold/escape normalisation. Unparseable stored cards answer 500
+with `s:exception` = `Sabre\VObject\ParseException`, like PHP. Three
+deliberate, more-standards-conformant divergences from Sabre are pinned by the
+tests: the filter is applied in **both** reports (Sabre's multiget call site
+forgets it), filter names match case-insensitively (RFC 6350 names are
+case-insensitive; Sabre's `array_diff` is not), and a malformed `content-type`
+attribute degrades to the vCard 3 target instead of `var_dump()`-ing and
+exiting the PHP process.
 
 **`max-resource-size-wrong` (resolved)** — Sabre's CardDAV plugin sets
 `maxResourceSize = 10000000` and Nextcloud does not override the *property*
@@ -162,6 +178,21 @@ used to return `207` with zero responses and now returns `415` with a
 (`3rdparty/sabre/dav/lib/DAV/Sync/Plugin.php:116`,
 `.../Exception/InvalidSyncToken.php`). The sidecar used to return **400** with
 a plain-text body and now returns the same **403** and body as Sabre.
+
+**`conditional-get-missing` (resolved)** — the four conditional headers are
+now evaluated for `GET`/`HEAD` on a card, following **RFC 7232** where Sabre's
+`Server::checkPreconditions()` diverges from it: `If-None-Match` uses *weak*
+comparison (PHP compares raw strings, so `W/"x"` never matched `"x"`), `HEAD`
+follows `GET` semantics (PHP answers **412** for `HEAD` + a matching
+`If-None-Match`, because it tests `'GET' === $method` literally before
+`httpHead()` rewrites the method), and every `304` carries `ETag` +
+`Last-Modified` (PHP omits the `ETag` for a bare `If-None-Match: *`). Those
+three are deliberate, more-standards-conformant divergences. Kept from Sabre:
+`If-Match` is strict (plus its legacy Evolution `\"` workaround) and fails with
+412 even for a missing card, `If-Modified-Since` is consulted only when
+`If-None-Match` is absent, `If-Unmodified-Since` staleness is 412, and
+unparseable dates are silently ignored. The request matrix is pinned by
+`tests/http_read.rs::conditional_*`.
 
 ### Auth
 
