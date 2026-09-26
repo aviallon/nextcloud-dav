@@ -1,11 +1,14 @@
 # nextcloud-dav — architecture
 
-A CardDAV sidecar for Nextcloud that serves
-`/remote.php/dav/addressbooks/users/<user>/**` directly from the Nextcloud
-database, bypassing the PHP stack for steady-state sync traffic. Reads are
-served from PostgreSQL; card `PUT`/`DELETE` are handled natively too, with the
-PHP event side effects dispatched asynchronously from a transactional outbox.
-Anything else still falls back to PHP through nginx.
+A DAV sidecar for Nextcloud that serves CardDAV
+(`/remote.php/dav/addressbooks/users/<user>/**`), a CalDAV subset
+(`/remote.php/dav/calendars/<user>/**`, including the calendar home and
+subscriptions), WebDAV file listings (`/remote.php/dav/files/<user>/**`) and
+the two discovery `PROPFIND`s (the DAV root and the caller's own principal)
+directly from the Nextcloud database, bypassing the PHP stack for steady-state
+sync traffic. Reads are served from PostgreSQL; card `PUT`/`DELETE` are handled
+natively too, with the PHP event side effects dispatched asynchronously from a
+transactional outbox. Anything else still falls back to PHP through nginx.
 
 This document is the as-built design. The reasoning that led here (measurements,
 rejected alternatives) is in the sibling `../dav-bench/` documents; the API
@@ -79,6 +82,7 @@ flowchart TB
   DISP -->|outbox + listener events| DB
   NC --> REDIS[(Redis)]
   DISP -->|sessions/locks via listeners| REDIS
+  DAV -.->|session store, read-only| REDIS
   DAV -->|optional: reach PHP for fallback| NGX
 ```
 
@@ -95,14 +99,18 @@ event listeners on the write path (§7.2).
 
 ## 3. Request routing
 
-Only paths **below** an address-book home go to Rust. The home itself stays on
-PHP on purpose: PHP also advertises the app-generated collections
-(`z-server-generated--system`, `z-app-generated--contactsinteraction--recent`)
-that the sidecar does not model, and discovery happens once per client.
+Four subtrees go to Rust: the DAV root and the caller's own principal
+(discovery `PROPFIND`), the address books, the calendar home and its calendars
+(including subscriptions), and the files tree. For CardDAV only paths
+**below** an address-book home go to Rust; the home listing itself stays on PHP
+on purpose (deviation `home-listing-php`): PHP also advertises the
+app-generated collections (`z-server-generated--system`,
+`z-app-generated--contactsinteraction--recent`) that the sidecar does not
+model.
 
 ```mermaid
 flowchart TD
-  R[incoming request] --> Q{matches<br/>^/remote\\.php/dav/addressbooks/users/&lt;u&gt;/. ?}
+  R[incoming request] --> Q{matches a sidecar location?<br/>root · own principal · addressbooks/users/&lt;u&gt;/. · calendars/&lt;u&gt;/ · files/}
   Q -- yes --> RS[proxy to 127.0.0.1:7868]
   Q -- no --> PHP[normal nginx php location → php-fpm]
 
@@ -128,6 +136,10 @@ Key properties of the nginx configuration that make this safe:
   small, so the cost is negligible.
 - The named fallback location re-runs `fastcgi_split_path_info`; `error_page`
   preserves `$uri`, so it resolves `/remote.php` + `/dav/...` for PHP.
+- **The auth-fallback probe is marked.** The sidecar's PHP fallback is a
+  credentialed `PROPFIND /remote.php/dav/` through the public URL; it carries
+  `X-Nextcloud-Dav-Fallback: 1`, the discovery handler answers `501` for it and
+  nginx replays it to PHP, so routing the root to the sidecar cannot recurse.
 
 ---
 
@@ -141,7 +153,7 @@ PHP** — one indexed `SELECT` and one SHA-512.
 ```mermaid
 flowchart TD
   A[Basic credentials] --> B{bruteforce enabled?}
-  B -- yes --> B1[count failed logins for /32 or /56 subnet<br/>sleep 0.1·2^n ms, block over threshold]
+  B -- yes --> B1[count failed logins for /32 or /56 subnet<br/>sleep 0.1·2^n s, cap 25 s, block over threshold]
   B -- no --> C
   B1 --> C[h = hex sha512 password + secret]
   C --> D[SELECT ... FROM oc_authtoken<br/>WHERE token = h AND version = 2]
@@ -252,11 +264,14 @@ Credentials that are *present but invalid* still get `401`, exactly as PHP does.
 The rule is only that the sidecar must never be the component that refuses a
 request it cannot evaluate. See the `unauthenticated-delegates` deviation.
 
-The database role therefore needs `SELECT` on the read path plus
+The database role therefore needs `SELECT` on the read path (which now spans
+the DAV, calendar, filecache/mount and account tables) plus
 `INSERT`/`UPDATE`/`DELETE` on `oc_cards`, `oc_addressbookchanges`,
 `oc_addressbooks` (synctoken only), `oc_cards_properties` and
-`oc_dav_event_outbox` for the write path. It still never touches `oc_activity`,
-the calendar tables or Redis — those are the PHP worker's job (§7).
+`oc_dav_event_outbox` for the write path. It still never *writes* `oc_activity`
+or the calendar-object tables — those are the PHP worker's job (§7) — and the
+only Redis traffic is the read-only session-store `GET` of the session-cookie
+path above.
 
 ```mermaid
 sequenceDiagram
@@ -332,20 +347,35 @@ from `oc_filecache` (`src/files.rs`), which removes the per-child PHP object
 graph and XML cost (~0.127 ms × N) for large listings. It is the same
 "authenticate, two indexed queries, serialise a multistatus" shape as CardDAV.
 
-The v1 scope is deliberately narrow, because a files listing is a **filesystem**
+The scope is deliberately gated, because a files listing is a **filesystem**
 view and `oc_filecache` is only one of its sources:
 
-- own home storage only (`oc_storages.id = 'home::<uid>'`, internal path
-  `files/<rel>`, resolved by `path_hash = md5(NFC(normalized path))`);
-- the app-password fast path only (`AuthMethod::FastPath`);
-- no mount at, under, or (as a collection) below the path — mounts come from
-  `oc_mounts` and are not children in the home cache;
+- the caller's own tree: the home storage (`oc_storages.id = 'home::<uid>'`)
+  plus the mounts in `oc_mounts` (received shares, groupfolders, externals),
+  resolved by `path_hash = md5(NFC(normalized path))`;
+- app-password or session-cookie authentication only
+  (`AuthMethod::FastPath` / `Session`);
+- listings that *contain* mounts are served: a mount's entry (name, etag, mtime,
+  size, mimetype, permissions, `nc:mount-type`, `nc:is-mount-root`) is
+  computable from `oc_mounts` + its root filecache row for every provider, and
+  the parent's synthetic etag/size/mtime merges the submounts
+  (`FileInfo::addSubEntry`);
+- listings *inside* a mount are served for local, shared and groupfolder
+  storages with the provider's permission mask applied, and the groupfolder ACL
+  engine (`ACLCacheWrapper` masking, `ACLManager` parent-first merge) is ported;
 - every explicitly requested property must be implemented, otherwise **501**.
 
-Anything else — the home root with mounts, a received share, a groupfolder, an
-external storage, `/trashbin`, `/versions`, the legacy `/remote.php/webdav/`,
-`OPTIONS`, `GET`, every write — answers **501** and nginx replays the buffered
-request to PHP. A missing path is a 404, matching Sabre's node resolution.
+Anything the mount model cannot reproduce exactly — a circle ACL rule, the
+`acl-inherit-per-user` groupfolder merge, a share type outside 0/1/2, a
+non-local external or one with `filesystem_check_changes`, a stale or
+unresolvable mount map — answers **501**, never `404` (a new mount must not
+look missing). So do `/trashbin`, `/versions`, the legacy `/remote.php/webdav/`,
+`OPTIONS`, `GET` and every write; nginx replays the buffered request to PHP. A
+missing path is a 404, matching Sabre's node resolution. The mount map is
+cached per user with a 30 s TTL. Two instance-level settings push files
+listings back to PHP entirely (`core/shareapi_exclude_groups` and a config.php
+with no `instanceid`), and `end_to_end_encryption` delegates the
+`nc:is-encrypted` property.
 
 The property gate is the load-bearing rule: a 404 for a property PHP serves
 would make a client believe the value does not exist, so an unknown qname
@@ -396,13 +426,22 @@ nginx location. Served natively:
 
 - the caller's **calendar home** (`Depth: 0`/`1`) from `oc_calendars` +
   `oc_dav_shares` + `oc_properties`;
-- one owned, live **calendar** (`Depth: 0`) with the full property set;
-- `sync-collection` and `calendar-multiget` REPORTs on that calendar.
+- one owned, live **calendar** (`Depth: 0`) with the full property set,
+  including the web UI's `{cs}publish-url` and the `{oc}`/`{DAV:}invite` share
+  lists;
+- the caller's **subscriptions** (`oc_calendarsubscriptions`), as home children
+  and at their own `Depth: 0`/`1` paths;
+- `sync-collection` and `calendar-multiget` REPORTs on an owned calendar.
 
 Everything else delegates with **501**: objects (`GET`/`PROPFIND`), `trashbin/`,
-`inbox`/`outbox`, subscriptions, federated/app-generated calendars, every other
+`inbox`/`outbox`, federated and app-generated calendars, every other
 principal, `calendar-query`, `<cal:expand>`, `application/calendar+json`,
-free-busy, `?export`, and all writes. A REPORT on a **shared** or trashed
+free-busy, `?export`, and all writes. A subscription request that turns on
+Nextcloud's webcal caching (a KDE/Evolution/Windows user agent or
+`X-NC-CalDAV-Webcal-Caching: On`) delegates too: PHP then serves a
+`CachedSubscription`, a node type the sidecar does not model, and a home
+listing that would expose a trashed or accepted federated calendar delegates
+for the same reason. A REPORT on a **shared** or trashed
 calendar also delegates, because the shared object post-processing
 (`VALARM` stripping, `CONFIDENTIAL` masking, size suppression) is a
 parse-and-re-serialise path the sidecar does not reproduce.
@@ -715,12 +754,14 @@ are rejected before any query, and every query is scoped to
 ## 11. What the sidecar deliberately does not do
 
 - `MKCOL`, `PROPPATCH`, `MOVE`, `COPY`, `POST`, and any write to a collection →
-  `501` (nginx replays them to PHP). Card `PUT`/`DELETE` *are* native.
+  `501` (nginx replays them to PHP). Card `PUT`/`DELETE` *are* native, gated on
+  `nextcloud_dav.event_dispatch` and the outbox table (§7.2).
 - Dispatch the PHP event listeners itself: it queues them (§7.2).
 - `?photo` (appdata + GD) and `?export` (concatenated vCard) → `501`.
 - The **system** address book and the app-generated `contactsinteraction`
-  book → served by PHP (and the home listing always is). Shared books and
-  database-backed group shares **are** served (see below).
+  book → served by PHP, as is the address-book home listing
+  (`home-listing-php`). Shared books and database-backed group shares **are**
+  served (see below).
 - jCard (`[`-prefixed) bodies → `415` rather than being converted to vCard, so
   the stored bytes stay byte-identical to what was uploaded.
 - vCard 3↔4 negotiation for `address-data`, conditional GET, `allprop`
@@ -822,7 +863,11 @@ Public HTTPS, same credentials, same data, 788-card address book:
 | PROPFIND Depth 1 (788 cards) | 1.34–1.41 s | **0.080–0.094 s** |
 | PROPFIND Depth 0 (home) | ~1.3 s | **0.030 s** |
 | GET card | ~1.3 s | **0.043 s** |
-| DAV root, files, calendars | ~1.2 s | unchanged (PHP) |
+
+The DAV root, files and calendars were still PHP-only when this run was made;
+they are served natively now — see `docs/BENCHMARKS.md` for the later,
+methodology-fixed run (3.3–5.1× over PHP on the card path) and the web UI's
+33-property calendar `PROPFIND` at 0.039 s vs 0.335 s through PHP (8.5×).
 
 Content parity: 789 hrefs and 788 ETags identical between backends, 0 differing
 values; bodies byte-identical; minified payload differs by 57 bytes (whitespace).
