@@ -25,4 +25,5 @@ pub mod sync;
 pub mod util;
 pub mod vcard;
 pub mod vcard_validate;
+pub mod vobject;
 pub mod xml;

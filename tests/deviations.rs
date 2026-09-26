@@ -789,8 +789,36 @@ async fn assert_deviation(id: &str, f: &Fixture) -> Result<(), String> {
             let r = response(&d, card_path).unwrap();
             let data = prop_text(r, NS_CARDDAV, "address-data").unwrap_or_default();
             ensure!(
-                data.contains("VERSION:3.0"),
-                "address-data was not returned as stored: {data}"
+                data.contains("VERSION:4.0"),
+                "version=4.0 was not negotiated: {data}"
+            );
+            ensure!(
+                data.contains("PRODID:-//Sabre//Sabre VObject 4.5.6//EN"),
+                "the converted card lacks the converter PRODID: {data}"
+            );
+            // The full matrix lives in src/vobject.rs::tests and
+            // tests/http_read.rs; pin the filter divergence here: the filter
+            // is honoured in *both* reports (Sabre ignores it in multiget).
+            f.env
+                .seed_card(
+                    f.book,
+                    "filter.vcf",
+                    b"BEGIN:VCARD\r\nVERSION:3.0\r\nUID:filter-1\r\nFN:Filter Me\r\nN:Me;Filter;;;\r\nEMAIL;TYPE=WORK:me@example.com\r\nEND:VCARD\r\n",
+                )
+                .await;
+            let body = r#"<?xml version="1.0"?>
+<card:addressbook-multiget xmlns:d="DAV:" xmlns:card="urn:ietf:params:xml:ns:carddav">
+  <d:prop><card:address-data><card:prop name="EMAIL"/></card:address-data></d:prop>
+  <d:href>/remote.php/dav/addressbooks/users/alice/contacts/filter.vcf</d:href>
+</card:addressbook-multiget>"#;
+            let resp = report(&f.app, BOOK_PATH, USER, PASSWORD, body).await;
+            let d = doc(&resp.body);
+            let r = response(&d, "/remote.php/dav/addressbooks/users/alice/contacts/filter.vcf")
+                .unwrap();
+            let data = prop_text(r, NS_CARDDAV, "address-data").unwrap_or_default();
+            ensure!(
+                !data.contains("N:Me") && data.contains("EMAIL"),
+                "the prop filter was not applied in multiget: {data}"
             );
         }
         "conditional-get-missing" => {

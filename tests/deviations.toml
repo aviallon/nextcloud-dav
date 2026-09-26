@@ -203,12 +203,12 @@ evidence = "src/routes.rs:default_props; docs/ARCHITECTURE.md §11"
 [[deviation]]
 id = "vcard-version-negotiation-missing"
 area = "report"
-status = "intentional"
-nextcloud = "address-data honours the requested content-type/version and the child <card:prop> filter, re-serialising the vCard."
-sidecar = "address-data is returned exactly as stored; the version/content-type attributes and the child prop filter are parsed but ignored."
-why = "No vCard 3<->4 converter is implemented; clients that request 4.0 get the stored (usually 3.0) bytes."
-test = "tests/deviations.rs::every_declared_deviation_holds (id=vcard-version-negotiation-missing)"
-evidence = "src/routes.rs:resolve_property (address-data); src/xml/parse.rs:AddressDataRequest"
+status = "resolved"
+nextcloud = "convertVCard (3rdparty/sabre/dav/lib/CardDAV/Plugin.php:803-855) parses the stored card in every REPORT, applies the child <card:prop> filter, negotiates the content-type/version attributes and re-serialises through vobject (or emits jCard). Its quirks: the filter is only passed from addressbook-query (the addressbook-multiget call site omits it), filter names match case-sensitively against the upper-cased parsed names, and a malformed content-type makes parseMimeType var_dump() and exit the process."
+sidecar = "src/vobject.rs ports the VObject 4.5.6 reader/writer, VCardConverter and jCard: same-version requests stay byte-verbatim, 3.0<->4.0 conversions follow the converter's exact rules (including the Apple X-ABDATE/X-APPLE-OMIT-YEAR handling and the PRODID rewrite), filtered output is re-serialised with VERSION hoisted and vobject's fold/escape normalisation, and jCard matches json_encode's escaping. Three deliberate, more-standards-conformant divergences: the <card:prop> filter is applied in BOTH reports, filter names match case-insensitively (RFC 6350 property names are case-insensitive), and a malformed content-type degrades to the vcard3 target instead of aborting the process. Unparseable stored cards answer 500 with s:exception=Sabre\VObject\ParseException, like PHP."
+why = "Clients that negotiate (Apple's prop filter, jCard consumers, v4 requesters) got raw stored v3 bytes where PHP answers converted output. Where Sabre is merely wrong the standard wins (each divergence is deliberate and pinned); the conversion and serialisation rules stay vobject-faithful so both backends produce identical bytes on the paths real clients use."
+test = "tests/deviations.rs::every_declared_deviation_holds (id=vcard-version-negotiation-missing); src/vobject.rs::tests; tests/http_read.rs::multiget_*/query_*/report_*"
+evidence = "src/vobject.rs; src/routes.rs:render_address_data; research/address-data-negotiation-spec.md (full source trace with file:line citations)"
 
 [[deviation]]
 id = "conditional-get-missing"

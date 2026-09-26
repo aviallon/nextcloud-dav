@@ -146,6 +146,18 @@ pub fn precondition_failed(header_name: &str) -> Response {
     )
 }
 
+/// A stored card that does not parse inside a REPORT: in PHP the
+/// `Sabre\VObject\ParseException` escapes to `Server::start()` and becomes an
+/// HTTP 500 (`3rdparty/sabre/dav/lib/DAV/Server.php:254-309`).
+pub fn vobject_parse_error(message: &str) -> Response {
+    dav_error(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "Sabre\\VObject\\ParseException",
+        message,
+        "",
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

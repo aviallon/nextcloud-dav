@@ -633,6 +633,126 @@ async fn get_strips_non_image_photo_data() {
 }
 
 // ---------------------------------------------------------------------------
+// address-data negotiation (Sabre `convertVCard` parity + declared divergences)
+// ---------------------------------------------------------------------------
+
+fn multiget_body(address_data_attrs: &str, prop_filter: &str) -> String {
+    format!(
+        r#"<?xml version="1.0"?>
+<card:addressbook-multiget xmlns:d="DAV:" xmlns:card="urn:ietf:params:xml:ns:carddav">
+  <d:prop><d:getetag/><card:address-data{address_data_attrs}>{prop_filter}</card:address-data></d:prop>
+  <d:href>/remote.php/dav/addressbooks/users/alice/contacts/jane.vcf</d:href>
+</card:addressbook-multiget>"#
+    )
+}
+
+#[tokio::test]
+async fn multiget_plain_address_data_is_verbatim() {
+    let (_env, _book, app) = setup!();
+    let resp = report(
+        &app,
+        BOOK_PATH,
+        USER,
+        PASSWORD,
+        &multiget_body("", ""),
+    )
+    .await;
+    let d = doc(&resp.body);
+    let data = prop_text(response(&d, CARD_PATH), NS_CARDDAV, "address-data");
+    assert_eq!(data.as_bytes(), CARD_JANE);
+}
+
+#[tokio::test]
+async fn multiget_version_40_is_converted() {
+    let (_env, _book, app) = setup!();
+    let resp = report(
+        &app,
+        BOOK_PATH,
+        USER,
+        PASSWORD,
+        &multiget_body(r#" version="4.0""#, ""),
+    )
+    .await;
+    let d = doc(&resp.body);
+    let data = prop_text(response(&d, CARD_PATH), NS_CARDDAV, "address-data");
+    assert!(data.starts_with("BEGIN:VCARD\r\nVERSION:4.0\r\n"), "{data}");
+    assert!(
+        data.contains("PRODID:-//Sabre//Sabre VObject 4.5.6//EN"),
+        "{data}"
+    );
+}
+
+#[tokio::test]
+async fn multiget_applies_the_prop_filter_divergence() {
+    let (_env, _book, app) = setup!();
+    // Sabre ignores the filter in addressbook-multiget (it calls convertVCard
+    // with two arguments); the sidecar applies it in both reports — declared
+    // divergence `vcard-version-negotiation-missing`.
+    let resp = report(
+        &app,
+        BOOK_PATH,
+        USER,
+        PASSWORD,
+        &multiget_body("", r#"<card:prop name="EMAIL"/>"#),
+    )
+    .await;
+    let d = doc(&resp.body);
+    let data = prop_text(response(&d, CARD_PATH), NS_CARDDAV, "address-data");
+    assert!(data.contains("EMAIL;TYPE=WORK:jane@example.com"), "{data}");
+    assert!(!data.contains("N:Doe"), "{data}");
+    // UID/VERSION/FN always survive the filter.
+    assert!(data.contains("FN:Jane Doe"), "{data}");
+    assert!(data.contains("UID:jane-1"), "{data}");
+}
+
+#[tokio::test]
+async fn query_address_data_jcard_is_json() {
+    let (_env, _book, app) = setup!();
+    let body = r#"<?xml version="1.0"?>
+<card:addressbook-query xmlns:d="DAV:" xmlns:card="urn:ietf:params:xml:ns:carddav">
+  <d:prop><card:address-data content-type="application/vcard+json"/></d:prop>
+</card:addressbook-query>"#;
+    // addressbook-query at Depth 0 is a 415 (`query-depth0-on-collection`),
+    // so the request carries the Depth every real client sends.
+    let request = axum::http::Request::builder()
+        .method("REPORT")
+        .uri(BOOK_PATH)
+        .header(
+            axum::http::header::AUTHORIZATION,
+            common::basic(USER, PASSWORD),
+        )
+        .header(
+            axum::http::header::CONTENT_TYPE,
+            "application/xml; charset=utf-8",
+        )
+        .header("depth", "1")
+        .body(axum::body::Body::from(body.to_string()))
+        .unwrap();
+    let resp = call(&app, request).await;
+    let d = doc(&resp.body);
+    let data = prop_text(response(&d, CARD_PATH), NS_CARDDAV, "address-data");
+    assert!(data.starts_with("[\"vcard\",[["), "{data}");
+    assert!(data.contains("[\"fn\""), "{data}");
+}
+
+#[tokio::test]
+async fn report_on_an_unparseable_card_is_500() {
+    let (env, book, app) = setup!();
+    env.seed_card(book, "broken.vcf", b"not a vcard at all").await;
+    let body = r#"<?xml version="1.0"?>
+<card:addressbook-multiget xmlns:d="DAV:" xmlns:card="urn:ietf:params:xml:ns:carddav">
+  <d:prop><card:address-data/></d:prop>
+  <d:href>/remote.php/dav/addressbooks/users/alice/contacts/broken.vcf</d:href>
+</card:addressbook-multiget>"#;
+    let resp = report(&app, BOOK_PATH, USER, PASSWORD, body).await;
+    // PHP lets Sabre\VObject\ParseException escape to Server::start(): HTTP
+    // 500 with the exception name in the error body.
+    assert_eq!(resp.status, 500);
+    let text = String::from_utf8_lossy(&resp.body);
+    assert!(text.contains("Sabre\\VObject\\ParseException"), "{text}");
+}
+
+// ---------------------------------------------------------------------------
 // addressbook-multiget / addressbook-query
 // ---------------------------------------------------------------------------
 

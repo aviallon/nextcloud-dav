@@ -966,6 +966,18 @@ fn build_response(
     ctx: &PropContext,
     props: &PropList,
 ) -> DavResponse {
+    build_response_with_data(href, node, ctx, props, None)
+}
+
+/// Like [`build_response`], but with a pre-rendered `address-data` value (the
+/// REPORT paths negotiate it through `vobject::convert_vcard`).
+fn build_response_with_data(
+    href: &str,
+    node: NodeData<'_>,
+    ctx: &PropContext,
+    props: &PropList,
+    address_data: Option<&str>,
+) -> DavResponse {
     let requested: Vec<PropQName> = match props {
         PropList::AllProp => default_props(&node),
         PropList::PropName => default_props(&node),
@@ -976,7 +988,15 @@ fn build_response(
     let mut found: Vec<(PropQName, PropValue)> = Vec::new();
     let mut missing: Vec<PropQName> = Vec::new();
     for qname in &requested {
-        match resolve_property(qname, &node, ctx) {
+        let resolved = match (&node, address_data) {
+            (NodeData::Card(_), Some(data))
+                if qname.ns == NS_CARDDAV && qname.local == "address-data" =>
+            {
+                Some(PropValue::Text(data.to_string()))
+            }
+            _ => resolve_property(qname, &node, ctx),
+        };
+        match resolved {
             Some(value) => {
                 if propname_only {
                     found.push((qname.clone(), PropValue::Empty));
@@ -1773,11 +1793,19 @@ async fn handle_report_book(
                 let response_href = normalize_href(raw_href, href);
                 match by_uri.get(&card_uri) {
                     Some(card) => {
-                        responses.push(build_response(
+                        let rendered =
+                            match render_address_data(card, &request.props, &request.address_data) {
+                                Ok(rendered) => rendered,
+                                Err(message) => {
+                                    return Ok(dav_error::vobject_parse_error(&message))
+                                }
+                            };
+                        responses.push(build_response_with_data(
                             &response_href,
                             NodeData::Card(card),
                             &ctx,
                             &PropList::Props(request.props.clone()),
+                            rendered.as_deref(),
                         ));
                     }
                     None => {
@@ -1823,11 +1851,17 @@ async fn handle_report_book(
                     }
                 }
                 let response_href = format!("{href}/{}", encode_path_segment(&card.uri));
-                responses.push(build_response(
+                let rendered =
+                    match render_address_data(card, &request.props, &request.address_data) {
+                        Ok(rendered) => rendered,
+                        Err(message) => return Ok(dav_error::vobject_parse_error(&message)),
+                    };
+                responses.push(build_response_with_data(
                     &response_href,
                     NodeData::Card(card),
                     &ctx,
                     &PropList::Props(request.props.clone()),
+                    rendered.as_deref(),
                 ));
                 if let Some(limit) = request.limit {
                     if responses.len() as i64 >= limit {
@@ -1855,6 +1889,33 @@ async fn handle_report_book(
     }
 }
 
+/// Renders the `{urn:ietf:params:xml:ns:carddav}address-data` value of a
+/// REPORT response through `CardDAV\Plugin::convertVCard`
+/// (`3rdparty/sabre/dav/lib/CardDAV/Plugin.php:803-855`): negotiated version /
+/// content-type and the `<card:prop>` filter. `Ok(None)` when the request does
+/// not ask for `address-data`; `Err` when the stored card does not parse (an
+/// HTTP 500 in PHP, `DAV/Server.php:254-309`).
+fn render_address_data(
+    card: &Card,
+    props: &[PropQName],
+    request: &parse::AddressDataRequest,
+) -> std::result::Result<Option<String>, String> {
+    let wanted = props
+        .iter()
+        .any(|q| q.ns == NS_CARDDAV && q.local == "address-data");
+    if !wanted {
+        return Ok(None);
+    }
+    crate::vobject::convert_vcard(
+        &card.carddata,
+        request.content_type.as_deref(),
+        request.version.as_deref(),
+        &request.properties,
+    )
+    .map(Some)
+    .map_err(|error| error.to_string())
+}
+
 async fn handle_report_card(
     state: &AppState,
     parsed: &ParsedPath,
@@ -1880,11 +1941,16 @@ async fn handle_report_card(
             .map(|filter| filter::evaluate(&vcard::parse(&card.carddata), filter))
             .unwrap_or(true);
         let responses = if matches {
-            vec![build_response(
+            let rendered = match render_address_data(&card, &request.props, &request.address_data) {
+                Ok(rendered) => rendered,
+                Err(message) => return Ok(dav_error::vobject_parse_error(&message)),
+            };
+            vec![build_response_with_data(
                 href,
                 NodeData::Card(&card),
                 &ctx,
                 &PropList::Props(request.props),
+                rendered.as_deref(),
             )]
         } else {
             Vec::new()
