@@ -15,7 +15,9 @@ use crate::error::{Error, Result};
 use crate::model::{AddressBook, Card, VisibleBook};
 use crate::outbox::EffectRegistry;
 use crate::sync::{self, SYNCTOKEN_PREFIX};
-use crate::util::{encode_path_segment, http_date, parse_basic_auth, percent_decode};
+use crate::util::{
+    encode_path_segment, http_date, parse_basic_auth, parse_http_date, percent_decode,
+};
 use crate::vcard;
 use crate::vcard_validate::{self, Reject};
 use crate::xml::filter;
@@ -620,7 +622,7 @@ async fn handle(state: Arc<AppState>, request: Request) -> Result<Response> {
             let href = href.clone();
             match method.as_str() {
                 "GET" | "HEAD" => {
-                    get_card(&state, &target_user, &book_uri, &card_uri, &method).await
+                    get_card(&state, &target_user, &book_uri, &card_uri, &method, &headers).await
                 }
                 "PUT" => {
                     if !state.native_writes {
@@ -1358,17 +1360,172 @@ fn read_only_privilege_set() -> PropValue {
 // GET / HEAD
 // ---------------------------------------------------------------------------
 
+/// What the conditional-request evaluation decides for a GET/HEAD.
+enum GetPrecondition {
+    Pass,
+    /// 304 with the `ETag` and `Last-Modified` of the current representation.
+    NotModified(Response),
+    /// 412 with Sabre's `PreconditionFailed` body (and its `ETag` header
+    /// where Sabre sets one).
+    Failed(Response),
+}
+
+/// Evaluates `If-Match` / `If-None-Match` / `If-Modified-Since` /
+/// `If-Unmodified-Since` for a GET/HEAD on a card, following **RFC 7232**
+/// where Sabre's `checkPreconditions()`
+/// (`3rdparty/sabre/dav/lib/DAV/Server.php:1289`) diverges from it. The
+/// divergences are deliberate and declared in `tests/deviations.toml`
+/// (`conditional-get-missing`):
+///
+/// - `If-None-Match` uses RFC 7232 *weak* comparison (Sabre compares entity
+///   tags as raw strings, so `W/"x"` never matches `"x"`);
+/// - a `HEAD` with a matching `If-None-Match` is a `304` (Sabre tests
+///   `'GET' === $method` literally and answers `412`, because
+///   `checkPreconditions()` runs before `httpHead()` rewrites the method);
+/// - every `304` carries `ETag` and `Last-Modified` (Sabre omits `ETag` for a
+///   bare `If-None-Match: *`).
+///
+/// Keeping Sabre's semantics: strict `If-Match` evaluation (plus its legacy
+/// Evolution `\"` workaround), `If-Modified-Since` consulted only when
+/// `If-None-Match` is absent, unparseable dates silently ignored, and a
+/// missing card under `If-Match` is a 412, not a 404.
+fn check_get_preconditions(
+    headers: &HeaderMap,
+    method: &Method,
+    card: Option<&Card>,
+) -> GetPrecondition {
+    if let Some(raw) = header_str(headers, header::IF_MATCH).filter(|raw| !raw.is_empty()) {
+        // A missing node is a 412 here, even for `*` (the PHP lookup happens
+        // before the `*` check).
+        let Some(card) = card else {
+            return GetPrecondition::Failed(dav_error::precondition_failed("If-Match"));
+        };
+        let quoted = card.quoted_etag();
+        if raw != "*" {
+            // Strong comparison (RFC 7232 §3.1): a weak validator never
+            // matches — plain string equality against the wire ETag gives
+            // exactly that. The second arm is Sabre's workaround for Evolution
+            // prepending the closing quote with a backslash.
+            let matched = raw.split(',').any(|item| {
+                let item = item.trim_matches(' ');
+                item == quoted || item.replace("\\\"", "\"") == quoted
+            });
+            if !matched {
+                let mut response = dav_error::precondition_failed("If-Match");
+                if let Ok(value) = HeaderValue::from_str(&quoted) {
+                    response.headers_mut().insert(header::ETAG, value);
+                }
+                return GetPrecondition::Failed(response);
+            }
+        }
+    }
+
+    let if_none_match = header_str(headers, header::IF_NONE_MATCH).filter(|raw| !raw.is_empty());
+    if let Some(raw) = if_none_match {
+        let matched = match card {
+            // A missing node skips the whole block in PHP (`$nodeExists`).
+            None => false,
+            Some(card) => {
+                if raw == "*" {
+                    true
+                } else {
+                    // RFC 7232 §3.2: weak comparison.
+                    let quoted = card.quoted_etag();
+                    let current = weak_tag(&quoted);
+                    raw.split(',').any(|item| weak_tag(item.trim_matches(' ')) == current)
+                }
+            }
+        };
+        if matched {
+            // RFC 7232 §6: HEAD follows GET semantics.
+            if *method == Method::GET || *method == Method::HEAD {
+                return GetPrecondition::NotModified(not_modified_response(card));
+            }
+            let mut response = dav_error::precondition_failed("If-None-Match");
+            if let Some(etag) = card.and_then(|c| HeaderValue::from_str(&c.quoted_etag()).ok()) {
+                response.headers_mut().insert(header::ETAG, etag);
+            }
+            return GetPrecondition::Failed(response);
+        }
+    }
+
+    if if_none_match.is_none() {
+        if let Some(raw) = header_str(headers, header::IF_MODIFIED_SINCE).filter(|raw| !raw.is_empty())
+        {
+            if let (Some(date), Some(card)) = (parse_http_date(raw), card) {
+                if let Some(lastmodified) = card.lastmodified {
+                    if lastmodified <= date {
+                        return GetPrecondition::NotModified(not_modified_response(Some(card)));
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(raw) =
+        header_str(headers, header::IF_UNMODIFIED_SINCE).filter(|raw| !raw.is_empty())
+    {
+        if let (Some(date), Some(card)) = (parse_http_date(raw), card) {
+            if let Some(lastmodified) = card.lastmodified {
+                if lastmodified > date {
+                    return GetPrecondition::Failed(
+                        dav_error::precondition_failed("If-Unmodified-Since"),
+                    );
+                }
+            }
+        }
+    }
+
+    GetPrecondition::Pass
+}
+
+/// RFC 7232 §2.3.2 weak comparison: strip the `W/` marker from both sides.
+fn weak_tag(tag: &str) -> &str {
+    tag.strip_prefix("W/").unwrap_or(tag)
+}
+
+/// The `304` response: empty body, with both validators advertised.
+fn not_modified_response(card: Option<&Card>) -> Response {
+    let mut response = Response::builder()
+        .status(StatusCode::NOT_MODIFIED)
+        .body(Body::empty())
+        .unwrap();
+    if let Some(card) = card {
+        if let Ok(value) = HeaderValue::from_str(&card.quoted_etag()) {
+            response.headers_mut().insert(header::ETAG, value);
+        }
+        if let Some(lastmodified) = card.lastmodified {
+            if let Ok(value) = HeaderValue::from_str(&http_date(lastmodified)) {
+                response.headers_mut().insert(header::LAST_MODIFIED, value);
+            }
+        }
+    }
+    response
+}
+
 async fn get_card(
     state: &AppState,
     user: &str,
     book_uri: &str,
     card_uri: &str,
     method: &Method,
+    headers: &HeaderMap,
 ) -> Result<Response> {
-    let Some(book) = resolve_book(state, user, book_uri).await? else {
-        return Ok(Error::NotFound.into_response());
+    let book = resolve_book(state, user, book_uri).await?;
+    let card = match &book {
+        Some(book) => state.db.card(book.book.id, card_uri).await?,
+        None => None,
     };
-    let Some(card) = state.db.card(book.book.id, card_uri).await? else {
+    // `Server::invokeMethod()` runs `checkPreconditions()` before dispatching
+    // to `CorePlugin::httpGet()`, so a missing node under `If-Match` is a 412,
+    // not a 404 — resolve first, answer second.
+    match check_get_preconditions(headers, method, card.as_ref()) {
+        GetPrecondition::Pass => {}
+        GetPrecondition::NotModified(response) | GetPrecondition::Failed(response) => {
+            return Ok(response)
+        }
+    }
+    let Some(card) = card else {
         return Ok(Error::NotFound.into_response());
     };
 

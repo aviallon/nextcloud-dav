@@ -439,6 +439,181 @@ async fn head_has_headers_but_no_body() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Conditional GET (Sabre `checkPreconditions` parity, quirks included)
+// ---------------------------------------------------------------------------
+
+fn conditional(method: &str, path: &str, headers: &[(&str, &str)]) -> axum::http::Request<axum::body::Body> {
+    let mut builder = axum::http::Request::builder()
+        .method(method)
+        .uri(path)
+        .header(
+            axum::http::header::AUTHORIZATION,
+            common::basic(USER, PASSWORD),
+        );
+    for (name, value) in headers {
+        builder = builder.header(*name, *value);
+    }
+    builder.body(axum::body::Body::empty()).unwrap()
+}
+
+const CARD_PATH: &str = "/remote.php/dav/addressbooks/users/alice/contacts/jane.vcf";
+
+#[tokio::test]
+async fn conditional_get_if_none_match_match_is_304_with_the_etag() {
+    let (_env, _book, app) = setup!();
+    let etag = get(&app, CARD_PATH, USER, PASSWORD).await.header("etag").unwrap();
+    let resp = call(
+        &app,
+        conditional("GET", CARD_PATH, &[("if-none-match", &etag)]),
+    )
+    .await;
+    assert_eq!(resp.status, 304);
+    // Sabre sets the ETag header before answering 304.
+    assert_eq!(resp.header("etag").as_deref(), Some(etag.as_str()));
+    assert!(resp.body.is_empty());
+}
+
+#[tokio::test]
+async fn conditional_get_if_none_match_miss_serves_the_body() {
+    let (_env, _book, app) = setup!();
+    let resp = call(
+        &app,
+        conditional("GET", CARD_PATH, &[("if-none-match", "\"deadbeef\"")]),
+    )
+    .await;
+    assert_eq!(resp.status, 200);
+    assert_eq!(resp.body, CARD_JANE);
+}
+
+#[tokio::test]
+async fn conditional_get_star_is_304_with_the_etag() {
+    let (_env, _book, app) = setup!();
+    let etag = get(&app, CARD_PATH, USER, PASSWORD).await.header("etag").unwrap();
+    // RFC 7232 §4.1: the 304 carries the validators. (PHP would omit the
+    // ETag here — declared divergence, `conditional-get-missing`.)
+    let resp = call(
+        &app,
+        conditional("GET", CARD_PATH, &[("if-none-match", "*")]),
+    )
+    .await;
+    assert_eq!(resp.status, 304);
+    assert_eq!(resp.header("etag").as_deref(), Some(etag.as_str()));
+    assert!(resp.header("last-modified").is_some());
+    assert!(resp.body.is_empty());
+}
+
+#[tokio::test]
+async fn conditional_get_weak_compares_etags_per_rfc7232() {
+    let (_env, _book, app) = setup!();
+    let etag = get(&app, CARD_PATH, USER, PASSWORD).await.header("etag").unwrap();
+    let weak = format!("W/{etag}");
+    // RFC 7232 §3.2: If-None-Match uses *weak* comparison, so the weak form
+    // of the current tag is a match and the body is not re-sent. (PHP compares
+    // raw strings and would answer 200 — declared divergence.)
+    let resp = call(
+        &app,
+        conditional("GET", CARD_PATH, &[("if-none-match", &weak)]),
+    )
+    .await;
+    assert_eq!(resp.status, 304);
+}
+
+#[tokio::test]
+async fn conditional_get_if_modified_since_at_mtime_is_304() {
+    let (_env, _book, app) = setup!();
+    let get_resp = get(&app, CARD_PATH, USER, PASSWORD).await;
+    let last_modified = get_resp.header("last-modified").unwrap();
+    let resp = call(
+        &app,
+        conditional(
+            "GET",
+            CARD_PATH,
+            &[("if-modified-since", &last_modified)],
+        ),
+    )
+    .await;
+    assert_eq!(resp.status, 304);
+    // Sabre's IMS branch sets Last-Modified (and not ETag) on the 304.
+    assert_eq!(
+        resp.header("last-modified").as_deref(),
+        Some(last_modified.as_str())
+    );
+    assert!(resp.body.is_empty());
+}
+
+#[tokio::test]
+async fn conditional_get_if_none_match_takes_precedence_over_if_modified_since() {
+    let (_env, _book, app) = setup!();
+    let get_resp = get(&app, CARD_PATH, USER, PASSWORD).await;
+    let last_modified = get_resp.header("last-modified").unwrap();
+    // If-None-Match present and not matching: the request is served even
+    // though the IMS date says "not modified" (IMS must be ignored).
+    let resp = call(
+        &app,
+        conditional(
+            "GET",
+            CARD_PATH,
+            &[
+                ("if-none-match", "\"deadbeef\""),
+                ("if-modified-since", &last_modified),
+            ],
+        ),
+    )
+    .await;
+    assert_eq!(resp.status, 200);
+    assert_eq!(resp.body, CARD_JANE);
+}
+
+#[tokio::test]
+async fn conditional_head_with_matching_if_none_match_is_304_per_rfc7232() {
+    let (_env, _book, app) = setup!();
+    let etag = get(&app, CARD_PATH, USER, PASSWORD).await.header("etag").unwrap();
+    // RFC 7232 §6: HEAD follows GET semantics. PHP would answer 412 here
+    // (`'GET' === $method` is tested before `httpHead()` rewrites the method)
+    // — declared divergence, `conditional-get-missing`.
+    let resp = call(
+        &app,
+        conditional("HEAD", CARD_PATH, &[("if-none-match", &etag)]),
+    )
+    .await;
+    assert_eq!(resp.status, 304);
+    assert_eq!(resp.header("etag").as_deref(), Some(etag.as_str()));
+}
+
+#[tokio::test]
+async fn conditional_get_if_unmodified_since_stale_is_412() {
+    let (_env, _book, app) = setup!();
+    let resp = call(
+        &app,
+        conditional(
+            "GET",
+            CARD_PATH,
+            &[("if-unmodified-since", "Sun, 06 Nov 1994 08:49:37 GMT")],
+        ),
+    )
+    .await;
+    assert_eq!(resp.status, 412);
+    // Sabre sets the ETag only for a failed If-Match, not here.
+    assert_eq!(resp.header("etag"), None);
+}
+
+#[tokio::test]
+async fn conditional_on_a_missing_card_is_412_for_if_match_and_404_otherwise() {
+    let (_env, _book, app) = setup!();
+    let missing = "/remote.php/dav/addressbooks/users/alice/contacts/missing.vcf";
+    // `checkPreconditions()` resolves the node inside the If-Match branch and
+    // turns NotFound into a PreconditionFailed before the 404 dispatch.
+    let resp = call(&app, conditional("GET", missing, &[("if-match", "*")])).await;
+    assert_eq!(resp.status, 412);
+    let resp = call(
+        &app,
+        conditional("GET", missing, &[("if-none-match", "*")]),
+    )
+    .await;
+    assert_eq!(resp.status, 404);
+}
+
 #[tokio::test]
 async fn get_strips_non_image_photo_data() {
     let (env, book, app) = setup!();

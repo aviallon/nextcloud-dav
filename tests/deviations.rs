@@ -798,6 +798,8 @@ async fn assert_deviation(id: &str, f: &Fixture) -> Result<(), String> {
                 .await
                 .header("etag")
                 .unwrap();
+            // The full matrix lives in tests/http_read.rs; pin the headline
+            // behaviour and the two PHP quirks here.
             let req = axum::http::Request::builder()
                 .method("GET")
                 .uri(card_path)
@@ -805,13 +807,33 @@ async fn assert_deviation(id: &str, f: &Fixture) -> Result<(), String> {
                     axum::http::header::AUTHORIZATION,
                     common::basic(USER, PASSWORD),
                 )
-                .header("if-none-match", etag)
+                .header("if-none-match", &etag)
                 .body(axum::body::Body::empty())
                 .unwrap();
             let resp = call(&f.app, req).await;
             ensure!(
-                resp.status == 200,
-                "conditional GET was evaluated (status {})",
+                resp.status == 304,
+                "If-None-Match match gave {} instead of 304",
+                resp.status
+            );
+            ensure!(
+                resp.header("etag").as_deref() == Some(etag.as_str()),
+                "the 304 must carry the ETag"
+            );
+            let req = axum::http::Request::builder()
+                .method("HEAD")
+                .uri(card_path)
+                .header(
+                    axum::http::header::AUTHORIZATION,
+                    common::basic(USER, PASSWORD),
+                )
+                .header("if-none-match", &etag)
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let resp = call(&f.app, req).await;
+            ensure!(
+                resp.status == 304,
+                "HEAD + matching If-None-Match must be 304 per RFC 7232, got {}",
                 resp.status
             );
         }

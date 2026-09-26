@@ -213,12 +213,12 @@ evidence = "src/routes.rs:resolve_property (address-data); src/xml/parse.rs:Addr
 [[deviation]]
 id = "conditional-get-missing"
 area = "get"
-status = "intentional"
-nextcloud = "Sabre evaluates If-None-Match / If-Modified-Since and can answer 304."
-sidecar = "ETag and Last-Modified are sent, but the conditional request headers are ignored, so GET always returns 200 with the body."
-why = "Clients re-download; correctness is unaffected. Not implemented in v1."
-test = "tests/deviations.rs::every_declared_deviation_holds (id=conditional-get-missing)"
-evidence = "src/routes.rs:get_card"
+status = "resolved"
+nextcloud = "Server::checkPreconditions() evaluates If-Match / If-Unmodified-Since / If-None-Match / If-Modified-Since before the GET handler and can answer 304 (or throw 412 PreconditionFailed)."
+sidecar = "The four conditions are evaluated per RFC 7232 (weak comparison for If-None-Match, strong for If-Match, If-Modified-Since consulted only when If-None-Match is absent, HEAD following GET semantics). Three deliberate, more-standards-conformant divergences from Sabre: a HEAD with a matching If-None-Match is 304 where PHP answers 412 (it tests 'GET' === method before httpHead() rewrites it), W/\"x\" weakly matches \"x\" where PHP compares raw strings, and every 304 carries ETag + Last-Modified where PHP omits the ETag for a bare If-None-Match: *. Kept from Sabre: unparseable dates are silently ignored, a missing card under If-Match is a 412 not a 404, and If-Match keeps the legacy Evolution `\"` workaround."
+why = "Clients re-downloaded every card on every sync. Where Sabre's evaluation merely violates RFC 7232 the standard wins (each divergence is deliberate and pinned); its date handling and error semantics stay bug-compatible so a conditional request behaves identically whichever backend answers on every path that matters."
+test = "tests/deviations.rs::every_declared_deviation_holds (id=conditional-get-missing); tests/http_read.rs::conditional_* (the full matrix, guard-proven)"
+evidence = "src/routes.rs:check_get_preconditions; src/util.rs:parse_http_date; 3rdparty/sabre/dav/lib/DAV/Server.php:1289 (checkPreconditions), :466 (invokeMethod), lib/DAV/CorePlugin.php:242 (httpHead)"
 
 [[deviation]]
 id = "max-resource-size-wrong"
