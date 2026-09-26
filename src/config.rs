@@ -78,9 +78,10 @@ pub struct BruteforceConfig {
     pub ipv6_subnet_size: u8,
     /// Whether the sidecar may INSERT into `oc_bruteforce_attempts`.
     ///
-    /// This is the **only** write the v1 sidecar performs. Set it to `false` to
-    /// keep the sidecar strictly read-only (the delay/block checks still run,
-    /// but new failures from the sidecar's fast path are not recorded).
+    /// This is the only auth-path write the sidecar performs (the card path has
+    /// its own writes). Set it to `false` to make the auth path read-only (the
+    /// delay/block checks still run, but new failures from the sidecar's fast
+    /// path are not recorded).
     pub record_attempts: bool,
 }
 
@@ -200,7 +201,7 @@ pub struct Opt {
 }
 
 pub const HELP: &str = "\
-nextcloud-dav - read-only CardDAV sidecar for Nextcloud
+nextcloud-dav - DAV sidecar for Nextcloud (CardDAV, CalDAV, files, discovery)
 
 USAGE:
     nextcloud-dav [OPTIONS] [CONFIG_FILE]
@@ -317,7 +318,7 @@ impl Config {
             ipv6_subnet_size: raw
                 .get_int("security.ipv6_normalized_subnet_size", 56)
                 .clamp(32, 64) as u8,
-            // Strictly read-only by default; enable for full parity with PHP.
+            // No INSERTs by default; enable for full parity with PHP.
             record_attempts: app
                 .and_then(|a| a.get_bool_at("record_bruteforce_attempts"))
                 .unwrap_or(false),

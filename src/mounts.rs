@@ -11,10 +11,11 @@
 //! synthetic parent etag/size/mtime, and path resolution inside a mount.
 //!
 //! The model is documented in `docs/recon/files-mounts-model.md`. Anything the
-//! model cannot reproduce exactly (groupfolder ACLs, non-local externals,
-//! circles, external `filesystem_check_changes`) marks the mount **unservable**
-//! so the caller answers `501` (delegate to PHP) instead of risking a `404` or a
-//! wrong listing.
+//! model cannot reproduce exactly (circle ACL rules, the `acl-inherit-per-user`
+//! groupfolder merge, share types outside user/group/usergroup, non-local
+//! externals, external `filesystem_check_changes`) marks the mount
+//! **unservable** so the caller answers `501` (delegate to PHP) instead of
+//! risking a `404` or a wrong listing.
 //!
 //! The per-user mount map is cached in-process with a short TTL (the user asked
 //! for this explicitly): a newly created mount must not be reported as missing,

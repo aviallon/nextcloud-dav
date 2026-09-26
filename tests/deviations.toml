@@ -136,7 +136,7 @@ area = "auth"
 status = "intentional"
 nextcloud = "Failed logins are recorded in oc_bruteforce_attempts by DatabaseBackend::registerAttempt()."
 sidecar = "The delay/block checks always run, but new failures are only recorded when nextcloud_dav.record_bruteforce_attempts is true (default false)."
-why = "Keeps the shipped sidecar strictly read-only, so a read-only DB user is sufficient. The PHP fallback still records failures."
+why = "Keeps the auth path read-only, so authentication needs no DB write grant. The PHP fallback still records failures; turn it on for full throttling parity."
 test = "tests/deviations.rs::every_declared_deviation_holds (id=bruteforce-recording-off)"
 evidence = "src/config.rs:BruteforceConfig::default; src/auth/mod.rs:record_failure"
 

@@ -1,8 +1,9 @@
 # Declared deviations from Nextcloud / SabreDAV
 
-`nextcloud-dav` reimplements a subset of Nextcloud's CardDAV backend. This
-document lists **every known behavioural divergence** from Nextcloud
-(`apps/dav/lib/CardDAV/*`) and SabreDAV (`3rdparty/sabre/dav`).
+`nextcloud-dav` reimplements a subset of Nextcloud's DAV backends (CardDAV,
+CalDAV, WebDAV file listings and discovery). This document lists **every known
+behavioural divergence** from Nextcloud (`apps/dav/lib/*`) and SabreDAV
+(`3rdparty/sabre/dav`).
 
 The machine-readable copy is [`../tests/deviations.toml`](../tests/deviations.toml).
 Every entry there is asserted by
@@ -17,7 +18,7 @@ Status vocabulary:
 |---|---|
 | `intentional` | a deliberate v1 scope decision |
 | `accepted` | a divergence that was investigated and accepted |
-| `temporary` | expected to change (write support is being added right now) |
+| `temporary` | expected to change |
 | `likely-wrong` | the sidecar probably does not match Nextcloud; not fixed here, pinned by a test so a fix is explicit |
 
 ## Summary
@@ -29,7 +30,7 @@ Status vocabulary:
 | `photo-delegated` | delegation | accepted | `?photo` → 501 → PHP |
 | `export-delegated` | delegation | accepted | `?export` → 501 → PHP |
 | `home-listing-php` | routing | accepted | home listing (and app-generated books) served by PHP |
-| `writes-501` | writes | temporary | PUT/DELETE/MKCOL/PROPPATCH/MOVE/COPY/POST → 501 → PHP |
+| `writes-501` | writes | resolved | card `PUT`/`DELETE` are native; `MKCOL`/`PROPPATCH`/`MOVE`/`COPY`/`POST` and collection writes → 501 → PHP |
 | `shared-books-php` | routing | resolved | owned + user/group-shared `oc_dav_shares` books are served with the sharing properties |
 | `shared-unshare-tombstone-semantics` | routing | intentional | tombstones exclude by `resourceid` (CalDAV semantics); PHP CardDAV uses `s.id` and never hides a surviving group share |
 | `shared-write-actor` | writes | intentional | the outbox has no actor column, so a shared write is attributed to the owner |
@@ -37,16 +38,20 @@ Status vocabulary:
 | `shared-books-listing-order` | routing | intentional | owned books first, then shared rows ordered by id |
 | `contactsinteraction-php` | routing | accepted | `z-app-generated--contactsinteraction--recent` is PHP-only |
 | `bruteforce-recording-off` | auth | intentional | failed logins are not recorded by default |
-| `no-event-dispatch` | writes | intentional | no CardCreated/Updated/DeletedEvent, so no search/activity/notification side effects |
+| `no-event-dispatch` | writes | intentional | a native write queues the event in `oc_dav_event_outbox`; no listener runs in the sidecar |
+| `events-queued-not-dispatched` | writes | intentional | the request returns after one committed outbox row + `pg_notify`; every effect runs in the companion PHP worker |
+| `effect-ownership-registry` | writes | intentional | every effect id is claimed by exactly one backend (all `php` in phase 1), frozen into each outbox row |
+| `jcard-rejected` | writes | intentional | jCard (`[`-prefixed) `PUT` bodies → `415` instead of being converted to vCard |
+| `vcard-2.1-rejected` | writes | intentional | a `VERSION` other than 3.0/4.0 (incl. 2.1) → `415` |
 | `allprop-curated` | propfind | intentional | `allprop`/`propname` return a curated property set |
 | `vcard-version-negotiation-missing` | report | intentional | `address-data` returned as stored; version/prop filters ignored |
 | `conditional-get-missing` | get | intentional | `If-None-Match`/`If-Modified-Since` not evaluated |
-| `max-resource-size-wrong` | propfind | **likely-wrong** | sidecar 5242880 vs Sabre 10000000 |
-| `supported-address-data-missing-json` | propfind | **likely-wrong** | sidecar omits `application/vcard+json` |
-| `supported-collation-element-name` | propfind | **likely-wrong** | sidecar emits `<card:collation>`, Sabre emits `<card:supported-collation>` |
-| `sync-invalid-token-400` | sync | **likely-wrong** | sidecar 400 vs Sabre 403 (`InvalidSyncToken extends Forbidden`) |
+| `max-resource-size-wrong` | propfind | resolved | returns `10000000` like Sabre (the `5242880` write limit is enforced separately) |
+| `supported-address-data-missing-json` | propfind | resolved | advertises all three types incl. `application/vcard+json` |
+| `supported-collation-element-name` | propfind | resolved | emits `<card:supported-collation>`, matching Sabre |
+| `sync-invalid-token-400` | sync | resolved | returns `403` + `<d:valid-sync-token/>` like Sabre (`InvalidSyncToken extends Forbidden`) |
 | `groups-sorted` | propfind | intentional | `oc:groups` sorted by value; PHP uses database order |
-| `query-depth0-on-collection` | report | **likely-wrong** | sidecar 207/empty vs Sabre 415 `ReportNotSupported` |
+| `query-depth0-on-collection` | report | resolved | returns `415` with a `<d:supported-report/>` body, like Sabre's `ReportNotSupported` |
 | `authtoken-v2-only` | auth | intentional | only `version = 2` tokens use the fast path; others fall back to PHP |
 | `error-body-501` | writes | accepted | 501 body is sidecar-specific text (nginx intercepts it) |
 
@@ -83,18 +88,33 @@ listed above.
 
 ### Writes
 
-**`writes-501`** — `PUT`, `DELETE`, `MKCOL`, `PROPPATCH`, `MOVE`, `COPY`,
-`POST` return `501` on purpose so nginx can hand them to PHP. **This is being
-changed concurrently**: write support is under implementation. The deviation is
-declared `temporary`; the test asserts the current `501` and will fail the
-moment a method starts working, forcing this entry to be updated.
+**`writes-501`** — card `PUT`/`DELETE` are native (`201`/`204`: the card row,
+change row, sync-token bump, search columns and one outbox row in a single
+transaction). `MKCOL`, `PROPPATCH`, `MOVE`, `COPY`, `POST`, and `PUT`/`DELETE`
+on a collection, still return `501` on purpose so nginx can hand them to PHP —
+as do card writes while native writes are unavailable (`event_dispatch.enabled
+= false` or a missing outbox table).
 
-**`no-event-dispatch`** — `CardDavBackend::createCard/updateCard/deleteCard`
-dispatch `CardCreatedEvent`/`CardUpdatedEvent`/`CardDeletedEvent`, which drive
-the search index, activity and notifications. The sidecar never writes, so it
-never dispatches; writes continue to go through PHP, so events still fire once.
-The test asserts a `PUT` leaves both `oc_cards` and `oc_addressbookchanges`
-untouched.
+**`no-event-dispatch` / `events-queued-not-dispatched`** —
+`CardDavBackend::createCard/updateCard/deleteCard` dispatch
+`CardCreatedEvent`/`CardUpdatedEvent`/`CardDeletedEvent` synchronously, and the
+listeners (search index, activity, birthday calendar, photo cache, push) run
+before the request returns. The sidecar instead commits one
+`oc_dav_event_outbox` row (state = 0) and a transactional `pg_notify` with the
+card; no listener runs in the sidecar process and the companion PHP worker
+(`occ dav:event-dispatch`) drains the queue. A failing listener can therefore
+no longer roll back the `PUT`, and every effect still runs exactly once.
+
+**`effect-ownership-registry`** — every effect id (activity, birthday, photo
+cache, notifications, Redis `DEL`, …) is claimed by exactly one backend in
+`src/outbox.rs::EffectRegistry`; phase 1 is all `php`, frozen into each outbox
+row, so an effect can later move to Rust without double dispatch.
+
+**`jcard-rejected` / `vcard-2.1-rejected`** — Sabre parses a `[`-prefixed body
+as jCard (RFC 7095) and re-serialises it to vCard, and vobject's REPAIR layer
+can upgrade vCard 2.1. The sidecar does neither: jCard and any `VERSION` other
+than 3.0/4.0 are rejected with `415`, so the stored bytes stay exactly what was
+uploaded.
 
 **`error-body-501`** — the `501` body is a sidecar-specific plain-text message.
 nginx intercepts it, so a real client never sees it.
@@ -108,53 +128,60 @@ set in `src/routes.rs::default_props`, not every live property.
 stored. `content-type`, `version` and the child `<card:prop>` filter are parsed
 but ignored; a client asking for vCard 4.0 gets the stored (usually 3.0) bytes.
 
-**`max-resource-size-wrong` (likely bug)** — Sabre's CardDAV plugin sets
+**`max-resource-size-wrong` (resolved)** — Sabre's CardDAV plugin sets
 `maxResourceSize = 10000000` and Nextcloud does not override the *property*
 (the `5242880` value is Nextcloud's separate `card_size_limit` write
-validation). The sidecar advertises `5242880`. Evidence:
-`src/config.rs:MAX_RESOURCE_SIZE`,
-`3rdparty/sabre/dav/lib/CardDAV/Plugin.php:58`,
-`apps/dav/lib/CardDAV/Validation/CardDavValidatePlugin.php:34`.
+validation). The sidecar used to advertise `5242880`; it now returns `10000000`
+and enforces the write limit separately on `PUT`.
 
-**`supported-address-data-missing-json` (likely bug)** — Sabre advertises
+**`supported-address-data-missing-json` (resolved)** — Sabre advertises
 `text/vcard 3.0`, `text/vcard 4.0` **and** `application/vcard+json 4.0`
 (`3rdparty/sabre/dav/lib/CardDAV/Xml/Property/SupportedAddressData.php:39`).
-The sidecar advertises only the first two.
+The sidecar used to omit the third and now advertises all three.
 
-**`supported-collation-element-name` (likely bug)** — Sabre serialises the
+**`supported-collation-element-name` (resolved)** — Sabre serialises the
 collations as `<card:supported-collation>`
 (`3rdparty/sabre/dav/lib/CardDAV/Xml/Property/SupportedCollationSet.php:42`);
-the sidecar emits `<card:collation>` (`src/routes.rs`, `supported-collation-set`).
+the sidecar used to emit `<card:collation>` and now matches Sabre.
 
 **`groups-sorted`** — `collectCardProperties()` is a `SELECT DISTINCT value`
 with no `ORDER BY`; the sidecar adds `ORDER BY value`. Same set, deterministic
 order.
 
-**`query-depth0-on-collection` (likely bug)** — Sabre raises
+**`query-depth0-on-collection` (resolved)** — Sabre raises
 `ReportNotSupported` (HTTP 415) when an `addressbook-query` at Depth 0 targets
 a collection (`3rdparty/sabre/dav/lib/CardDAV/Plugin.php:402`); the sidecar
-returns `207` with zero responses.
+used to return `207` with zero responses and now returns `415` with a
+`<d:supported-report/>` body.
 
 ### Sync
 
-**`sync-invalid-token-400` (likely bug)** — a token that does not start with
+**`sync-invalid-token-400` (resolved)** — a token that does not start with
 `http://sabre.io/ns/sync/` raises `InvalidSyncToken`, which extends `Forbidden`
 ⇒ **403** with a `<d:valid-sync-token/>` precondition body
 (`3rdparty/sabre/dav/lib/DAV/Sync/Plugin.php:116`,
-`.../Exception/InvalidSyncToken.php`). The sidecar returns **400** with a
-plain-text body (`src/sync.rs::parse_sync_token`). Note the task brief said
-"malformed token → 400"; the Sabre source says 403. The test pins the current
-400.
+`.../Exception/InvalidSyncToken.php`). The sidecar used to return **400** with
+a plain-text body and now returns the same **403** and body as Sabre.
 
 ### Auth
 
 **`bruteforce-recording-off`** — `nextcloud_dav.record_bruteforce_attempts`
-defaults to `false` so the shipped sidecar performs no writes at all. The
-delay/block *checks* always run. The PHP fallback records failures as before.
+defaults to `false`, so the sidecar's own fast path records no failed login and
+the auth path needs no DB write grant. The delay/block *checks* always run, and
+the PHP fallback records failures as before. (The sidecar does write on the
+card path — see `writes-501`.)
 
 **`authtoken-v2-only`** — the fast path filters `version = 2`
 (`PublicKeyToken::VERSION`); any other version is delegated to PHP. A mismatch
 can only cause a fallback, never an acceptance.
+
+**`unauthenticated-delegates`** — a request with no `Authorization` header is
+first evaluated against the Nextcloud session cookie (when
+`nextcloud_dav.session_redis_url` is configured); anything that cannot be
+proved exactly is delegated (`501` → PHP) instead of refused, because the web
+UI's DAV requests carry only a session cookie and an OAuth `Bearer` token is
+PHP's. Credentials that are present but invalid still get `401`, exactly as PHP
+does.
 
 ## Open questions (not asserted, deliberately)
 
@@ -177,18 +204,13 @@ deviations. Each is a candidate for a live differential check.
 5. **`max-resource-size` on a deployed NC 33.** The `10000000` value was read
    from the Sabre copy in the NC 36 checkout; a deployed NC 33 may vendor a
    different Sabre version.
-6. **`README.md` auth section is stale.** It says the fast path filters
-   `version = 1`; the code (`src/db.rs`) and `ARCHITECTURE.md` use `version = 2`.
-   The README text is wrong, the code is right.
-7. **`oc:owner-principal` for shared books.** Not applicable because shared
-   books are PHP-only, but if they are ever served the property must be added.
-8. **UID extraction on write.** Nextcloud computes `oc_cards.uid` in
-   `CardDavBackend::getUID()` (and enforces the no-uid-conflict precondition)
-   on create/update. The sidecar is read-only and serves the stored `uid`
-   column; its vCard parser can extract a UID but nothing writes it. A future
-   write path must reproduce `getUID()` (including the 400 for a missing UID).
-   Exercised at the parser level only
-   (`tests/protocol_wire.rs::vcard_uid_is_extractable`).
+
+Three items of the original list are resolved and no longer open: the README's
+`version = 1` wording (fixed — the filter is `version = 2`), `oc:owner-principal`
+for shared books (implemented: shared books are served with the full sharing
+property set), and UID extraction on write (the native write path reproduces
+`getUID()` and the no-uid-conflict precondition, pinned by
+`tests/write_path.rs`).
 
 ## How the guarantee works
 
@@ -230,7 +252,10 @@ in `src/files.rs`; the recon is `recon/files-propfind-model.md`.
 | `discovery-language-request-fallback` | propfind | intentional | `nc:language` delegates when no `force_language`/`core/lang` is set |
 | `calendars-property-gate-501` | propfind | intentional | an explicit calendars PROPFIND for an unimplemented-but-served qname (`cs:publish-url`, ...) → 501, never 404; known-404 qnames stay 404 |
 | `calendars-special-children-acl-delegated` | delegation | intentional | home `Depth:1` requesting `{DAV:}acl`/`current-user-privilege-set` → 501 (the special children's ACLs are not modelled) |
-| `calendars-trashed-subscriptions-federated-delegated` | delegation | intentional | a caller with a trashed calendar, subscription or federated calendar → home listing 501 |
+| `calendars-trashed-federated-delegated` | delegation | intentional | a caller with a trashed or accepted federated calendar → home listing 501 (a home whose only extra children are subscriptions is served) |
+| `calendars-subscriptions-served` | propfind | resolved | subscriptions served as home children and at their own paths with PHP's exact property set; a NULL `source` (PHP 500) delegates |
+| `calendars-subscriptions-listing-order` | routing | intentional | subscriptions ordered by `calendarorder ASC, id ASC`; PHP has no id tie-breaker |
+| `calendars-webcal-caching-delegated` | delegation | intentional | a webcal-caching client (KDE/Evolution/Windows UA or `X-NC-CalDAV-Webcal-Caching: On`) with subscriptions → 501 (`CachedSubscription` is a different node shape) |
 | `calendars-own-home-only` | delegation | intentional | another principal's calendar home/calendar → 501 |
 | `calendars-shared-listing-order` | routing | intentional | shared calendars ordered by `a.id`; PHP has no `ORDER BY` |
 | `calendars-personal-displayname-localized` | propfind | resolved | `personal`/`contact_birthdays` displayname localized from the `dav` app l10n; a missing l10n source delegates (501) instead of serving English |
@@ -394,9 +419,11 @@ canonically by `tests/local/caldav_parity.sh`.
 the implemented set or the known-404 set answers 501, never 404. The known-404
 set is the exact live 404 set (`{DAV:}quota-*`, `{DAV:}share-access`,
 `{DAV:}getlastmodified`, `{cal}min-date-time`, ...). `{cs}publish-url` (200 iff
-published), `{DAV:}invite` on a calendar with outgoing shares, and
-`allowed-sharing-modes` under `limitAddressBookAndCalendarSharingToOwner=yes`
-are not modelled and therefore delegate.
+published) and the `{oc}`/`{DAV:}invite` share lists are modelled
+(`calendars-property-gate-501`); `allowed-sharing-modes` under
+`limitAddressBookAndCalendarSharingToOwner=yes`, and a share principal the
+sidecar cannot resolve (a circle, a federated `principals/remote-users/` share,
+or a user/group absent from the local tables), still delegate.
 
 **The override layer.** `displayname`, `calendar-description`,
 `calendar-timezone`, `calendar-order`, `calendar-color`,
@@ -415,12 +442,13 @@ calendar falls back to `getCalendarsForUser()` and does. The sidecar reproduces
 both (live-verified).
 
 **Delegated.** Objects (`GET`/`PROPFIND`/`PUT`/`DELETE`), `trashbin/`,
-`inbox`/`outbox`, subscriptions, federated and app-generated calendars,
-`calendar-query`, `<cal:expand>`, `application/calendar+json`, free-busy,
-`?export` and every write answer 501. A home Depth 1 that requests
+`inbox`/`outbox`, federated and app-generated calendars, `calendar-query`,
+`<cal:expand>`, `application/calendar+json`, free-busy, `?export` and every
+write answer 501. A home Depth 1 that requests
 `{DAV:}acl`/`current-user-privilege-set` delegates because the special
 children's ACLs are not modelled; a Depth 0 on a calendar serves both for owned
-and direct-user-shared calendars.
+and direct-user-shared calendars (a group-shared calendar's `{DAV:}acl`
+delegates).
 
 **REPORTs (`sync-collection`, `calendar-multiget`).** On an owned, live calendar
 the sidecar serves both. `calendar-multiget` fetches the objects by URI in
@@ -432,7 +460,11 @@ does `str_replace("\r", '', $val)`), while `{DAV:}getetag` is the quoted stored
 uses the pre-increment token and `MAX(operation)` per URI; a non-numeric token
 is an initial sync (there is no `init_` paging), an empty token with a limit is
 `507` + `<d:number-of-matches-within-limits/>`, and a token missing the prefix
-is `403` + `<d:valid-sync-token/>`. A REPORT on a **shared** or trashed calendar
+is `403` + `<d:valid-sync-token/>`. A `<d:nresults>0</d:nresults>` limit means
+zero rows (and no initial-sync `507`), and a float `is_numeric()` token takes
+the incremental path and is rejected by the database — both exactly like PHP
+(`calendars-sync-nresults-zero`, `calendars-sync-float-token`). A REPORT on a
+**shared** or trashed calendar or a subscription
 delegates, because the shared object post-processing (`VALARM` stripping,
 `CONFIDENTIAL` masking, size suppression) is a parse-and-re-serialise path the
 sidecar does not reproduce. An unimplemented property in a REPORT request
@@ -440,10 +472,19 @@ delegates (501), never a 404; the known-404 object set
 (`{caldav}schedule-tag`, `{oc}size`, `{DAV:}quota-*`, `{nc}deleted-at`, ...)
 stays 404.
 
-**Trashed / subscription / federated.** A caller who can see a trashed calendar,
-a subscription or a federated calendar gets a 501 for the home listing, because
-PHP's child set cannot be reproduced by the subset model.
+**Trashed / federated / webcal-caching.** A caller who can see a trashed calendar
+or an accepted federated calendar gets a 501 for the home listing, because
+PHP's child set cannot be reproduced by the subset model
+(`calendars-trashed-federated-delegated`). Subscriptions, by contrast, are
+served — as home children and at their own paths
+(`calendars-subscriptions-served`) — except for a webcal-caching client (a
+KDE/Evolution/Windows user agent or `X-NC-CalDAV-Webcal-Caching: On`), where
+PHP returns a `CachedSubscription` node instead of a `Subscription`
+(`calendars-webcal-caching-delegated`).
 
 **Localization.** `Calendar::__construct()` localizes the `personal` and
-`contact_birthdays` displayname through the `dav` app's l10n; the sidecar serves
-the stored string.
+`contact_birthdays` displayname through the `dav` app's l10n; the sidecar
+reproduces both rewrites from `apps/dav/l10n/<lang>.json` and, when the l10n
+source cannot be read but a name would be translated, delegates (501) instead
+of serving the untranslated English string
+(`calendars-personal-displayname-localized`).
