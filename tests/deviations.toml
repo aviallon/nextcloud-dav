@@ -281,6 +281,16 @@ test = "tests/deviations.rs::every_declared_deviation_holds (id=query-depth0-on-
 evidence = "src/routes.rs:handle_report_book; 3rdparty/sabre/dav/lib/CardDAV/Plugin.php:402"
 
 [[deviation]]
+id = "query-report-order"
+area = "routing"
+status = "intentional"
+nextcloud = "addressbook-query iterates AddressBook::getChildren(), i.e. CardDavBackend::getCards() with no ORDER BY: the response order is whatever plan PostgreSQL picks (observed live: URI order via an index scan)."
+sidecar = "addressbook-query responses come out in oc_cards.id order (ORDER BY id), the same deterministic order as the PROPFIND listings. The response set is identical to PHP's; only the sequence differs."
+why = "Deterministic output is friendlier to clients and diffing, and matches the choice already declared for shared books, groups, calendars and subscriptions; an unordered query's plan-dependent sequence cannot be reproduced in principle."
+test = "tests/deviations.rs::every_declared_deviation_holds (id=query-report-order)"
+evidence = "src/db.rs:cards; tests/local/negotiation_parity.sh (compares the query result as a set)"
+
+[[deviation]]
 id = "authtoken-v2-only"
 area = "auth"
 status = "intentional"

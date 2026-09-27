@@ -56,6 +56,7 @@ const DECLARED_IDS: &[&str] = &[
     "unauthenticated-delegates",
     "groups-sorted",
     "query-depth0-on-collection",
+    "query-report-order",
     "authtoken-v2-only",
     "error-body-501",
     "files-property-gate-501",
@@ -956,6 +957,48 @@ async fn assert_deviation(id: &str, f: &Fixture) -> Result<(), String> {
                 resp.text().contains("supported-report"),
                 "415 body lacks the supported-report precondition: {}",
                 resp.text()
+            );
+        }
+        "query-report-order" => {
+            // Declared deterministic-order deviation: the sidecar answers
+            // addressbook-query in oc_cards.id order, PHP in whatever order
+            // its ORDER-LESS getCards() comes back.
+            f.env
+                .seed_card(
+                    f.book,
+                    "aaa.vcf",
+                    b"BEGIN:VCARD\r\nVERSION:3.0\r\nUID:aaa-1\r\nFN:Aaa\r\nEND:VCARD\r\n",
+                )
+                .await;
+            let body = r#"<?xml version="1.0"?>
+<card:addressbook-query xmlns:d="DAV:" xmlns:card="urn:ietf:params:xml:ns:carddav">
+  <d:prop><d:getetag/></d:prop>
+</card:addressbook-query>"#;
+            let req = axum::http::Request::builder()
+                .method("REPORT")
+                .uri(BOOK_PATH)
+                .header(
+                    axum::http::header::AUTHORIZATION,
+                    common::basic(USER, PASSWORD),
+                )
+                .header(
+                    axum::http::header::CONTENT_TYPE,
+                    "application/xml; charset=utf-8",
+                )
+                .header("depth", "1")
+                .body(axum::body::Body::from(body.to_string()))
+                .unwrap();
+            let resp = call(&f.app, req).await;
+            let text = String::from_utf8_lossy(&resp.body);
+            let jane = text.find("jane.vcf").unwrap_or(usize::MAX);
+            let john = text.find("john.vcf").unwrap_or(usize::MAX);
+            let aaa = text.find("aaa.vcf").unwrap_or(usize::MAX);
+            // id order (jane seeded first, aaa last), NOT uri order (which
+            // would put aaa first).
+            ensure!(
+                jane < john && john < aaa,
+                "addressbook-query responses are not in oc_cards.id order: \
+                 jane@{jane} john@{john} aaa@{aaa}"
             );
         }
         "authtoken-v2-only" => {

@@ -52,6 +52,7 @@ Status vocabulary:
 | `sync-invalid-token-400` | sync | resolved | returns `403` + `<d:valid-sync-token/>` like Sabre (`InvalidSyncToken extends Forbidden`) |
 | `groups-sorted` | propfind | intentional | `oc:groups` sorted by value; PHP uses database order |
 | `query-depth0-on-collection` | report | resolved | returns `415` with a `<d:supported-report/>` body, like Sabre's `ReportNotSupported` |
+| `query-report-order` | routing | intentional | `addressbook-query` responses come out in `oc_cards.id` order; PHP has no `ORDER BY` (observed: URI order) |
 | `authtoken-v2-only` | auth | intentional | only `version = 2` tokens use the fast path; others fall back to PHP |
 | `error-body-501` | writes | accepted | 501 body is sidecar-specific text (nginx intercepts it) |
 
