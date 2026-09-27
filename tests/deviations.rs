@@ -821,6 +821,42 @@ async fn assert_deviation(id: &str, f: &Fixture) -> Result<(), String> {
                 !data.contains("N:Me") && data.contains("EMAIL"),
                 "the prop filter was not applied in multiget: {data}"
             );
+            // The GET Accept path (`httpAfterGet`) belongs to the same
+            // negotiation: pin its Content-Type string and the HEAD divergence
+            // (PHP 500s on HEAD + Accept; RFC 7232 says HEAD follows GET).
+            let req = axum::http::Request::builder()
+                .method("GET")
+                .uri(card_path)
+                .header(
+                    axum::http::header::AUTHORIZATION,
+                    common::basic(USER, PASSWORD),
+                )
+                .header("accept", "application/vcard+json")
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let resp = call(&f.app, req).await;
+            ensure!(
+                resp.header("content-type").as_deref()
+                    == Some("application/vcard+json; charset=utf-8"),
+                "GET Accept=json must negotiate jCard, got {:?}",
+                resp.header("content-type")
+            );
+            let req = axum::http::Request::builder()
+                .method("HEAD")
+                .uri(card_path)
+                .header(
+                    axum::http::header::AUTHORIZATION,
+                    common::basic(USER, PASSWORD),
+                )
+                .header("accept", "application/vcard+json")
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let resp = call(&f.app, req).await;
+            ensure!(
+                resp.status == 200,
+                "HEAD + Accept must stay 200 like the GET (PHP 500s — declared), got {}",
+                resp.status
+            );
         }
         "conditional-get-missing" => {
             let etag = get(&f.app, card_path, USER, PASSWORD)

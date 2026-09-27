@@ -136,14 +136,21 @@ Same-version requests without a filter stay **byte-verbatim**; `version=` /
 (3.0↔4.0, the Apple `X-ABDATE`/`X-APPLE-OMIT-YEAR` anniversary handling, the
 `PRODID:-//Sabre//Sabre VObject 4.5.6//EN` rewrite); a `<card:prop>` filter
 re-serialises with `UID`/`VERSION`/`FN` always kept, `VERSION` hoisted first
-and vobject's fold/escape normalisation. Unparseable stored cards answer 500
-with `s:exception` = `Sabre\VObject\ParseException`, like PHP. Three
+and vobject's fold/escape normalisation. The **GET** path negotiates as well
+(`httpAfterGet` semantics): the request's `Accept` header selects vCard 3,
+vCard 4 or jCard and rewrites the body and `Content-Type` (including Sabre's
+by-ref quirk that the 4.0/jCard targets carry the whole option string, e.g.
+`text/vcard; version=4.0; charset=utf-8`) but never the validators.
+Unparseable stored cards answer 500
+with `s:exception` = `Sabre\VObject\ParseException`, like PHP. Five
 deliberate, more-standards-conformant divergences from Sabre are pinned by the
 tests: the filter is applied in **both** reports (Sabre's multiget call site
 forgets it), filter names match case-insensitively (RFC 6350 names are
-case-insensitive; Sabre's `array_diff` is not), and a malformed `content-type`
+case-insensitive; Sabre's `array_diff` is not), a malformed `content-type`
 attribute degrades to the vCard 3 target instead of `var_dump()`-ing and
-exiting the PHP process.
+exiting the PHP process, `HEAD` + `Accept` serves the converted GET headers
+where PHP 500s on the empty HEAD body (RFC 7232 §6), and a GET of a card whose
+`VERSION` cannot be converted is served verbatim where PHP 500s.
 
 **`max-resource-size-wrong` (resolved)** — Sabre's CardDAV plugin sets
 `maxResourceSize = 10000000` and Nextcloud does not override the *property*

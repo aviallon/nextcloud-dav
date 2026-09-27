@@ -753,6 +753,90 @@ async fn report_on_an_unparseable_card_is_500() {
 }
 
 // ---------------------------------------------------------------------------
+// GET Accept negotiation (`httpAfterGet` parity)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn get_accept_json_is_jcard_and_keeps_validators() {
+    let (_env, _book, app) = setup!();
+    let plain = get(&app, CARD_PATH, USER, PASSWORD).await;
+    let mut req = request("GET", CARD_PATH, USER, PASSWORD);
+    req.headers_mut().insert(
+        axum::http::header::ACCEPT,
+        axum::http::HeaderValue::from_static("application/vcard+json"),
+    );
+    let resp = call(&app, req).await;
+    assert_eq!(resp.status, 200);
+    // The by-ref $mimeType quirk: the jCard target carries the whole option
+    // string (live-confirmed against PHP).
+    assert_eq!(
+        resp.header("content-type").as_deref(),
+        Some("application/vcard+json; charset=utf-8")
+    );
+    let text = String::from_utf8_lossy(&resp.body);
+    assert!(text.starts_with("[\"vcard\",[["), "{text}");
+    // The validators stay those of the stored bytes (PHP never rewrites them
+    // in httpAfterGet).
+    assert_eq!(resp.header("etag"), plain.header("etag"));
+    assert_eq!(resp.header("last-modified"), plain.header("last-modified"));
+}
+
+#[tokio::test]
+async fn get_accept_v4_converts() {
+    let (_env, _book, app) = setup!();
+    let mut req = request("GET", CARD_PATH, USER, PASSWORD);
+    req.headers_mut().insert(
+        axum::http::header::ACCEPT,
+        axum::http::HeaderValue::from_static("text/vcard; version=4.0"),
+    );
+    let resp = call(&app, req).await;
+    assert_eq!(resp.status, 200);
+    assert_eq!(
+        resp.header("content-type").as_deref(),
+        Some("text/vcard; version=4.0; charset=utf-8")
+    );
+    let text = String::from_utf8_lossy(&resp.body);
+    assert!(text.starts_with("BEGIN:VCARD\r\nVERSION:4.0\r\n"), "{text}");
+}
+
+#[tokio::test]
+async fn get_accept_list_picks_highest_quality() {
+    let (_env, _book, app) = setup!();
+    let mut req = request("GET", CARD_PATH, USER, PASSWORD);
+    req.headers_mut().insert(
+        axum::http::header::ACCEPT,
+        axum::http::HeaderValue::from_static(
+            "text/vcard;q=0.5, application/vcard+json;q=0.9",
+        ),
+    );
+    let resp = call(&app, req).await;
+    assert_eq!(
+        resp.header("content-type").as_deref(),
+        Some("application/vcard+json; charset=utf-8")
+    );
+}
+
+#[tokio::test]
+async fn head_accept_json_is_200_where_php_500s() {
+    let (_env, _book, app) = setup!();
+    // Declared divergence: PHP's httpAfterGet parses the empty HEAD body
+    // (convertVCard('')) and answers 500; RFC 7232 §6 says HEAD follows GET,
+    // so the sidecar serves the converted headers with an empty body.
+    let mut req = request("HEAD", CARD_PATH, USER, PASSWORD);
+    req.headers_mut().insert(
+        axum::http::header::ACCEPT,
+        axum::http::HeaderValue::from_static("application/vcard+json"),
+    );
+    let resp = call(&app, req).await;
+    assert_eq!(resp.status, 200);
+    assert_eq!(
+        resp.header("content-type").as_deref(),
+        Some("application/vcard+json; charset=utf-8")
+    );
+    assert!(resp.body.is_empty());
+}
+
+// ---------------------------------------------------------------------------
 // addressbook-multiget / addressbook-query
 // ---------------------------------------------------------------------------
 

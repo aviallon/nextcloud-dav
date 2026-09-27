@@ -1549,11 +1549,27 @@ async fn get_card(
         return Ok(Error::NotFound.into_response());
     };
 
-    let mut response = Response::new(Body::from(card.carddata.clone()));
-    response.headers_mut().insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("text/vcard; charset=utf-8"),
-    );
+    // `CardDAV\Plugin::httpAfterGet` (`afterMethod:GET`,
+    // `3rdparty/sabre/dav/lib/CardDAV/Plugin.php:722-738`): the `text/vcard`
+    // body is converted per the request's `Accept` header (vCard 4 or jCard),
+    // rewriting the body and Content-Type but never the validators. PHP 500s
+    // on HEAD here (it parses the empty HEAD body); the sidecar serves the
+    // converted GET headers with an empty body instead — declared divergence
+    // (RFC 7232 §6: HEAD follows GET).
+    let (body, mime) = match crate::vobject::convert_vcard_for_get(
+        &card.carddata,
+        header_str(headers, header::ACCEPT),
+    ) {
+        Ok(rendered) => rendered,
+        Err(error) => return Ok(dav_error::vobject_parse_error(&error.to_string())),
+    };
+
+    let mut response = Response::new(Body::from(body));
+    let content_type = HeaderValue::from_str(&format!("{mime}; charset=utf-8"))
+        .unwrap_or_else(|_| HeaderValue::from_static("text/vcard; charset=utf-8"));
+    response
+        .headers_mut()
+        .insert(header::CONTENT_TYPE, content_type);
     if let Ok(etag) = HeaderValue::from_str(&card.quoted_etag()) {
         response.headers_mut().insert(header::ETAG, etag);
     }

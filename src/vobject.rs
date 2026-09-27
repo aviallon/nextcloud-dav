@@ -1570,6 +1570,115 @@ pub fn negotiate(content_type: &str, version: &str) -> Target {
     }
 }
 
+/// `Plugin::httpAfterGet`'s negotiation (`Plugin.php:722-738` +
+/// `negotiateVCard`, `Plugin.php:756-789`): the request's raw `Accept` header
+/// through `Sabre\HTTP\negotiateContentType`, returning the target and the
+/// by-ref `$mimeType` string that lands in the response `Content-Type` —
+/// including its quirk that the v4 and jCard targets carry the whole option
+/// string (`text/vcard; version=4.0`, `application/vcard+json`) while the 3.0
+/// targets normalise to `text/vcard`.
+pub fn negotiate_accept(accept: Option<&str>) -> (Target, String) {
+    let winner = accept
+        .map(str::trim)
+        .filter(|a| !a.is_empty())
+        .and_then(negotiate_accept_content_type);
+    match winner.as_deref() {
+        Some("text/vcard; version=4.0") => (Target::Vcard4, "text/vcard; version=4.0".into()),
+        Some("application/vcard+json") => (Target::Jcard, "application/vcard+json".into()),
+        // Including no match and an absent/empty Accept: negotiateContentType
+        // falls back to the first option (`text/x-vcard`), which negotiateVCard
+        // maps to `text/vcard`.
+        _ => (Target::Vcard3, "text/vcard".into()),
+    }
+}
+
+/// The multi-entry `Accept` form of [`negotiate_content_type`]
+/// (`http-lib/functions.php:104-184`): proposals are split on `,` naively
+/// (like PHP's `explode`), the winner is the highest quality, then the highest
+/// specificity (20 type + 10 subtype + option parameters), earliest match
+/// winning ties.
+fn negotiate_accept_content_type(accept: &str) -> Option<String> {
+    let (mut best, mut best_q, mut best_score) = (None, -1.0_f64, -1_i64);
+    for part in accept.split(',') {
+        let Some(proposal) = parse_mime_type(part.trim()) else {
+            continue;
+        };
+        for (index, option) in OPTIONS.iter().enumerate() {
+            let Some(option) = parse_mime_type(option) else {
+                continue;
+            };
+            if option.type_name != "*" && option.type_name != proposal.type_name {
+                continue;
+            }
+            if option.sub_type != "*" && option.sub_type != proposal.sub_type {
+                continue;
+            }
+            if !option.parameters.iter().all(|(name, value)| {
+                proposal
+                    .parameters
+                    .iter()
+                    .any(|(n, v)| n == name && v == value)
+            }) {
+                continue;
+            }
+            let _ = index;
+            let mut score = option.parameters.len() as i64;
+            if option.type_name != "*" {
+                score += 20;
+            }
+            if option.sub_type != "*" {
+                score += 10;
+            }
+            if proposal.quality > best_q
+                || (proposal.quality == best_q && score > best_score)
+            {
+                best_q = proposal.quality;
+                best_score = score;
+                best = Some(OPTIONS[index].to_string());
+            }
+        }
+    }
+    best
+}
+
+/// The `httpAfterGet` body conversion for a card `GET`/`HEAD`
+/// (`Plugin.php:722-738`): the `Accept`-negotiated body and its `$mimeType`
+/// string. PHP parses unconditionally (a garbage body is a 500 here, as in the
+/// REPORT path) — and runs this on `HEAD` too, where it 500s on the empty
+/// body; the sidecar converts the GET body and empties it for HEAD instead
+/// (declared divergence, RFC 7232 §6).
+pub fn convert_vcard_for_get(
+    data: &[u8],
+    accept: Option<&str>,
+) -> Result<(String, String), ParseError> {
+    let (target, mime) = negotiate_accept(accept);
+    let doc = parse(data)?;
+    let body = match target {
+        Target::Vcard3 | Target::Vcard4 => {
+            let same_version = matches!(
+                (target, doc.version()),
+                (Target::Vcard3, DocVersion::V30) | (Target::Vcard4, DocVersion::V40)
+            );
+            if same_version {
+                // `convertVCard`'s early return: byte-verbatim.
+                String::from_utf8_lossy(data).into_owned()
+            } else {
+                match convert(&doc, target) {
+                    Ok(converted) => serialize(&converted),
+                    // A card whose VERSION is missing or unknown cannot be
+                    // converted. PHP's converter throws and the GET 500s;
+                    // serving the stored bytes is the more standards-conformant
+                    // GET — declared divergence (`vcard-version-negotiation-
+                    // missing`).
+                    Err(_) => String::from_utf8_lossy(data).into_owned(),
+                }
+            }
+        }
+        Target::Jcard => json_serialize(&convert(&doc, Target::Jcard)?),
+    };
+    Ok((body, mime))
+}
+
 // ---------------------------------------------------------------------------
 // `Plugin::convertVCard` (`Plugin.php:803-855`)
 // ---------------------------------------------------------------------------
