@@ -1,0 +1,59 @@
+# SPDX-FileCopyrightText: 2026 Nextcloud GmbH and Nextcloud contributors
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# Build + full test suite on every push. Written to run on **GitHub Actions and
+# Gitea act_runner alike**: Gitea Actions reads `.github/workflows/` too, and
+# every `uses:` reference is a fully-qualified `https://github.com/...` URL so
+# it resolves from any forge (short `owner/repo` refs would be looked up in the
+# host instance's own action registry).
+#
+# Two guards beyond the exit code:
+#
+# - the DB-backed integration suites early-return "ok" when `initdb`/`pg_ctl`
+#   are missing (`SKIP: PostgreSQL …` on stdout), which would fake a green run
+#   — the log is scanned for SKIP lines and the job fails if any appear;
+# - the total number of passing tests is asserted (>= 400), so a suite that
+#   stops running entirely cannot slip through as "0 failed".
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: https://github.com/actions/checkout@v5
+
+      # Flakes + nix-command are enabled by the action, matching how the
+      # README documents the build. PostgreSQL is in the toolchain so the
+      # TestEnv suites run instead of silently skipping.
+      - uses: https://github.com/cachix/install-nix-action@v31
+
+      - name: Build and test
+        run: |
+          if ! nix shell \
+                nixpkgs#cargo nixpkgs#rustc nixpkgs#pkg-config \
+                nixpkgs#cmake nixpkgs#openssl nixpkgs#postgresql \
+              -c cargo test > test.log 2>&1; then
+            echo 'ERROR: cargo test failed'
+            tail -100 test.log
+            exit 1
+          fi
+          tail -25 test.log
+
+          if grep -q 'SKIP:' test.log; then
+            echo 'ERROR: tests silently skipped (DB-backed suites did not run)'
+            grep -n 'SKIP:' test.log | head
+            exit 1
+          fi
+
+          passed=$(grep -oE '[0-9]+ passed' test.log | awk '{s+=$1} END {print s+0}')
+          echo "total passed: $passed"
+          if [ "$passed" -lt 400 ]; then
+            echo "ERROR: only $passed tests ran (expected >= 400)"
+            exit 1
+          fi
