@@ -53,8 +53,10 @@ flowchart LR
 
 The sidecar runs as an ordinary extra container **in the same pod** as
 Nextcloud. That removes the need to distribute an image: the static binary is
-dropped on the existing Nextcloud PVC and executed from an `alpine` container,
-exactly like `notify_push`. It listens on loopback only; nginx proxies to it.
+dropped into an `alpine` sidecar container as its **own image** (built by the
+repo `Dockerfile`, pulled from `gitea.lesviallon.fr`), exactly like any other
+workload: the image is the deployment unit and nothing is copied onto the
+PVC by hand. It listens on loopback only; nginx proxies to it.
 
 ```mermaid
 flowchart TB
@@ -86,9 +88,10 @@ flowchart TB
   DAV -->|optional: reach PHP for fallback| NGX
 ```
 
-The binary lives at `custom_apps/nextcloud_dav/bin/nextcloud-dav`. It is built
-by `Dockerfile` (multi-stage `rust:alpine` → static musl) and copied onto the
-PVC; see §12 for the deploy procedure and its pitfalls.
+The binary lives at `/usr/local/bin/nextcloud-dav` inside the sidecar image
+(`Dockerfile`: multi-stage `rust:alpine` → static musl on `alpine:3.24`, the
+alpine base kept for the wget probes). The image tag is pinned in the helmfile
+values; see §12 for the deploy procedure and its pitfalls.
 
 The **dispatcher** (`nextcloud_dav-dispatcher`) is a separate container because
 the sidecar's `alpine` image has no PHP: it runs the companion app's worker
@@ -828,30 +831,31 @@ no actor column.
 
 ## 12. Operations
 
-**Build and place the binary** (no image distribution, mirrors `notify_push`):
+**Build and roll out** — the image is the deployment unit; **every deployment
+goes through a helm values edit and `helmfile apply`** (infra repo):
 
 ```sh
-docker build -t nextcloud-dav:build .
-docker create --name ndav nextcloud-dav:build
-docker cp ndav:/usr/local/bin/nextcloud-dav ./nextcloud-dav-static
-docker rm ndav
-kubectl -n nextcloud cp -c nextcloud ./nextcloud-dav-static \
-  <pod>:/var/www/html/custom_apps/nextcloud_dav/bin/nextcloud-dav
-kubectl -n nextcloud exec <pod> -c nextcloud -- chmod 755 /var/www/html/custom_apps/nextcloud_dav/bin/nextcloud-dav
+# 1. build + push the image (tag = version + git short sha)
+docker build -t gitea.lesviallon.fr/aviallon/nextcloud-dav:<tag> .
+docker push gitea.lesviallon.fr/aviallon/nextcloud-dav:<tag>
+# 2. bump the tag in helmfile/values/nextcloud-prod.yaml.gotmpl
+#    (the `nextcloud-dav` sidecar's `image:`), commit, then:
+cd ~/Programing/Kubernetes && helmfile apply -l name=nextcloud-prod --suppress-diff
 ```
 
-**Restart only the sidecar** after swapping the binary (no pod restart):
-
-```sh
-kubectl -n nextcloud exec <pod> -c nextcloud-dav -- kill 1
-```
+Verification after the rollout: `kubectl exec <pod> -c nextcloud-dav --
+sha256sum /usr/local/bin/nextcloud-dav` must equal the image's hash (`docker
+run --rm --entrypoint sha256sum <image> /usr/local/bin/nextcloud-dav`), then
+the exec-probed `/healthz` and the startup logs (which also state whether
+native writes and session-cookie auth are active). Roll back with `helmfile
+rollback` / by reverting the tag.
 
 **Pitfalls learned the hard way**
 
 | pitfall | consequence | rule |
 |---|---|---|
 | kubelet `httpGet` probe on a loopback listener | probe hits the pod IP, fails, CrashLoop | use an `exec` probe (`wget -qO- http://127.0.0.1:7868/healthz`) |
-| Deployment strategy is `Recreate` | every manifest change is downtime (~80 s) | prefer binary swap + container restart; schedule changes deliberately |
+| Deployment strategy is `Recreate` | every manifest change is downtime (~80 s) | deployments are values edits + `helmfile apply`; schedule the apply deliberately |
 | ConfigMap change alone | nginx keeps the old config | wait for the kubelet volume sync, then `nginx -s reload` |
 | `proxy_request_buffering off` | `error_page` fallback gets an empty body | keep buffering on |
 | `^~` prefix location | shadows the PHP location, home listing served by Rust | use the sub-path regex |

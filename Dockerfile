@@ -1,15 +1,19 @@
 # SPDX-FileCopyrightText: 2026 Nextcloud GmbH and Nextcloud contributors
 # SPDX-License-Identifier: AGPL-3.0-or-later
 #
-# Multi-stage build producing a static (musl) binary. The binary is what gets
-# deployed: like nextcloud/notify_push, it is dropped on the Nextcloud PVC and
-# run from an `alpine` sidecar container, so no image has to be distributed to
-# the cluster.
+# Multi-stage build producing a static (musl) binary inside a small alpine
+# image. The **image is the deployment unit**: production pulls it from the
+# registry and the container runs the binary directly (see the
+# `nextcloud-dav` sidecar in the infra repo's
+# `helmfile/values/nextcloud-prod.yaml.gotmpl`). The alpine base is kept for
+# the wget-based health probes; nothing is copied onto the Nextcloud PVC.
 #
-#   docker build -t nextcloud-dav:build .
-#   docker create --name ndav nextcloud-dav:build
-#   docker cp ndav:/usr/local/bin/nextcloud-dav ./nextcloud-dav-static
-#   docker rm ndav
+#   docker build -t gitea.lesviallon.fr/aviallon/nextcloud-dav:<tag> .
+#   docker push gitea.lesviallon.fr/aviallon/nextcloud-dav:<tag>
+#   # then bump the tag in the helmfile values and `helmfile apply`
+#
+# (For a local binary only: docker create + docker cp still works, but that
+# path is not how anything is deployed.)
 
 FROM rust:alpine AS builder
 RUN apk add --no-cache musl-dev cmake make gcc g++ perl bash linux-headers
